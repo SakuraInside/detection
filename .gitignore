@@ -1,0 +1,12 @@
+models/*.pt
+models/*.engine
+__pycache__/
+*.pyc
+logs/events.db
+logs/events.db-*
+
+# local virtual environment
+.venv/
+
+# large model weights (use releases/LFS if needed)
+*.pt

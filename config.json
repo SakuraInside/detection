@@ -1,0 +1,60 @@
+{
+  "model": {
+    "weights": "models/yolo11x.pt",
+    "imgsz": 896,
+    "device": "cuda:0",
+    "half": true,
+    "conf": 0.15,
+    "iou": 0.45,
+    "tracker": "botsort.yaml",
+    "object_classes": [],
+    "excluded_class_names": [
+      "tv",
+      "laptop",
+      "mouse",
+      "keyboard",
+      "remote",
+      "cell phone",
+      "chair",
+      "couch",
+      "bed",
+      "dining table",
+      "potted plant",
+      "toilet",
+      "book",
+      "cat",
+      "dog",
+      "bird",
+      "horse",
+      "sheep",
+      "cow",
+      "elephant",
+      "bear",
+      "zebra",
+      "giraffe"
+    ],
+    "person_class": 0
+  },
+  "pipeline": {
+    "decode_queue": 4,
+    "result_queue": 4,
+    "detect_every_n_frames": 1,
+    "target_fps": 30,
+    "render_overlay": true
+  },
+  "analyzer": {
+    "static_displacement_px": 8,
+    "static_window_sec": 3.0,
+    "abandon_time_sec": 15.0,
+    "owner_proximity_px": 180,
+    "owner_left_sec": 5.0,
+    "disappear_grace_sec": 4.0,
+    "min_object_area_px": 80,
+    "presence_ratio_threshold": 0.7
+  },
+  "ui": {
+    "alarm_sound": true,
+    "show_persons": true,
+    "show_track_ids": true
+  }
+}
