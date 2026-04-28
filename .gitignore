@@ -1,2 +1,6 @@
 models/*.pt
 models/*.engine
+__pycache__/
+*.pyc
+logs/events.db
+logs/events.db-*
