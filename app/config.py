@@ -37,19 +37,12 @@ class ModelConfig:
     # Дополнительный blacklist по имени класса для подавления известных ложных срабатываний.
     excluded_class_names: list[str] = field(
         default_factory=lambda: [
-            "tv",
-            "laptop",
-            "mouse",
-            "keyboard",
-            "remote",
-            "cell phone",
             "chair",
             "couch",
             "bed",
             "dining table",
             "potted plant",
             "toilet",
-            "book",
             "cat",
             "dog",
             "bird",
@@ -64,6 +57,32 @@ class ModelConfig:
     )
     # ID класса "person" в COCO.
     person_class: int = 0
+    # Адаптивный confidence-фильтр по вертикали кадра:
+    # верхняя часть (дальняя зона) обычно содержит меньшие объекты.
+    # Для нее разрешаем более низкий confidence.
+    upper_region_y_ratio: float = 0.62
+    min_conf_upper: float = 0.08
+    min_conf_lower: float = 0.20
+    # Дополнительное послабление у нижней кромки кадра (частично обрезанные объекты).
+    bottom_region_y_ratio: float = 0.88
+    min_conf_bottom: float = 0.12
+    # Послабление для bbox, касающихся границ кадра.
+    border_relax_px: int = 24
+    min_conf_border: float = 0.10
+    # Классовые минимальные пороги confidence (по имени класса YOLO).
+    # Нужны, когда отдельный класс (например bottle) стабильно теряется.
+    class_min_conf: dict[str, float] = field(
+        default_factory=lambda: {
+            "bottle": 0.03,
+        }
+    )
+    # Дополнительный проход детекции по зоне пола (нижняя часть кадра).
+    floor_roi_enabled: bool = True
+    floor_roi_y_ratio: float = 0.55
+    floor_roi_imgsz: int = 960
+    floor_roi_conf: float = 0.04
+    # Порог IoU для дедупликации "full frame" и "floor ROI" детекций.
+    merge_iou_threshold: float = 0.45
 
 
 @dataclass
@@ -77,6 +96,12 @@ class PipelineConfig:
     target_fps: int = 30
     # Рисовать оверлей (рамки, подписи) поверх кадра.
     render_overlay: bool = True
+    # Пытаемся включить аппаратное ускорение декодирования (если доступно).
+    prefer_hw_decode: bool = True
+    # Качество JPEG для web-стрима. Ниже -> меньше CPU и сеть.
+    jpeg_quality: int = 80
+    # Кодировать JPEG не для каждого кадра (ускоряет рендер на слабом CPU).
+    render_every_n_frames: int = 1
 
 
 @dataclass
@@ -105,6 +130,8 @@ class UIConfig:
     show_persons: bool = True
     # Показывать track_id возле боксов.
     show_track_ids: bool = True
+    # Рисовать текстовые подписи (выключение снижает CPU на рендере).
+    show_labels: bool = True
 
 
 @dataclass

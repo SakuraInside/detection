@@ -30,6 +30,10 @@ from .config import AppConfig, ConfigStore
 from .detector import DetectionResult, YoloTracker
 from .logger_db import EventLogger, EventRow, now
 
+cv2.setUseOptimized(True)
+# Не распараллеливаем OpenCV по CPU чрезмерно: это снижает конкуренцию
+# потоков декодера/рендера с инференсом и стабилизирует latency.
+cv2.setNumThreads(1)
 
 @dataclass
 class FrameJob:
@@ -153,9 +157,18 @@ class VideoPipeline:
         if not p.exists():
             raise FileNotFoundError(path)
         # Инициализируем новый VideoCapture под указанным файлом.
-        cap = cv2.VideoCapture(str(p))
+        backend = cv2.CAP_FFMPEG if hasattr(cv2, "CAP_FFMPEG") else cv2.CAP_ANY
+        cap = cv2.VideoCapture(str(p), backend)
         if not cap.isOpened():
             raise RuntimeError(f"failed to open video: {p}")
+        if self._cfg_store.cfg.pipeline.prefer_hw_decode:
+            # Мягкая попытка включить аппаратный decode; если backend/сборка
+            # не поддерживает, просто продолжаем без ошибки.
+            try:
+                if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_ANY"):
+                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+            except Exception:
+                pass
         with self._cap_lock:
             if self._cap is not None:
                 self._cap.release()
@@ -330,7 +343,12 @@ class VideoPipeline:
                 # чтобы разгрузить модель и повысить плавность.
                 result = self._last_result
 
-            jpeg = self._render(job, result)
+            render_every = max(1, int(self._cfg_store.cfg.pipeline.render_every_n_frames))
+            if (job.frame_id % render_every) != 0 and self._latest_rendered is not None:
+                # Повторно используем прошлый JPEG, чтобы снизить CPU-нагрузку на кодек.
+                jpeg = self._latest_rendered.jpeg
+            else:
+                jpeg = self._render(job, result)
             with self._latest_lock:
                 self._latest_rendered = RenderedFrame(
                     frame_id=job.frame_id,
@@ -367,26 +385,31 @@ class VideoPipeline:
             for det in result.detections:
                 state = tracks.get(det.track_id, {}).get("state", "candidate")
                 color = _OVERLAY_COLORS.get(state, _OVERLAY_COLORS["default"])
-                label_parts = [det.cls_name, f"{det.confidence:.2f}"]
-                if cfg.ui.show_track_ids:
-                    label_parts.insert(0, f"#{det.track_id}")
-                label_parts.append(state)
-                self._draw_box(img, det.bbox, color, " ".join(label_parts))
+                label = ""
+                if cfg.ui.show_labels:
+                    label_parts = [det.cls_name, f"{det.confidence:.2f}"]
+                    if cfg.ui.show_track_ids:
+                        label_parts.insert(0, f"#{det.track_id}")
+                    label_parts.append(state)
+                    label = " ".join(label_parts)
+                self._draw_box(img, det.bbox, color, label)
 
             self._draw_hud(img, result)
 
-        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        quality = int(max(40, min(95, self._cfg_store.cfg.pipeline.jpeg_quality)))
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
         return buf.tobytes() if ok else b""
 
     def _draw_box(self, img: np.ndarray, bbox, color, label: str) -> None:
         # Рисуем рамку и подпись одним стилем для всех типов объектов.
         x1, y1, x2, y2 = (int(v) for v in bbox)
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(
-            img, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA
-        )
+        if label:
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(
+                img, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA
+            )
 
     def _draw_hud(self, img: np.ndarray, result: DetectionResult) -> None:
         # Верхняя строка телеметрии для быстрой диагностики производительности.

@@ -6,22 +6,16 @@
     "half": true,
     "conf": 0.15,
     "iou": 0.45,
-    "tracker": "botsort.yaml",
+    "tracker": "configs/botsort_loose.yaml",
     "object_classes": [],
     "excluded_class_names": [
       "tv",
-      "laptop",
-      "mouse",
-      "keyboard",
-      "remote",
-      "cell phone",
       "chair",
       "couch",
       "bed",
       "dining table",
       "potted plant",
       "toilet",
-      "book",
       "cat",
       "dog",
       "bird",
@@ -33,14 +27,32 @@
       "zebra",
       "giraffe"
     ],
-    "person_class": 0
+    "person_class": 0,
+    "upper_region_y_ratio": 0.62,
+    "min_conf_upper": 0.08,
+    "min_conf_lower": 0.18,
+    "bottom_region_y_ratio": 0.88,
+    "min_conf_bottom": 0.1,
+    "border_relax_px": 24,
+    "min_conf_border": 0.08,
+    "class_min_conf": {
+      "bottle": 0.03
+    },
+    "floor_roi_enabled": true,
+    "floor_roi_y_ratio": 0.55,
+    "floor_roi_imgsz": 960,
+    "floor_roi_conf": 0.04,
+    "merge_iou_threshold": 0.45
   },
   "pipeline": {
     "decode_queue": 4,
     "result_queue": 4,
-    "detect_every_n_frames": 1,
+    "detect_every_n_frames": 2,
     "target_fps": 30,
-    "render_overlay": true
+    "render_overlay": true,
+    "prefer_hw_decode": true,
+    "jpeg_quality": 60,
+    "render_every_n_frames": 2
   },
   "analyzer": {
     "static_displacement_px": 8,
@@ -55,6 +67,7 @@
   "ui": {
     "alarm_sound": true,
     "show_persons": true,
-    "show_track_ids": true
+    "show_track_ids": true,
+    "show_labels": false
   }
 }

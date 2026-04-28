@@ -1,0 +1,23 @@
+# Looser BoT-SORT profile for small/occluded objects (bottles, bags near edges).
+# Keeps more low-confidence detections in tracking so they are not dropped
+# before the analyzer stage.
+
+tracker_type: botsort
+
+# Lower thresholds compared to default botsort.yaml.
+track_high_thresh: 0.12
+track_low_thresh: 0.02
+new_track_thresh: 0.08
+
+# Matching / persistence.
+match_thresh: 0.80
+track_buffer: 90
+fuse_score: true
+
+# Camera motion compensation helps for slight jitter.
+gmc_method: sparseOptFlow
+
+# ReID off for speed/stability on single camera scenario.
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: false
