@@ -30,9 +30,10 @@ class ModelConfig:
     iou: float = 0.5
     # Конфиг трекера Ultralytics.
     tracker: str = "botsort.yaml"
-    # ID классов COCO, которые считаем "потенциально оставляемыми предметами" (+ человек).
+    # ID классов COCO, которые считаем "целевыми предметами" (+ человек).
+    # Пустой список => учитываем все классы (кроме исключенных в excluded_class_names).
     object_classes: list[int] = field(
-        default_factory=lambda: [24, 26, 28, 39, 41, 63, 64, 65, 66, 67, 73, 76]
+        default_factory=list
     )
     # Дополнительный blacklist по имени класса для подавления известных ложных срабатываний.
     excluded_class_names: list[str] = field(
@@ -57,6 +58,8 @@ class ModelConfig:
     )
     # ID класса "person" в COCO.
     person_class: int = 0
+    # ID класса "cup" в COCO.
+    cup_class: int = 41
     # Адаптивный confidence-фильтр по вертикали кадра:
     # верхняя часть (дальняя зона) обычно содержит меньшие объекты.
     # Для нее разрешаем более низкий confidence.
@@ -74,6 +77,9 @@ class ModelConfig:
     class_min_conf: dict[str, float] = field(
         default_factory=lambda: {
             "bottle": 0.03,
+            "cup": 0.0015,
+            "wine glass": 0.0015,
+            "bowl": 0.003,
         }
     )
     # Дополнительный проход детекции по зоне пола (нижняя часть кадра).
@@ -102,6 +108,63 @@ class ModelConfig:
     inference_rpc_addr: str = ""
     # Таймаут вызова внешнего inference service (сек).
     inference_rpc_timeout_sec: float = 20.0
+    # Дополнительный проход cup-only в ROI стола.
+    table_roi_enabled: bool = True
+    # ROI стола в относительных координатах [0..1].
+    table_roi_x1: float = 0.12
+    table_roi_y1: float = 0.14
+    table_roi_x2: float = 0.50
+    table_roi_y2: float = 0.66
+    # Параметры инференса cup-only на ROI.
+    table_roi_imgsz: int = 1280
+    table_roi_conf: float = 0.01
+    table_roi_iou: float = 0.50
+    # Детектить ROI не на каждом кадре для экономии FPS.
+    table_roi_every_n_frames: int = 2
+    # Минимальная ширина/высота bbox для учета детекции.
+    min_box_size_px: int = 20
+    # Пониженный минимум bbox для отдельных маленьких классов.
+    min_box_size_by_class: dict[str, int] = field(
+        default_factory=lambda: {
+            "cup": 12,
+            "wine glass": 12,
+            "bowl": 12,
+        }
+    )
+    # Слой "неизвестный предмет" поверх YOLO (по появлению/движению в сцене).
+    unknown_layer_enabled: bool = False
+    # Сколько первых кадров использовать только для адаптации фона.
+    unknown_warmup_frames: int = 45
+    # Порог пиксельного движения для маски "область в движении".
+    unknown_motion_threshold: int = 18
+    # Минимальная площадь движущейся области.
+    unknown_motion_min_area_px: int = 400
+    # Сколько кадров ждать после остановки движения перед сравнением before/after.
+    unknown_settle_frames: int = 8
+    # Интервал в секундах для сравнения текущего кадра с прошлым.
+    unknown_compare_interval_sec: float = 5.0
+    # Порог изменения яркости (before/after).
+    unknown_diff_intensity_threshold: int = 20
+    # Порог изменения градиента (before/after).
+    unknown_grad_threshold: int = 25
+    # Порог бинаризации foreground mask от MOG2.
+    unknown_fg_threshold: int = 220
+    # Минимальная площадь кандидата "unknown" в пикселях.
+    unknown_min_area_px: int = 250
+    # Максимальная площадь кандидата "unknown" (защита от "вспышек" на весь кадр).
+    unknown_max_area_ratio: float = 0.12
+    # Минимальная "плотность" маски внутри bbox (доля foreground-пикселей).
+    unknown_min_fill_ratio: float = 0.18
+    # Если overlap с person выше порога — считаем, что это человек, не объект.
+    unknown_person_iou_threshold: float = 0.15
+    # Дополнительный отступ вокруг bbox человека для подавления ложных unknown.
+    unknown_person_exclusion_px: int = 40
+    # Обрабатываем unknown только ниже этой доли высоты кадра.
+    unknown_min_y_ratio: float = 0.30
+    # Игнорируем unknown вплотную к границам кадра (частый шум).
+    unknown_border_px: int = 8
+    # Псевдо-confidence для unknown, чтобы Analyzer/UI отображали объект.
+    unknown_confidence: float = 0.3
 
 
 @dataclass

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import threading
+import json
 import queue
 import socket
-import json
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from multiprocessing import get_context
 from multiprocessing.queues import Queue
@@ -13,6 +15,7 @@ from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
@@ -94,8 +97,17 @@ class _LocalYoloTracker:
         # Если GPU недоступен, автоматически откатываемся на CPU.
         self._device = cfg.device if torch.cuda.is_available() else "cpu"
         self._half = cfg.half and self._device.startswith("cuda")
+        self._frame_counter = 0
         self._aux_next_id = 1_000_000
         self._aux_tracks: dict[int, tuple[int, tuple[float, float], tuple[float, float, float, float], float]] = {}
+        self._motion_prev_gray: Optional[np.ndarray] = None
+        self._static_gray: Optional[np.ndarray] = None
+        self._long_static_gray: Optional[np.ndarray] = None
+        self._pre_motion_gray: Optional[np.ndarray] = None
+        self._person_motion_mask: Optional[np.ndarray] = None
+        self._gray_history: deque[tuple[float, np.ndarray]] = deque(maxlen=512)
+        self._bg_seen_frames = 0
+        self._no_motion_frames = 0
         if self._device.startswith("cuda"):
             # Небольшие оптимизации CUDA для стабильного fps.
             torch.backends.cudnn.benchmark = True
@@ -156,7 +168,16 @@ class _LocalYoloTracker:
             self._cfg = cfg
             self._device = cfg.device if torch.cuda.is_available() else "cpu"
             self._half = cfg.half and self._device.startswith("cuda")
+            self._frame_counter = 0
             self._load()
+            self._motion_prev_gray = None
+            self._static_gray = None
+            self._long_static_gray = None
+            self._pre_motion_gray = None
+            self._person_motion_mask = None
+            self._gray_history.clear()
+            self._bg_seen_frames = 0
+            self._no_motion_frames = 0
 
     @property
     def names(self) -> dict[int, str]:
@@ -183,6 +204,15 @@ class _LocalYoloTracker:
                 pass
             self._aux_tracks.clear()
             self._aux_next_id = 1_000_000
+            self._frame_counter = 0
+            self._motion_prev_gray = None
+            self._static_gray = None
+            self._long_static_gray = None
+            self._pre_motion_gray = None
+            self._person_motion_mask = None
+            self._gray_history.clear()
+            self._bg_seen_frames = 0
+            self._no_motion_frames = 0
 
     def infer(
         self,
@@ -192,11 +222,15 @@ class _LocalYoloTracker:
         priority: Optional[str] = None,
     ) -> DetectionResult:
         cfg = self._cfg
+        self._frame_counter += 1
         # Грубый фильтр по именам классов для подавления ложных тревог
         # (мебель, животные, электроника и т.п.).
         excluded = {str(n).strip().lower() for n in cfg.excluded_class_names if str(n).strip()}
         class_min_conf = {
             str(k).strip().lower(): float(v) for k, v in (cfg.class_min_conf or {}).items() if str(k).strip()
+        }
+        min_box_by_class = {
+            str(k).strip().lower(): int(v) for k, v in (cfg.min_box_size_by_class or {}).items() if str(k).strip()
         }
         with self._lock:
             assert self._model is not None
@@ -247,6 +281,7 @@ class _LocalYoloTracker:
         upper_cut = float(h) * float(cfg.upper_region_y_ratio)
         bottom_cut = float(h) * float(cfg.bottom_region_y_ratio)
         border_relax = int(max(0, cfg.border_relax_px))
+        min_box_size = float(max(1, cfg.min_box_size_px))
         for tid, c, p, box in zip(ids, cls, conf, xyxy):
             cls_name = names.get(int(c), str(c))
             cls_norm = cls_name.strip().lower()
@@ -257,6 +292,9 @@ class _LocalYoloTracker:
                 # Убираем заведомо "шумные" классы из пользовательского blacklist.
                 continue
             x1, y1, x2, y2 = box
+            min_box_size_cls = float(max(1, min_box_by_class.get(cls_norm, int(min_box_size))))
+            if (x2 - x1) < min_box_size_cls or (y2 - y1) < min_box_size_cls:
+                continue
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
             # Перспективная фильтрация confidence:
@@ -289,6 +327,17 @@ class _LocalYoloTracker:
             elif not cfg.object_classes or int(c) in cfg.object_classes:
                 # В detections складываем только целевые объекты (без person).
                 detections.append(det)
+        # Дополнительная стабилизация ID людей:
+        # даже при кратких сбоях трекера сохраняем непрерывность track_id.
+        if persons:
+            person_ids = self._assign_aux_ids(
+                classes=[cfg.person_class] * len(persons),
+                boxes_xyxy=[list(p.bbox) for p in persons],
+                h=h,
+                w=w,
+            )
+            for p, stable_id in zip(persons, person_ids):
+                p.track_id = int(stable_id)
 
         # Второй проход по зоне пола: повышает recall для объектов на полу.
         # При scheduler hints в режиме перегруза ограничиваем/отключаем ROI-верификацию.
@@ -304,6 +353,20 @@ class _LocalYoloTracker:
                     cap = max(1, int(max_roi_count))
                     floor_det = sorted(floor_det, key=lambda d: d.confidence, reverse=True)[:cap]
                 detections = self._merge_detections(detections, floor_det, cfg.merge_iou_threshold)
+        if (
+            cfg.table_roi_enabled
+            and frame.shape[0] > 0
+            and (self._frame_counter % max(1, int(cfg.table_roi_every_n_frames)) == 0)
+        ):
+            roi_det = self._infer_table_roi_cup(frame, cfg, names)
+            if roi_det:
+                detections = self._merge_detections(detections, roi_det, cfg.merge_iou_threshold)
+        # Отдельный слой "unknown" добавляет кандидаты новых объектов, которые
+        # YOLO не смог уверенно отнести к известному классу.
+        if cfg.unknown_layer_enabled:
+            unknown_det = self._infer_unknown_objects(frame, detections, persons, cfg)
+            if unknown_det:
+                detections = self._merge_detections(detections, unknown_det, cfg.merge_iou_threshold)
         return DetectionResult(detections, persons, inference_ms)
 
     def _infer_floor_roi(
@@ -315,6 +378,10 @@ class _LocalYoloTracker:
         names: dict[int, str],
     ) -> list[Detection]:
         h, w = frame.shape[:2]
+        min_box_size = float(max(1, cfg.min_box_size_px))
+        min_box_by_class = {
+            str(k).strip().lower(): int(v) for k, v in (cfg.min_box_size_by_class or {}).items() if str(k).strip()
+        }
         y0 = int(max(0, min(h - 1, h * float(cfg.floor_roi_y_ratio))))
         crop = frame[y0:, :]
         if crop.size == 0:
@@ -349,6 +416,9 @@ class _LocalYoloTracker:
             if cls_norm in {"tv", "monitor"} or cls_norm in excluded:
                 continue
             x1, y1, x2, y2 = box
+            min_box_size_cls = float(max(1, min_box_by_class.get(cls_norm, int(min_box_size))))
+            if (x2 - x1) < min_box_size_cls or (y2 - y1) < min_box_size_cls:
+                continue
             y1 += y0
             y2 += y0
             cx = (x1 + x2) / 2.0
@@ -365,6 +435,72 @@ class _LocalYoloTracker:
                     cls_name=cls_name,
                     confidence=float(p),
                     bbox=(float(x1), float(y1), float(x2), float(y2)),
+                    centroid=(cx, cy),
+                )
+            )
+        return out
+
+    def _infer_table_roi_cup(
+        self,
+        frame: np.ndarray,
+        cfg: ModelConfig,
+        names: dict[int, str],
+    ) -> list[Detection]:
+        h, w = frame.shape[:2]
+        x1 = int(max(0, min(w - 1, round(float(cfg.table_roi_x1) * w))))
+        y1 = int(max(0, min(h - 1, round(float(cfg.table_roi_y1) * h))))
+        x2 = int(max(x1 + 1, min(w, round(float(cfg.table_roi_x2) * w))))
+        y2 = int(max(y1 + 1, min(h, round(float(cfg.table_roi_y2) * h))))
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+
+        with self._lock:
+            assert self._model is not None
+            with torch.inference_mode():
+                rs = self._model.predict(
+                    source=crop,
+                    imgsz=int(cfg.table_roi_imgsz),
+                    conf=float(cfg.table_roi_conf),
+                    iou=float(cfg.table_roi_iou),
+                    device=self._device,
+                    half=self._half,
+                    classes=[int(cfg.cup_class)],
+                    verbose=False,
+                )
+        if not rs:
+            return []
+        r = rs[0]
+        if r.boxes is None:
+            return []
+
+        cls = r.boxes.cls.int().cpu().tolist()
+        conf = r.boxes.conf.float().cpu().tolist()
+        xyxy = r.boxes.xyxy.cpu().tolist()
+        full_boxes = [[bx1 + x1, by1 + y1, bx2 + x1, by2 + y1] for bx1, by1, bx2, by2 in xyxy]
+        aux_ids = self._assign_aux_ids(cls, full_boxes, h, w)
+        min_box_size = float(max(1, cfg.min_box_size_px))
+        min_box_by_class = {
+            str(k).strip().lower(): int(v) for k, v in (cfg.min_box_size_by_class or {}).items() if str(k).strip()
+        }
+
+        out: list[Detection] = []
+        for tid, c, p, box in zip(aux_ids, cls, conf, full_boxes):
+            cls_name = names.get(int(c), str(c))
+            cls_norm = cls_name.strip().lower()
+            min_box_size_cls = float(max(1, min_box_by_class.get(cls_norm, int(min_box_size))))
+            bx1, by1, bx2, by2 = box
+            if (bx2 - bx1) < min_box_size_cls or (by2 - by1) < min_box_size_cls:
+                continue
+            cx = (bx1 + bx2) / 2.0
+            cy = (by1 + by2) / 2.0
+            out.append(
+                Detection(
+                    track_id=int(tid),
+                    cls_id=int(c),
+                    cls_name=cls_name,
+                    confidence=float(p),
+                    bbox=(float(bx1), float(by1), float(bx2), float(by2)),
                     centroid=(cx, cy),
                 )
             )
@@ -442,6 +578,217 @@ class _LocalYoloTracker:
             if not duplicate:
                 merged.append(d)
         return merged
+
+    def _infer_unknown_objects(
+        self,
+        frame: np.ndarray,
+        known_objects: list[Detection],
+        persons: list[Detection],
+        cfg: ModelConfig,
+    ) -> list[Detection]:
+        # Сравнение "до движения" и "после движения" в зоне изменения.
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        now_ts = time.time()
+        self._gray_history.append((now_ts, gray.copy()))
+        self._bg_seen_frames += 1
+        if self._motion_prev_gray is None:
+            self._motion_prev_gray = gray
+            self._static_gray = gray.copy()
+            self._long_static_gray = gray.copy()
+            self._person_motion_mask = np.zeros(gray.shape, dtype=np.uint8)
+            return []
+        if self._bg_seen_frames <= int(max(1, cfg.unknown_warmup_frames)):
+            self._motion_prev_gray = gray
+            self._static_gray = gray.copy()
+            self._long_static_gray = gray.copy()
+            return []
+
+        motion_thr = int(max(0, min(255, cfg.unknown_motion_threshold)))
+        motion_diff = cv2.absdiff(gray, self._motion_prev_gray)
+        _, motion_mask = cv2.threshold(motion_diff, motion_thr, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        motion_contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        motion_min_area = float(max(1, cfg.unknown_motion_min_area_px))
+        in_motion = any(cv2.contourArea(c) >= motion_min_area for c in motion_contours)
+        self._motion_prev_gray = gray
+
+        if in_motion:
+            if self._pre_motion_gray is None and self._static_gray is not None:
+                self._pre_motion_gray = self._static_gray.copy()
+            if self._person_motion_mask is None:
+                self._person_motion_mask = np.zeros(gray.shape, dtype=np.uint8)
+            # Накапливаем зоны, где двигался человек, чтобы потом не считать их "new object".
+            person_pad = int(max(0, cfg.unknown_person_exclusion_px))
+            for p in persons:
+                px1, py1, px2, py2 = p.bbox
+                x1 = max(0, int(px1 - person_pad))
+                y1 = max(0, int(py1 - person_pad))
+                x2 = min(gray.shape[1], int(px2 + person_pad))
+                y2 = min(gray.shape[0], int(py2 + person_pad))
+                if x2 > x1 and y2 > y1:
+                    self._person_motion_mask[y1:y2, x1:x2] = 255
+            self._no_motion_frames = 0
+            return []
+        self._no_motion_frames += 1
+
+        settle_frames = int(max(1, cfg.unknown_settle_frames))
+        if self._no_motion_frames < settle_frames:
+            return []
+
+        reference_gray = self._pre_motion_gray if self._pre_motion_gray is not None else self._static_gray
+        if reference_gray is None:
+            self._static_gray = gray.copy()
+            return []
+        if self._long_static_gray is None:
+            self._long_static_gray = reference_gray.copy()
+        interval_ref = self._get_interval_reference(now_ts, float(max(0.5, cfg.unknown_compare_interval_sec)))
+
+        intensity_thr = int(max(0, min(255, cfg.unknown_diff_intensity_threshold)))
+        grad_thr = int(max(0, min(255, cfg.unknown_grad_threshold)))
+        diff_abs_pre = cv2.absdiff(gray, reference_gray)
+        diff_abs_long = cv2.absdiff(gray, self._long_static_gray)
+        diff_abs_interval = cv2.absdiff(gray, interval_ref)
+        grad_cur = self._gradient_mag(gray)
+        grad_ref = self._gradient_mag(reference_gray)
+        grad_long = self._gradient_mag(self._long_static_gray)
+        grad_interval = self._gradient_mag(interval_ref)
+        grad_diff_pre = cv2.absdiff(grad_cur, grad_ref)
+        grad_diff_long = cv2.absdiff(grad_cur, grad_long)
+        grad_diff_interval = cv2.absdiff(grad_cur, grad_interval)
+        mask_pre = (diff_abs_pre >= intensity_thr) & (grad_diff_pre >= grad_thr)
+        mask_long = (diff_abs_long >= intensity_thr) & (grad_diff_long >= grad_thr)
+        mask_interval = (diff_abs_interval >= intensity_thr) & (grad_diff_interval >= grad_thr)
+        mask = np.where(mask_pre | mask_long | mask_interval, 255, 0).astype(np.uint8)
+        if self._person_motion_mask is not None:
+            mask = cv2.bitwise_and(mask, cv2.bitwise_not(self._person_motion_mask))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            self._static_gray = gray.copy()
+            self._long_static_gray = cv2.addWeighted(self._long_static_gray, 0.95, gray, 0.05, 0)
+            self._pre_motion_gray = None
+            if self._person_motion_mask is not None:
+                self._person_motion_mask.fill(0)
+            return []
+
+        h, w = frame.shape[:2]
+        frame_area = float(max(1, h * w))
+        min_area = float(max(1, cfg.unknown_min_area_px))
+        max_area = float(max(min_area, cfg.unknown_max_area_ratio * frame_area))
+        min_fill = float(max(0.01, min(1.0, cfg.unknown_min_fill_ratio)))
+        person_iou_thr = float(max(0.0, min(1.0, cfg.unknown_person_iou_threshold)))
+        person_pad = int(max(0, cfg.unknown_person_exclusion_px))
+        min_y = float(h) * float(max(0.0, min(1.0, cfg.unknown_min_y_ratio)))
+        border_px = int(max(0, cfg.unknown_border_px))
+        min_box_size = float(max(1, cfg.min_box_size_px))
+        pseudo_conf = float(max(0.01, min(1.0, cfg.unknown_confidence)))
+        expanded_person_boxes: list[tuple[float, float, float, float]] = []
+        for p in persons:
+            px1, py1, px2, py2 = p.bbox
+            expanded_person_boxes.append(
+                (
+                    max(0.0, px1 - person_pad),
+                    max(0.0, py1 - person_pad),
+                    min(float(w), px2 + person_pad),
+                    min(float(h), py2 + person_pad),
+                )
+            )
+
+        candidate_boxes: list[tuple[float, float, float, float]] = []
+        for cnt in contours:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            area = float(bw * bh)
+            if area < min_area or area > max_area:
+                continue
+            ar = bw / max(1.0, float(bh))
+            if ar > 4.0 or ar < 0.2:
+                continue
+
+            x1, y1, x2, y2 = float(x), float(y), float(x + bw), float(y + bh)
+            if (x2 - x1) < min_box_size or (y2 - y1) < min_box_size:
+                continue
+            if x1 <= border_px or y1 <= border_px or x2 >= (w - border_px) or y2 >= (h - border_px):
+                continue
+            if y2 < min_y:
+                continue
+            roi = mask[y : y + bh, x : x + bw]
+            if roi.size == 0:
+                continue
+            fill_ratio = float(cv2.countNonZero(roi)) / float(roi.size)
+            if fill_ratio < min_fill:
+                continue
+
+            bbox = (x1, y1, x2, y2)
+            if any(self._iou_tuple(bbox, d.bbox) >= person_iou_thr for d in known_objects):
+                continue
+            if any(self._iou_tuple(bbox, p.bbox) >= person_iou_thr for p in persons):
+                continue
+            if any(self._boxes_intersect(bbox, pb) for pb in expanded_person_boxes):
+                continue
+
+            candidate_boxes.append(bbox)
+        if not candidate_boxes:
+            return []
+
+        aux_ids = self._assign_aux_ids(
+            classes=[-1] * len(candidate_boxes),
+            boxes_xyxy=[list(b) for b in candidate_boxes],
+            h=h,
+            w=w,
+        )
+        out: list[Detection] = []
+        for tid, bbox in zip(aux_ids, candidate_boxes):
+            x1, y1, x2, y2 = bbox
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            out.append(
+                Detection(
+                    track_id=int(tid),
+                    cls_id=-1,
+                    cls_name="unknown",
+                    confidence=pseudo_conf,
+                    bbox=bbox,
+                    centroid=(cx, cy),
+                )
+            )
+        self._static_gray = gray.copy()
+        self._long_static_gray = cv2.addWeighted(self._long_static_gray, 0.9, gray, 0.1, 0)
+        self._pre_motion_gray = None
+        if self._person_motion_mask is not None:
+            self._person_motion_mask.fill(0)
+        return out
+
+    @staticmethod
+    def _boxes_intersect(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        return ax1 < bx2 and bx1 < ax2 and ay1 < by2 and by1 < ay2
+
+    @staticmethod
+    def _gradient_mag(gray: np.ndarray) -> np.ndarray:
+        gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+        ax = cv2.convertScaleAbs(gx)
+        ay = cv2.convertScaleAbs(gy)
+        return cv2.addWeighted(ax, 0.5, ay, 0.5, 0)
+
+    def _get_interval_reference(self, now_ts: float, interval_sec: float) -> np.ndarray:
+        target_ts = now_ts - interval_sec
+        selected = self._gray_history[0][1]
+        for ts, g in self._gray_history:
+            if ts <= target_ts:
+                selected = g
+            else:
+                break
+        min_keep_ts = now_ts - max(interval_sec * 2.0, 8.0)
+        while len(self._gray_history) > 2 and self._gray_history[0][0] < min_keep_ts:
+            self._gray_history.popleft()
+        return selected
 
 
 def _worker_main(cfg: ModelConfig, command_q: Queue, result_q: Queue) -> None:

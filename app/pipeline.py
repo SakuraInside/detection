@@ -69,7 +69,7 @@ _OVERLAY_COLORS = {
     "unattended": (0, 140, 255),
     "alarm_abandoned": (0, 0, 255),
     "alarm_disappeared": (255, 0, 200),
-    "person": (255, 200, 0),
+    "person": (255, 0, 0),
     "default": (180, 180, 180),
 }
 
@@ -556,7 +556,8 @@ class VideoPipeline:
             tracks = {t["id"]: t for t in tracks_data}
             if cfg.ui.show_persons:
                 for p in result.persons:
-                    self._draw_box(img, p.bbox, _OVERLAY_COLORS["person"], f"person {p.confidence:.2f}")
+                    person_label = f"person #{p.track_id} {p.confidence:.2f}"
+                    self._draw_box(img, p.bbox, _OVERLAY_COLORS["person"], person_label)
             for det in result.detections:
                 state = tracks.get(det.track_id, {}).get("state", "candidate")
                 color = _OVERLAY_COLORS.get(state, _OVERLAY_COLORS["default"])
