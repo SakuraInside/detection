@@ -29,6 +29,7 @@ from .analyzer import Analyzer, AnalyzerEvent
 from .config import AppConfig, ConfigStore
 from .detector import DetectionResult, YoloTracker
 from .logger_db import EventLogger, EventRow, now
+from .runtime_bridge import RuntimeBridgeConfig, RuntimeControlDecision, RuntimeCoreBridge
 
 cv2.setUseOptimized(True)
 # Не распараллеливаем OpenCV по CPU чрезмерно: это снижает конкуренцию
@@ -51,6 +52,15 @@ class RenderedFrame:
     detections: int
     persons: int
     inference_ms: float
+
+
+@dataclass
+class RenderJob:
+    frame_id: int
+    pos_ms: float
+    image: np.ndarray
+    result: DetectionResult
+    tracks: list[dict]
 
 
 _OVERLAY_COLORS = {
@@ -82,6 +92,14 @@ class VideoPipeline:
 
         self._tracker = YoloTracker(config_store.cfg.model)
         self._analyzer = Analyzer(config_store.cfg.analyzer)
+        self._runtime_bridge = RuntimeCoreBridge(
+            RuntimeBridgeConfig(
+                addr=str(config_store.cfg.pipeline.runtime_core_addr or "").strip(),
+                timeout_sec=float(config_store.cfg.pipeline.runtime_core_timeout_sec),
+                control_addr=str(config_store.cfg.pipeline.runtime_control_addr or "").strip(),
+                control_timeout_sec=float(config_store.cfg.pipeline.runtime_control_timeout_sec),
+            )
+        )
 
         # Состояние открытого видео и его метаданные.
         self._cap_lock = threading.RLock()
@@ -106,6 +124,7 @@ class VideoPipeline:
         self._latest_lock = threading.Lock()
         self._latest_rendered: Optional[RenderedFrame] = None
         self._last_result: Optional[DetectionResult] = None
+        self._last_tracks: list[dict] = []
         self._stats_lock = threading.Lock()
         self._stats = {
             "decoded": 0,
@@ -115,6 +134,15 @@ class VideoPipeline:
             "decode_fps": 0.0,
             "render_fps": 0.0,
             "inference_ms_avg": 0.0,
+            "scheduler_mode": "local",
+            "runtime_control_enabled": False,
+            "runtime_control_decisions": 0,
+            "runtime_control_fallbacks": 0,
+            "scheduler_target_interval": 1,
+            "scheduler_priority": "normal",
+            "scheduler_overload_level": 0,
+            "scheduler_latency_ema_ms": 0.0,
+            "scheduler_max_roi_count": 1,
         }
         self._decode_fps_window: list[float] = []
         self._render_fps_window: list[float] = []
@@ -122,8 +150,13 @@ class VideoPipeline:
 
         self._decoder_thread = threading.Thread(target=self._decoder_loop, name="decoder", daemon=True)
         self._worker_thread = threading.Thread(target=self._worker_loop, name="inference", daemon=True)
+        self._render_q: "queue.Queue[RenderJob]" = queue.Queue(
+            maxsize=max(1, int(config_store.cfg.pipeline.result_queue))
+        )
+        self._render_thread = threading.Thread(target=self._render_loop, name="render", daemon=True)
         self._decoder_thread.start()
         self._worker_thread.start()
+        self._render_thread.start()
 
     # ---------------------------------------------------------------- public
 
@@ -150,6 +183,37 @@ class VideoPipeline:
             "loaded": self._cap is not None,
             "stats": stats,
             "tracks": self._analyzer.tracks_snapshot(),
+        }
+
+    def metrics(self) -> dict:
+        with self._stats_lock:
+            stats = dict(self._stats)
+        with self._latest_lock:
+            latest = self._latest_rendered
+        return {
+            "stats": stats,
+            "queues": {
+                "decode_size": self._decode_q.qsize(),
+                "decode_max": self._decode_q.maxsize,
+                "render_size": self._render_q.qsize(),
+                "render_max": self._render_q.maxsize,
+            },
+            "video": {
+                "path": self._video_path,
+                "fps": self._fps,
+                "width": self._frame_w,
+                "height": self._frame_h,
+                "loaded": self._cap is not None,
+                "playing": self._play_event.is_set(),
+            },
+            "latest_frame": None
+            if latest is None
+            else {
+                "frame_id": latest.frame_id,
+                "detections": latest.detections,
+                "persons": latest.persons,
+                "inference_ms": latest.inference_ms,
+            },
         }
 
     def open(self, path: str) -> dict:
@@ -204,11 +268,27 @@ class VideoPipeline:
         # Применяем изменения model + analyzer (если были).
         self._tracker.reload(self._cfg_store.cfg.model)
         self._analyzer.update_config(self._cfg_store.cfg.analyzer)
+        self._runtime_bridge.update(
+            RuntimeBridgeConfig(
+                addr=str(self._cfg_store.cfg.pipeline.runtime_core_addr or "").strip(),
+                timeout_sec=float(self._cfg_store.cfg.pipeline.runtime_core_timeout_sec),
+                control_addr=str(self._cfg_store.cfg.pipeline.runtime_control_addr or "").strip(),
+                control_timeout_sec=float(self._cfg_store.cfg.pipeline.runtime_control_timeout_sec),
+            )
+        )
         self._last_result = None
 
     def update_settings(self) -> None:
         # Легкое обновление без перезагрузки нейросети.
         self._analyzer.update_config(self._cfg_store.cfg.analyzer)
+        self._runtime_bridge.update(
+            RuntimeBridgeConfig(
+                addr=str(self._cfg_store.cfg.pipeline.runtime_core_addr or "").strip(),
+                timeout_sec=float(self._cfg_store.cfg.pipeline.runtime_core_timeout_sec),
+                control_addr=str(self._cfg_store.cfg.pipeline.runtime_control_addr or "").strip(),
+                control_timeout_sec=float(self._cfg_store.cfg.pipeline.runtime_control_timeout_sec),
+            )
+        )
 
     def latest_jpeg(self) -> Optional[bytes]:
         with self._latest_lock:
@@ -227,6 +307,9 @@ class VideoPipeline:
                 self._cap.release()
         self._decoder_thread.join(timeout=2.0)
         self._worker_thread.join(timeout=2.0)
+        self._render_thread.join(timeout=2.0)
+        self._runtime_bridge.close()
+        self._tracker.shutdown()
 
     # --------------------------------------------------------------- threads
 
@@ -316,10 +399,47 @@ class VideoPipeline:
             # Можно запускать тяжелый инференс не на каждом кадре.
             detect_every = max(1, int(self._cfg_store.cfg.pipeline.detect_every_n_frames))
             should_infer = self._last_result is None or (job.frame_id % detect_every == 0)
+            scheduler_max_roi_count = 3
+            scheduler_priority = "normal"
+            # Если подключен runtime-core control-plane, решение по infer
+            # централизуется в Rust scheduler.
+            if self._last_result is not None:
+                runtime_control_enabled = bool(
+                    str(self._cfg_store.cfg.pipeline.runtime_control_addr or "").strip()
+                )
+                with self._stats_lock:
+                    self._stats["runtime_control_enabled"] = runtime_control_enabled
+                    if not runtime_control_enabled:
+                        self._stats["scheduler_mode"] = "local"
+                decision: Optional[RuntimeControlDecision] = self._runtime_bridge.should_infer(
+                    camera_id=self._video_path or "single-camera",
+                    frame_id=job.frame_id,
+                    default_interval=detect_every,
+                )
+                if decision is not None:
+                    should_infer = decision.infer
+                    scheduler_max_roi_count = int(decision.max_roi_count)
+                    scheduler_priority = str(decision.priority)
+                    with self._stats_lock:
+                        self._stats["scheduler_mode"] = "runtime-core"
+                        self._stats["runtime_control_decisions"] += 1
+                        self._stats["scheduler_target_interval"] = int(decision.target_interval)
+                        self._stats["scheduler_priority"] = str(decision.priority)
+                        self._stats["scheduler_overload_level"] = int(decision.overload_level)
+                        self._stats["scheduler_latency_ema_ms"] = float(decision.latency_ema_ms)
+                        self._stats["scheduler_max_roi_count"] = int(decision.max_roi_count)
+                elif runtime_control_enabled:
+                    with self._stats_lock:
+                        self._stats["scheduler_mode"] = "local-fallback"
+                        self._stats["runtime_control_fallbacks"] += 1
 
             if should_infer:
                 try:
-                    result = self._tracker.infer(job.image)
+                    result = self._tracker.infer(
+                        job.image,
+                        max_roi_count=scheduler_max_roi_count,
+                        priority=scheduler_priority,
+                    )
                 except Exception as exc:
                     print(f"[pipeline] inference error: {exc}")
                     continue
@@ -328,6 +448,22 @@ class VideoPipeline:
                 events = self._analyzer.ingest(ts_now, result)
                 for ev in events:
                     self._handle_event(ev, job, ts_now)
+                self._last_tracks = self._analyzer.tracks_snapshot()
+                self._runtime_bridge.send(
+                    {
+                        "type": "inference_result",
+                        "camera_id": self._video_path or "single-camera",
+                        "frame_id": job.frame_id,
+                        "pos_ms": float(job.pos_ms),
+                        "inference_ms": float(result.inference_ms),
+                        "detections": len(result.detections),
+                        "persons": len(result.persons),
+                        "tracks": len(self._last_tracks),
+                        "events": len(events),
+                        "scheduler_priority": scheduler_priority,
+                        "scheduler_max_roi_count": scheduler_max_roi_count,
+                    }
+                )
 
                 with self._stats_lock:
                     self._stats["inferred"] += 1
@@ -342,21 +478,60 @@ class VideoPipeline:
                 # Повторно используем прошлый результат между кадрами,
                 # чтобы разгрузить модель и повысить плавность.
                 result = self._last_result
+            tracks = list(self._last_tracks)
+            self._runtime_bridge.send(
+                {
+                    "type": "frame_observed",
+                    "camera_id": self._video_path or "single-camera",
+                    "frame_id": job.frame_id,
+                    "pos_ms": float(job.pos_ms),
+                    "width": int(job.image.shape[1]) if job.image is not None else 0,
+                    "height": int(job.image.shape[0]) if job.image is not None else 0,
+                    "inferred": bool(should_infer),
+                }
+            )
+            self._enqueue_render(job, result, tracks)
 
+    def _enqueue_render(self, job: FrameJob, result: DetectionResult, tracks: list[dict]) -> None:
+        render_job = RenderJob(
+            frame_id=job.frame_id,
+            pos_ms=job.pos_ms,
+            image=job.image,
+            result=result,
+            tracks=tracks,
+        )
+        try:
+            self._render_q.put_nowait(render_job)
+        except queue.Full:
+            # Preview-контур может отставать, но analytics path блокировать нельзя.
+            try:
+                self._render_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._render_q.put_nowait(render_job)
+            except queue.Full:
+                pass
+
+    def _render_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                job = self._render_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
             render_every = max(1, int(self._cfg_store.cfg.pipeline.render_every_n_frames))
             if (job.frame_id % render_every) != 0 and self._latest_rendered is not None:
-                # Повторно используем прошлый JPEG, чтобы снизить CPU-нагрузку на кодек.
                 jpeg = self._latest_rendered.jpeg
             else:
-                jpeg = self._render(job, result)
+                jpeg = self._render(job, job.result, job.tracks)
             with self._latest_lock:
                 self._latest_rendered = RenderedFrame(
                     frame_id=job.frame_id,
                     pos_ms=job.pos_ms,
                     jpeg=jpeg,
-                    detections=len(result.detections),
-                    persons=len(result.persons),
-                    inference_ms=result.inference_ms,
+                    detections=len(job.result.detections),
+                    persons=len(job.result.persons),
+                    inference_ms=job.result.inference_ms,
                 )
             self._tick_window(self._render_fps_window, "render_fps")
 
@@ -372,13 +547,13 @@ class VideoPipeline:
         with self._stats_lock:
             self._stats[stat_key] = float(len(window))
 
-    def _render(self, job: FrameJob, result: DetectionResult) -> bytes:
+    def _render(self, job: RenderJob, result: DetectionResult, tracks_data: list[dict]) -> bytes:
         # Рисуем оверлей и кодируем в JPEG для web-стрима.
         cfg: AppConfig = self._cfg_store.cfg
         img = job.image
         if cfg.pipeline.render_overlay:
             img = img.copy()
-            tracks = {t["id"]: t for t in self._analyzer.tracks_snapshot()}
+            tracks = {t["id"]: t for t in tracks_data}
             if cfg.ui.show_persons:
                 for p in result.persons:
                     self._draw_box(img, p.bbox, _OVERLAY_COLORS["person"], f"person {p.confidence:.2f}")

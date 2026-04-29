@@ -10,3 +10,4 @@ logs/events.db-*
 
 # large model weights (use releases/LFS if needed)
 *.pt
+runtime-core/target/

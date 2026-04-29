@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -138,6 +140,14 @@ def create_app() -> FastAPI:
     @app.get("/api/info")
     async def _info() -> dict:
         return pipeline.info()
+
+    @app.get("/api/metrics")
+    async def _metrics() -> dict:
+        return {
+            "process": _process_metrics(),
+            "system": _system_metrics(),
+            "pipeline": pipeline.metrics(),
+        }
 
     @app.get("/api/files")
     async def _files() -> dict:
@@ -280,3 +290,114 @@ async def _status_pump(hub: WSHub, pipeline: VideoPipeline) -> None:
 
 
 app = create_app()
+
+
+def _process_metrics() -> dict:
+    rss_bytes = None
+    vms_bytes = None
+    cpu_percent = None
+    try:
+        import psutil  # type: ignore
+
+        p = psutil.Process(os.getpid())
+        mem = p.memory_info()
+        rss_bytes = int(mem.rss)
+        vms_bytes = int(mem.vms)
+        cpu_percent = float(p.cpu_percent(interval=0.0))
+    except Exception:
+        pass
+    return {
+        "pid": os.getpid(),
+        "rss_bytes": rss_bytes,
+        "vms_bytes": vms_bytes,
+        "cpu_percent": cpu_percent,
+    }
+
+
+def _system_metrics() -> dict:
+    cpu_percent = None
+    ram_used = None
+    ram_total = None
+    ram_percent = None
+    try:
+        import psutil  # type: ignore
+
+        cpu_percent = float(psutil.cpu_percent(interval=0.0))
+        vm = psutil.virtual_memory()
+        ram_used = int(vm.used)
+        ram_total = int(vm.total)
+        ram_percent = float(vm.percent)
+    except Exception:
+        pass
+    return {
+        "cpu_percent": cpu_percent,
+        "ram_used_bytes": ram_used,
+        "ram_total_bytes": ram_total,
+        "ram_percent": ram_percent,
+        "gpu": _gpu_metrics(),
+    }
+
+
+def _gpu_metrics() -> dict:
+    # Для production-like GPU-нод предпочитаем nvidia-smi как системный источник.
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=1.5, check=True)
+    except Exception:
+        return {
+            "available": False,
+            "name": None,
+            "util_percent": None,
+            "memory_used_bytes": None,
+            "memory_total_bytes": None,
+            "memory_percent": None,
+        }
+    lines = [x.strip() for x in out.stdout.splitlines() if x.strip()]
+    if not lines:
+        return {
+            "available": False,
+            "name": None,
+            "util_percent": None,
+            "memory_used_bytes": None,
+            "memory_total_bytes": None,
+            "memory_percent": None,
+        }
+    # Берем первую GPU для базового NOC-дашборда.
+    parts = [p.strip() for p in lines[0].split(",")]
+    if len(parts) < 4:
+        return {
+            "available": False,
+            "name": None,
+            "util_percent": None,
+            "memory_used_bytes": None,
+            "memory_total_bytes": None,
+            "memory_percent": None,
+        }
+    name = parts[0]
+    util = _to_float(parts[1])
+    mem_used_mb = _to_float(parts[2])
+    mem_total_mb = _to_float(parts[3])
+    used_bytes = int(mem_used_mb * 1024 * 1024) if mem_used_mb is not None else None
+    total_bytes = int(mem_total_mb * 1024 * 1024) if mem_total_mb is not None else None
+    mem_percent = None
+    if mem_used_mb is not None and mem_total_mb and mem_total_mb > 0:
+        mem_percent = float((mem_used_mb / mem_total_mb) * 100.0)
+    return {
+        "available": True,
+        "name": name,
+        "util_percent": util,
+        "memory_used_bytes": used_bytes,
+        "memory_total_bytes": total_bytes,
+        "memory_percent": mem_percent,
+    }
+
+
+def _to_float(raw: str) -> float | None:
+    try:
+        return float(raw.strip())
+    except Exception:
+        return None

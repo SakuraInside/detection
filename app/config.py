@@ -83,6 +83,25 @@ class ModelConfig:
     floor_roi_conf: float = 0.04
     # Порог IoU для дедупликации "full frame" и "floor ROI" детекций.
     merge_iou_threshold: float = 0.45
+    # Запускать YOLO в отдельном Python worker-процессе (thin inference layer).
+    # Это снижает влияние модели на основной runtime и упрощает дальнейший вынос оркестрации.
+    use_inference_worker: bool = True
+    # Ограничение IPC-очередей запросов/ответов к worker.
+    worker_queue_size: int = 2
+    # Таймаут RPC-запросов к worker (сек).
+    worker_timeout_sec: float = 20.0
+    # Таймаут ожидания запуска worker и загрузки модели (сек).
+    worker_startup_timeout_sec: float = 90.0
+    # Старт-метод multiprocessing.
+    # На Windows/кроссплатформенно безопаснее "spawn".
+    worker_mp_start_method: str = "spawn"
+    # Передавать кадры в worker через shared memory, а не через pickle очереди.
+    worker_use_shared_memory: bool = True
+    # Адрес внешнего inference service (JSON-RPC), например "127.0.0.1:7788".
+    # Если задан, модель обслуживается внешним процессом, а не локальным worker.
+    inference_rpc_addr: str = ""
+    # Таймаут вызова внешнего inference service (сек).
+    inference_rpc_timeout_sec: float = 20.0
 
 
 @dataclass
@@ -102,6 +121,14 @@ class PipelineConfig:
     jpeg_quality: int = 80
     # Кодировать JPEG не для каждого кадра (ускоряет рендер на слабом CPU).
     render_every_n_frames: int = 1
+    # Адрес Rust runtime-core ingest bridge (JSON line protocol), например "127.0.0.1:7878".
+    runtime_core_addr: str = ""
+    # Таймаут отправки метаданных в runtime-core (сек).
+    runtime_core_timeout_sec: float = 0.05
+    # Адрес control-plane scheduler в runtime-core, например "127.0.0.1:7879".
+    runtime_control_addr: str = ""
+    # Таймаут запроса решения should_infer (сек).
+    runtime_control_timeout_sec: float = 0.01
 
 
 @dataclass

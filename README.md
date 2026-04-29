@@ -86,6 +86,38 @@ python run.py
 
 Открыть UI: [http://127.0.0.1:8000](http://127.0.0.1:8000)
 
+### Быстрый запуск migration-стека
+
+Единая команда запуска с профилями:
+
+```bash
+python run_stack.py --profile external
+```
+
+Windows one-command запуск:
+
+```powershell
+.\run_stack.ps1 -Profile external
+```
+
+Профили:
+
+- `legacy` — только текущий Python runtime (без runtime-core и внешнего inference RPC);
+- `hybrid` — Python runtime + внутренний inference worker + runtime-core control/ingest;
+- `external` — целевой режим: runtime-core + внешний Python inference service + app.
+
+### Сравнительный benchmark профилей
+
+```bash
+python benchmark_profiles.py --profiles legacy,hybrid,external --duration-sec 20
+```
+
+Результат сохраняется в `logs/benchmark_profiles.json` и показывает:
+
+- `decode_fps_avg`, `render_fps_avg`, `inference_ms_avg`;
+- `rss_mb_avg`, `rss_mb_peak`;
+- активный `scheduler_mode`.
+
 ---
 
 ## 4) Подробно по файлам (кто за что отвечает)
@@ -305,6 +337,7 @@ python run.py
 ## 5) REST/WS API (кратко)
 
 - `GET /api/info` — текущий статус пайплайна, метрики, треки.
+- `GET /api/metrics` — расширенные runtime-метрики (process + pipeline queues/stats).
 - `GET /api/files` — список видео в `data/`.
 - `POST /api/open` — открыть видео.
 - `POST /api/play` / `POST /api/pause` — управление проигрыванием.
@@ -357,6 +390,60 @@ python run.py
 - декод видео (`cv2.VideoCapture`),
 - JPEG-кодирование для MJPEG,
 - часть web/SQLite операций.
+
+### Варианты инференс-режима
+
+Сейчас поддерживаются 3 режима model-serving:
+
+- локально в процессе (`use_inference_worker=false`);
+- отдельный Python worker-процесс (`use_inference_worker=true`);
+- внешний inference service (`inference_rpc_addr="127.0.0.1:7788"`).
+
+Рекомендуемый migration-path:
+
+1) сначала `use_inference_worker=true` + `worker_use_shared_memory=true`;  
+2) затем вынос в отдельный сервис `python run_inference_service.py --host 127.0.0.1 --port 7788`;  
+3) после этого в `config.json` задать `inference_rpc_addr`.
+
+Для автоматического применения пресетов используйте:
+
+```bash
+python run_stack.py --profile legacy
+python run_stack.py --profile hybrid
+python run_stack.py --profile external
+```
+
+### Переменные окружения для runtime-портов
+
+Можно централизованно переопределить адреса без правки кода:
+
+- `RUNTIME_INGEST_ADDR` (default `127.0.0.1:7878`)
+- `RUNTIME_CONTROL_ADDR` (default `127.0.0.1:7879`)
+- `INFERENCE_RPC_ADDR` (default `127.0.0.1:7788`)
+- `APP_HOST` / `APP_PORT` (defaults `127.0.0.1` / `8000`)
+
+Для централизованного scheduling из Rust runtime:
+
+- поднять `runtime-core` с `RUNTIME_CONTROL_ADDR=127.0.0.1:7879`;
+- в `config.json` указать `pipeline.runtime_control_addr = "127.0.0.1:7879"`.
+
+После этого решение `should_infer` запрашивается у runtime-core, а не только локально по `detect_every_n_frames`.
+Статус виден в `GET /api/info -> stats`:
+
+- `scheduler_mode`: `local` / `runtime-core` / `local-fallback`
+- `runtime_control_enabled`
+- `runtime_control_decisions`
+- `runtime_control_fallbacks`
+- `scheduler_target_interval`
+- `scheduler_priority`
+- `scheduler_overload_level`
+- `scheduler_latency_ema_ms`
+- `scheduler_max_roi_count`
+
+Hints теперь реально применяются в инференсе:
+
+- `scheduler_priority=low` отключает тяжелую floor ROI верификацию;
+- `scheduler_max_roi_count` ограничивает число floor ROI-кандидатов на дополнительный проход.
 
 ---
 

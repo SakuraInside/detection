@@ -42,7 +42,15 @@
     "floor_roi_y_ratio": 0.55,
     "floor_roi_imgsz": 960,
     "floor_roi_conf": 0.04,
-    "merge_iou_threshold": 0.45
+    "merge_iou_threshold": 0.45,
+    "use_inference_worker": true,
+    "worker_queue_size": 2,
+    "worker_timeout_sec": 20.0,
+    "worker_startup_timeout_sec": 90.0,
+    "worker_mp_start_method": "spawn",
+    "worker_use_shared_memory": true,
+    "inference_rpc_addr": "127.0.0.1:7788",
+    "inference_rpc_timeout_sec": 20.0
   },
   "pipeline": {
     "decode_queue": 4,
@@ -52,7 +60,11 @@
     "render_overlay": true,
     "prefer_hw_decode": true,
     "jpeg_quality": 60,
-    "render_every_n_frames": 2
+    "render_every_n_frames": 2,
+    "runtime_core_addr": "127.0.0.1:7878",
+    "runtime_core_timeout_sec": 0.05,
+    "runtime_control_addr": "127.0.0.1:7879",
+    "runtime_control_timeout_sec": 0.01
   },
   "analyzer": {
     "static_displacement_px": 8,
