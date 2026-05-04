@@ -1,7 +1,7 @@
 {
   "model": {
-    "weights": "models/yolo11x.pt",
-    "imgsz": 896,
+    "weights": "models/yolo11m.pt",
+    "imgsz": 640,
     "device": "cuda:0",
     "half": true,
     "conf": 0.1,
@@ -44,7 +44,7 @@
     },
     "floor_roi_enabled": true,
     "floor_roi_y_ratio": 0.55,
-    "floor_roi_imgsz": 1280,
+    "floor_roi_imgsz": 704,
     "floor_roi_conf": 0.02,
     "merge_iou_threshold": 0.45,
     "use_inference_worker": false,
@@ -55,12 +55,12 @@
     "worker_use_shared_memory": true,
     "inference_rpc_addr": "",
     "inference_rpc_timeout_sec": 20.0,
-    "table_roi_enabled": true,
+    "table_roi_enabled": false,
     "table_roi_x1": 0.12,
     "table_roi_y1": 0.14,
     "table_roi_x2": 0.5,
     "table_roi_y2": 0.66,
-    "table_roi_imgsz": 1280,
+    "table_roi_imgsz": 640,
     "table_roi_conf": 0.01,
     "table_roi_iou": 0.5,
     "table_roi_every_n_frames": 1,
@@ -86,7 +86,9 @@
     "unknown_person_exclusion_px": 40,
     "unknown_min_y_ratio": 0.3,
     "unknown_border_px": 8,
-    "unknown_confidence": 0.3
+    "unknown_confidence": 0.3,
+    "unknown_reference_scale": 0.25,
+    "unknown_gray_history_maxlen": 24
   },
   "pipeline": {
     "decode_queue": 1,
@@ -108,7 +110,12 @@
     "runtime_core_timeout_sec": 0.05,
     "runtime_control_addr": "",
     "runtime_control_timeout_sec": 0.01,
-    "rust_video_bridge_addr": ""
+    "rust_video_bridge_addr": "",
+    "forensic_ring_max": 6,
+    "memory_chart_warning_bytes": 805306368,
+    "memory_chart_critical_bytes": 1006632960,
+    "preview_encode_max_fps": 12,
+    "analytics_extra_pids": []
   },
   "analyzer": {
     "centroid_history_maxlen": 64,

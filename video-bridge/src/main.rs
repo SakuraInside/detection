@@ -39,6 +39,10 @@ struct Handshake {
     height: i32,
     fps: f64,
     frames: i64,
+    /// Клиент просил включить HW decode (OpenCV CAP_PROP_HW_ACCELERATION).
+    prefer_hw_decode: bool,
+    /// Удалось применить CAP_PROP_HW_ACCELERATION (best-effort).
+    hw_decode_set_ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
@@ -95,8 +99,18 @@ fn main() -> Result<()> {
             }
         };
         let seek_frame = v.get("seek_frame").and_then(|x| x.as_u64()).map(|x| x as i32);
+        let prefer_hw_decode = v
+            .get("prefer_hw_decode")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
 
-        match run_session(&mut stream, &path, seek_frame, args.target_fps) {
+        match run_session(
+            &mut stream,
+            &path,
+            seek_frame,
+            args.target_fps,
+            prefer_hw_decode,
+        ) {
             Ok(()) => info!(%peer, "session ended"),
             Err(e) => warn!(%peer, error = %e, "session error"),
         }
@@ -113,6 +127,8 @@ fn write_handshake_error(stream: &mut std::net::TcpStream, msg: &str) -> Result<
         height: 0,
         fps: 0.0,
         frames: 0,
+        prefer_hw_decode: false,
+        hw_decode_set_ok: false,
         message: Some(msg.to_string()),
     };
     writeln!(stream, "{}", serde_json::to_string(&h)?)?;
@@ -125,6 +141,7 @@ fn run_session(
     path: &str,
     seek_frame: Option<i32>,
     target_fps: u32,
+    prefer_hw_decode: bool,
 ) -> Result<()> {
     if !Path::new(path).exists() {
         write_handshake_error(stream, &format!("file not found: {path}"))?;
@@ -136,6 +153,21 @@ fn run_session(
     if !cap.is_opened()? {
         write_handshake_error(stream, "VideoCapture failed")?;
         return Ok(());
+    }
+
+    // OpenCV 4.x: CAP_PROP_HW_ACCELERATION + VIDEO_ACCELERATION_ANY (1.0) — best-effort.
+    const CAP_PROP_HW_ACCELERATION: i32 = 53;
+    const VIDEO_ACCELERATION_ANY: f64 = 1.0;
+    let mut hw_decode_set_ok = false;
+    if prefer_hw_decode {
+        hw_decode_set_ok = cap
+            .set(CAP_PROP_HW_ACCELERATION, VIDEO_ACCELERATION_ANY)
+            .unwrap_or(false);
+        if hw_decode_set_ok {
+            info!("HW video acceleration requested and set on capture");
+        } else {
+            warn!("prefer_hw_decode set but CAP_PROP_HW_ACCELERATION not applied (driver/build)");
+        }
     }
 
     if let Some(sf) = seek_frame {
@@ -154,6 +186,8 @@ fn run_session(
         height: h,
         fps,
         frames,
+        prefer_hw_decode,
+        hw_decode_set_ok,
         message: None,
     };
     writeln!(stream, "{}", serde_json::to_string(&hs)?)?;

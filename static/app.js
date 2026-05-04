@@ -47,7 +47,7 @@ function fmtBytes(n) {
 }
 
 function updateSpeedo(rootSel, pct, valueText, subText) {
-  const root = $(rootSel);
+  const root = rootSel.startsWith("#") ? $(rootSel) : document.getElementById(rootSel);
   if (!root) return;
   const p = Math.max(0, Math.min(100, Number.isFinite(pct) ? pct : 0));
   root.style.setProperty("--pct", String(p));
@@ -55,47 +55,6 @@ function updateSpeedo(rootSel, pct, valueText, subText) {
   const subEl = root.querySelector(".speedo-sub");
   if (valEl) valEl.textContent = valueText;
   if (subEl) subEl.textContent = subText;
-}
-
-let metricsTimer = null;
-
-async function refreshMetrics() {
-  try {
-    const data = await api("GET", "/api/metrics");
-    const sys = data.system || {};
-    const proc = data.process || {};
-    const gpu = sys.gpu || {};
-
-    const cpuPct = sys.cpu_percent;
-    updateSpeedo(
-      "#speedo-cpu",
-      cpuPct ?? 0,
-      cpuPct != null ? `${cpuPct.toFixed(0)}%` : "—",
-      proc.cpu_percent != null ? `процесс ${proc.cpu_percent.toFixed(0)}%` : ""
-    );
-
-    const ramPct = sys.ram_percent;
-    const ramSub =
-      sys.ram_used_bytes != null && sys.ram_total_bytes != null
-        ? `${fmtBytes(sys.ram_used_bytes)} / ${fmtBytes(sys.ram_total_bytes)}`
-        : "";
-    updateSpeedo("#speedo-ram", ramPct ?? 0, ramPct != null ? `${ramPct.toFixed(0)}%` : "—", ramSub);
-
-    const gn = $("#gpu-name");
-    if (gpu.available && gpu.util_percent != null) {
-      const memSub =
-        gpu.memory_used_bytes != null && gpu.memory_total_bytes != null
-          ? `${fmtBytes(gpu.memory_used_bytes)} / ${fmtBytes(gpu.memory_total_bytes)}`
-          : "";
-      updateSpeedo("#speedo-gpu", gpu.util_percent, `${gpu.util_percent.toFixed(0)}%`, memSub);
-      if (gn) gn.textContent = gpu.name || "GPU";
-    } else {
-      updateSpeedo("#speedo-gpu", 0, "—", "нет данных");
-      if (gn) gn.textContent = "GPU не обнаружена (nvidia-smi / драйвер)";
-    }
-  } catch (e) {
-    console.warn("metrics fail", e);
-  }
 }
 
 function switchOperativeTab(tab) {
@@ -151,33 +110,10 @@ async function refreshMetrics() {
   try {
     const data = await api("GET", "/api/metrics");
     applySystemMetrics(data.system || {});
+    applyProcessAnalyticsMetrics(data.process || {}, data.pipeline || {});
   } catch (e) {
     console.warn("metrics fail", e);
   }
-}
-
-function fmtBytes(v) {
-  const n = Number(v || 0);
-  if (!isFinite(n) || n <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let x = n;
-  let i = 0;
-  while (x >= 1024 && i < units.length - 1) {
-    x /= 1024;
-    i += 1;
-  }
-  return `${x.toFixed(i <= 1 ? 0 : 1)} ${units[i]}`;
-}
-
-function updateSpeedo(id, pct, usedText, totalText) {
-  const root = document.getElementById(id);
-  if (!root) return;
-  const val = Math.max(0, Math.min(100, Number(pct || 0)));
-  root.style.setProperty("--pct", String(val));
-  const valueEl = root.querySelector(".speedo-value");
-  const subEl = root.querySelector(".speedo-sub");
-  if (valueEl) valueEl.textContent = `${val.toFixed(0)}%`;
-  if (subEl) subEl.textContent = `${usedText} / ${totalText}`;
 }
 
 function applySystemMetrics(system) {
@@ -196,6 +132,84 @@ function applySystemMetrics(system) {
   const gpuUsed = fmtBytes(gpu.memory_used_bytes || 0);
   const gpuTotal = fmtBytes(gpu.memory_total_bytes || 0);
   updateSpeedo("speedo-gpu", gpuPct, gpuUsed, gpuTotal);
+}
+
+function applyProcessAnalyticsMetrics(proc, pipe) {
+  const thr = pipe.thresholds || {};
+  const warnB = Number(thr.memory_warning_bytes || 805306368);
+  const critB = Number(thr.memory_critical_bytes || 1006632960);
+  const rss = proc.rss_analytics_sum_bytes;
+  const ema = proc.rss_ema_bytes;
+  const cudaR = proc.cuda_memory_reserved_bytes;
+  const q = pipe.queues || {};
+  const buf = pipe.buffers || {};
+  const st = pipe.stats || {};
+  const leg = $("#mem-chart-legend");
+  if (leg) {
+    const parts = [
+      `RSS Σ ${fmtBytes(rss)}`,
+      `EMA ${fmtBytes(ema)}`,
+      `пик(окно) ${fmtBytes(proc.rss_peak_recent_bytes)}`,
+      `decode ${q.decode_size ?? "—"}/${q.decode_max ?? "—"}`,
+      `render ${q.render_size ?? "—"}/${q.render_max ?? "—"}`,
+      `e2e EMA ${(st.e2e_ms_ema || 0).toFixed(0)} мс`,
+    ];
+    if (cudaR != null) parts.push(`CUDA ${fmtBytes(cudaR)}`);
+    if (buf.frame_pool_free != null) parts.push(`pool своб. ${buf.frame_pool_free}/${buf.frame_pool_slots || "—"}`);
+    parts.push(`forensic ${buf.forensic_ring_len || 0}`);
+    leg.textContent = parts.join(" · ");
+  }
+  drawMemChart(proc.rss_history || [], warnB, critB);
+}
+
+function drawMemChart(hist, warnB, critB) {
+  const cv = $("#mem-chart");
+  if (!cv || !cv.getContext) return;
+  const ctx = cv.getContext("2d");
+  const w = cv.clientWidth || cv.width;
+  const h = 120;
+  if (cv.width !== w) cv.width = w;
+  if (cv.height !== h) cv.height = h;
+  ctx.fillStyle = "#f8fafc";
+  ctx.fillRect(0, 0, w, h);
+  if (!hist.length) return;
+  const vals = hist.map((p) => Number(p.rss_ema_bytes) || 0);
+  const maxV = Math.max(critB * 1.02, ...vals, 1);
+  const t0 = hist[0].t;
+  const t1 = hist[hist.length - 1].t;
+  const maxT = Math.max(t1 - t0, 1e-6);
+  ctx.strokeStyle = "#e2e8f0";
+  for (let i = 0; i <= 4; i++) {
+    const y = 8 + (i / 4) * (h - 16);
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+  const lineY = (bytes) => h - 8 - (bytes / maxV) * (h - 16);
+  ctx.strokeStyle = "#fbbf24";
+  ctx.setLineDash([5, 5]);
+  ctx.beginPath();
+  ctx.moveTo(0, lineY(warnB));
+  ctx.lineTo(w, lineY(warnB));
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = "#f87171";
+  ctx.beginPath();
+  ctx.moveTo(0, lineY(critB));
+  ctx.lineTo(w, lineY(critB));
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.strokeStyle = "#1d4ed8";
+  ctx.lineWidth = 1.5;
+  hist.forEach((pt, i) => {
+    const x = ((pt.t - t0) / maxT) * (w - 4) + 2;
+    const y = lineY(Number(pt.rss_ema_bytes) || 0);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.lineWidth = 1;
 }
 
 function applyInfo(info) {
@@ -221,7 +235,7 @@ function applyInfo(info) {
   $("#hud-render").textContent = `рендер ${(s.render_fps || 0).toFixed(0)} fps`;
   $("#hud-inf").textContent = `инф ${(s.inference_ms_avg || 0).toFixed(1)} мс`;
   $("#hud-events").textContent = `событий ${s.events || 0}`;
-  $("#dropped-info").textContent = `пропущено ${s.dropped_decode || 0}`;
+  $("#dropped-info").textContent = `пропуск decode ${s.dropped_decode || 0} · render ${s.dropped_render || 0}`;
 
   // Синхронизируем локальную карту тревог с актуальным snapshot треков.
   const liveAlarms = new Set();

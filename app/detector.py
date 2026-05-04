@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing import get_context
 from multiprocessing.queues import Queue
 from multiprocessing.shared_memory import SharedMemory
@@ -59,6 +59,8 @@ class DetectionResult:
     detections: list[Detection]
     persons: list[Detection]
     inference_ms: float
+    # Время подэтапов (мс), например unknown_ref — для /api/metrics.
+    stage_ms: dict[str, float] = field(default_factory=dict)
 
 
 def detection_to_dict(det: Detection) -> dict:
@@ -90,16 +92,19 @@ def detection_result_to_dict(result: DetectionResult) -> dict:
         "detections": [detection_to_dict(d) for d in result.detections],
         "persons": [detection_to_dict(p) for p in result.persons],
         "inference_ms": float(result.inference_ms),
+        "stage_ms": dict(result.stage_ms or {}),
     }
 
 
 def detection_result_from_dict(data: dict) -> DetectionResult:
     dets = [detection_from_dict(x) for x in (data.get("detections") or [])]
     persons = [detection_from_dict(x) for x in (data.get("persons") or [])]
+    sm = data.get("stage_ms")
     return DetectionResult(
         detections=dets,
         persons=persons,
         inference_ms=float(data.get("inference_ms", 0.0)),
+        stage_ms=dict(sm) if isinstance(sm, dict) else {},
     )
 
 
@@ -126,7 +131,9 @@ class _LocalYoloTracker:
         self._long_static_gray: Optional[np.ndarray] = None
         self._pre_motion_gray: Optional[np.ndarray] = None
         self._person_motion_mask: Optional[np.ndarray] = None
-        self._gray_history: deque[tuple[float, np.ndarray]] = deque(maxlen=512)
+        self._gray_history: deque[tuple[float, np.ndarray]] = deque(
+            maxlen=max(4, int(cfg.unknown_gray_history_maxlen))
+        )
         self._bg_seen_frames = 0
         self._no_motion_frames = 0
         if self._device.startswith("cuda"):
@@ -198,7 +205,7 @@ class _LocalYoloTracker:
             self._long_static_gray = None
             self._pre_motion_gray = None
             self._person_motion_mask = None
-            self._gray_history.clear()
+            self._gray_history = deque(maxlen=max(4, int(cfg.unknown_gray_history_maxlen)))
             self._bg_seen_frames = 0
             self._no_motion_frames = 0
 
@@ -233,7 +240,7 @@ class _LocalYoloTracker:
             self._long_static_gray = None
             self._pre_motion_gray = None
             self._person_motion_mask = None
-            self._gray_history.clear()
+            self._gray_history = deque(maxlen=max(4, int(self._cfg.unknown_gray_history_maxlen)))
             self._bg_seen_frames = 0
             self._no_motion_frames = 0
 
@@ -370,8 +377,11 @@ class _LocalYoloTracker:
             floor_roi_enabled = False
         if max_roi_count is not None and int(max_roi_count) <= 1:
             floor_roi_enabled = False
+        stage_ms: dict[str, float] = {}
         if floor_roi_enabled:
+            t0 = time.perf_counter()
             floor_det = self._infer_floor_roi(frame, cfg, excluded, class_min_conf, names)
+            stage_ms["floor_roi"] = (time.perf_counter() - t0) * 1000.0
             if floor_det:
                 if max_roi_count is not None:
                     cap = max(1, int(max_roi_count))
@@ -382,16 +392,20 @@ class _LocalYoloTracker:
             and frame.shape[0] > 0
             and (self._frame_counter % max(1, int(cfg.table_roi_every_n_frames)) == 0)
         ):
+            t0 = time.perf_counter()
             roi_det = self._infer_table_roi_cup(frame, cfg, names)
+            stage_ms["table_roi"] = (time.perf_counter() - t0) * 1000.0
             if roi_det:
                 detections = self._merge_detections(detections, roi_det, cfg.merge_iou_threshold)
         # Отдельный слой "unknown" добавляет кандидаты новых объектов, которые
         # YOLO не смог уверенно отнести к известному классу.
         if cfg.unknown_layer_enabled:
+            t0 = time.perf_counter()
             unknown_det = self._infer_unknown_objects(frame, detections, persons, cfg)
+            stage_ms["unknown_ref"] = (time.perf_counter() - t0) * 1000.0
             if unknown_det:
                 detections = self._merge_detections(detections, unknown_det, cfg.merge_iou_threshold)
-        return DetectionResult(detections, persons, inference_ms)
+        return DetectionResult(detections, persons, inference_ms, stage_ms)
 
     def _infer_floor_roi(
         self,
@@ -611,13 +625,20 @@ class _LocalYoloTracker:
         persons: list[Detection],
         cfg: ModelConfig,
     ) -> list[Detection]:
-        # Сравнение "до движения" и "после движения" в зоне изменения.
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Reference/motion на пониженном разрешении: меньше RAM и CPU; bbox -> полный кадр.
+        h, w = frame.shape[:2]
+        scale = float(max(0.15, min(1.0, float(cfg.unknown_reference_scale))))
+        lw = max(32, int(round(w * scale)))
+        lh = max(32, int(round(h * scale)))
+        sx = w / float(lw)
+        sy = h / float(lh)
+        small = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         now_ts = time.time()
         self._gray_history.append((now_ts, gray.copy()))
         self._bg_seen_frames += 1
-        if self._motion_prev_gray is None:
+        if self._motion_prev_gray is None or self._motion_prev_gray.shape != gray.shape:
             self._motion_prev_gray = gray
             self._static_gray = gray.copy()
             self._long_static_gray = gray.copy()
@@ -636,8 +657,8 @@ class _LocalYoloTracker:
         motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         motion_contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        motion_min_area = float(max(1, cfg.unknown_motion_min_area_px))
-        in_motion = any(cv2.contourArea(c) >= motion_min_area for c in motion_contours)
+        motion_min_area_low = float(max(1.0, cfg.unknown_motion_min_area_px)) * (scale * scale)
+        in_motion = any(cv2.contourArea(c) >= motion_min_area_low for c in motion_contours)
         self._motion_prev_gray = gray
 
         if in_motion:
@@ -645,14 +666,13 @@ class _LocalYoloTracker:
                 self._pre_motion_gray = self._static_gray.copy()
             if self._person_motion_mask is None:
                 self._person_motion_mask = np.zeros(gray.shape, dtype=np.uint8)
-            # Накапливаем зоны, где двигался человек, чтобы потом не считать их "new object".
             person_pad = int(max(0, cfg.unknown_person_exclusion_px))
             for p in persons:
                 px1, py1, px2, py2 = p.bbox
-                x1 = max(0, int(px1 - person_pad))
-                y1 = max(0, int(py1 - person_pad))
-                x2 = min(gray.shape[1], int(px2 + person_pad))
-                y2 = min(gray.shape[0], int(py2 + person_pad))
+                x1 = max(0, int((px1 - person_pad) / sx))
+                y1 = max(0, int((py1 - person_pad) / sy))
+                x2 = min(lw, int((px2 + person_pad) / sx))
+                y2 = min(lh, int((py2 + person_pad) / sy))
                 if x2 > x1 and y2 > y1:
                     self._person_motion_mask[y1:y2, x1:x2] = 255
             self._no_motion_frames = 0
@@ -701,7 +721,6 @@ class _LocalYoloTracker:
                 self._person_motion_mask.fill(0)
             return []
 
-        h, w = frame.shape[:2]
         frame_area = float(max(1, h * w))
         min_area = float(max(1, cfg.unknown_min_area_px))
         max_area = float(max(min_area, cfg.unknown_max_area_ratio * frame_area))
@@ -727,19 +746,20 @@ class _LocalYoloTracker:
         candidate_boxes: list[tuple[float, float, float, float]] = []
         for cnt in contours:
             x, y, bw, bh = cv2.boundingRect(cnt)
-            area = float(bw * bh)
-            if area < min_area or area > max_area:
+            x1f, y1f = x * sx, y * sy
+            x2f, y2f = (x + bw) * sx, (y + bh) * sy
+            area_full = max(0.0, (x2f - x1f) * (y2f - y1f))
+            if area_full < min_area or area_full > max_area:
                 continue
-            ar = bw / max(1.0, float(bh))
+            bw_f, bh_f = x2f - x1f, y2f - y1f
+            ar = bw_f / max(1.0, float(bh_f))
             if ar > 4.0 or ar < 0.2:
                 continue
-
-            x1, y1, x2, y2 = float(x), float(y), float(x + bw), float(y + bh)
-            if (x2 - x1) < min_box_size or (y2 - y1) < min_box_size:
+            if bw_f < min_box_size or bh_f < min_box_size:
                 continue
-            if x1 <= border_px or y1 <= border_px or x2 >= (w - border_px) or y2 >= (h - border_px):
+            if x1f <= border_px or y1f <= border_px or x2f >= (w - border_px) or y2f >= (h - border_px):
                 continue
-            if y2 < min_y:
+            if y2f < min_y:
                 continue
             roi = mask[y : y + bh, x : x + bw]
             if roi.size == 0:
@@ -748,7 +768,7 @@ class _LocalYoloTracker:
             if fill_ratio < min_fill:
                 continue
 
-            bbox = (x1, y1, x2, y2)
+            bbox = (x1f, y1f, x2f, y2f)
             if any(self._iou_tuple(bbox, d.bbox) >= person_iou_thr for d in known_objects):
                 continue
             if any(self._iou_tuple(bbox, p.bbox) >= person_iou_thr for p in persons):

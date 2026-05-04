@@ -21,6 +21,7 @@ class RustVideoBridge:
         self._addr = (host.strip(), int(port_s))
         self._sock: Optional[socket.socket] = None
         self.handshake: dict[str, Any] = {}
+        self._payload_buf: Optional[bytearray] = None
 
     def close(self) -> None:
         if self._sock is not None:
@@ -34,13 +35,23 @@ class RustVideoBridge:
                 pass
             self._sock = None
 
-    def open_video(self, path: str, seek_frame: Optional[int] = None) -> dict[str, Any]:
+    def open_video(
+        self,
+        path: str,
+        seek_frame: Optional[int] = None,
+        *,
+        prefer_hw_decode: bool = False,
+    ) -> dict[str, Any]:
         """Открыть файл на стороне bridge (новое TCP-подключение)."""
         self.close()
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.connect(self._addr)
-        cmd: dict[str, Any] = {"cmd": "open", "path": str(Path(path).resolve())}
+        cmd: dict[str, Any] = {
+            "cmd": "open",
+            "path": str(Path(path).resolve()),
+            "prefer_hw_decode": bool(prefer_hw_decode),
+        }
         if seek_frame is not None:
             cmd["seek_frame"] = int(seek_frame)
         s.sendall((json.dumps(cmd, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -51,10 +62,17 @@ class RustVideoBridge:
             raise RuntimeError(h.get("message") or "handshake failed")
         self._sock = s
         self.handshake = h
+        iw = int(h.get("width") or 0)
+        ih = int(h.get("height") or 0)
+        self._payload_buf = bytearray(max(0, iw * ih * 3)) if iw > 0 and ih > 0 else None
         return h
 
     def read_frame(self) -> Optional[tuple[np.ndarray, float, int]]:
-        """Один кадр BGR uint8 или None при EOF/обрыве."""
+        """Один кадр BGR uint8 (view в переиспользуемый буфер) или None при EOF/обрыве.
+
+        Следующий read_frame перезапишет буфер — до следующего вызова нужно скопировать кадр
+        (например, в пул пайплайна).
+        """
         if self._sock is None:
             return None
         try:
@@ -65,12 +83,14 @@ class RustVideoBridge:
             return None
         meta = json.loads(line)
         ln_b = self._recv_exact(self._sock, 4)
-        ln = struct.unpack("<I", ln_b)[0]
-        buf = self._recv_exact(self._sock, ln)
+        ln = int(struct.unpack("<I", ln_b)[0])
         h = int(meta["height"])
         w = int(meta["width"])
-        arr = np.frombuffer(buf, dtype=np.uint8, count=ln).reshape((h, w, 3))
-        return arr.copy(), float(meta["pos_ms"]), int(meta["frame_id"])
+        if self._payload_buf is None or len(self._payload_buf) < ln:
+            self._payload_buf = bytearray(ln)
+        self._recv_exact_into(self._sock, self._payload_buf, ln)
+        arr = np.frombuffer(self._payload_buf, dtype=np.uint8, count=ln).reshape((h, w, 3))
+        return arr, float(meta["pos_ms"]), int(meta["frame_id"])
 
     @staticmethod
     def _readline(sock: socket.socket) -> str:
@@ -95,3 +115,13 @@ class RustVideoBridge:
             parts.append(chunk)
             remaining -= len(chunk)
         return b"".join(parts)
+
+    @staticmethod
+    def _recv_exact_into(sock: socket.socket, dst: bytearray, n: int) -> None:
+        mv = memoryview(dst)[:n]
+        pos = 0
+        while pos < n:
+            got = sock.recv_into(mv[pos:], n - pos)
+            if got == 0:
+                raise OSError("short read")
+            pos += got

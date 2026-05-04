@@ -18,6 +18,7 @@ Preview (MJPEG) может даунскейлиться и троттлитьс�
 
 from __future__ import annotations
 
+import collections
 import queue
 import threading
 import time
@@ -75,6 +76,14 @@ class FramePool:
 
     def release(self, idx: int) -> None:
         self._free.put_nowait(idx)
+
+    def free_slots(self) -> int:
+        return int(self._free.qsize())
+
+    def total_bytes(self) -> int:
+        if not self._buffers:
+            return 0
+        return int(self._buffers[0].nbytes * len(self._buffers))
 
 
 @dataclass
@@ -166,11 +175,17 @@ class VideoPipeline:
         self._stats = {
             "decoded": 0,
             "dropped_decode": 0,
+            "dropped_render": 0,
             "inferred": 0,
             "events": 0,
             "decode_fps": 0.0,
             "render_fps": 0.0,
             "inference_ms_avg": 0.0,
+            "decode_wait_ms_ema": 0.0,
+            "inference_only_ms_ema": 0.0,
+            "e2e_ms_ema": 0.0,
+            "render_ms_ema": 0.0,
+            "full_frames_in_flight": 0,
             "scheduler_mode": "local",
             "runtime_control_enabled": False,
             "runtime_control_decisions": 0,
@@ -195,6 +210,11 @@ class VideoPipeline:
             maxsize=max(1, int(config_store.cfg.pipeline.result_queue))
         )
         self._render_thread = threading.Thread(target=self._render_loop, name="render", daemon=True)
+        frn = max(0, int(self._cfg_store.cfg.pipeline.forensic_ring_max))
+        self._forensic_ring_max = frn
+        self._forensic_ring: Optional[collections.deque[tuple[int, float, bytes]]] = (
+            collections.deque(maxlen=frn) if frn > 0 else None
+        )
         self._decoder_thread.start()
         self._worker_thread.start()
         self._render_thread.start()
@@ -231,6 +251,13 @@ class VideoPipeline:
             stats = dict(self._stats)
         with self._latest_lock:
             latest = self._latest_rendered
+        pc = self._cfg_store.cfg.pipeline
+        fp = self._frame_pool
+        forensic_bytes = 0
+        forensic_len = 0
+        if self._forensic_ring:
+            forensic_len = len(self._forensic_ring)
+            forensic_bytes = sum(len(x[2]) for x in self._forensic_ring)
         return {
             "stats": stats,
             "queues": {
@@ -238,6 +265,17 @@ class VideoPipeline:
                 "decode_max": self._decode_q.maxsize,
                 "render_size": self._render_q.qsize(),
                 "render_max": self._render_q.maxsize,
+            },
+            "buffers": {
+                "frame_pool_free": fp.free_slots() if fp else None,
+                "frame_pool_slots": int(pc.frame_pool_size or 0),
+                "frame_pool_bytes": fp.total_bytes() if fp else 0,
+                "forensic_ring_len": forensic_len,
+                "forensic_ring_bytes": forensic_bytes,
+            },
+            "thresholds": {
+                "memory_warning_bytes": int(pc.memory_chart_warning_bytes),
+                "memory_critical_bytes": int(pc.memory_chart_critical_bytes),
             },
             "video": {
                 "path": self._video_path,
@@ -273,7 +311,10 @@ class VideoPipeline:
                     pass
             br = RustVideoBridge(rust_addr)
             try:
-                h = br.open_video(str(p))
+                h = br.open_video(
+                    str(p),
+                    prefer_hw_decode=bool(self._cfg_store.cfg.pipeline.prefer_hw_decode),
+                )
             except Exception:
                 br.close()
                 raise
@@ -357,6 +398,9 @@ class VideoPipeline:
     def update_settings(self) -> None:
         # Легкое обновление без перезагрузки нейросети.
         self._analyzer.update_config(self._cfg_store.cfg.analyzer)
+        frn = max(0, int(self._cfg_store.cfg.pipeline.forensic_ring_max))
+        self._forensic_ring_max = frn
+        self._forensic_ring = collections.deque(maxlen=frn) if frn > 0 else None
         self._runtime_bridge.update(
             RuntimeBridgeConfig(
                 addr=str(self._cfg_store.cfg.pipeline.runtime_core_addr or "").strip(),
@@ -475,7 +519,11 @@ class VideoPipeline:
                 if target is not None and self._video_path:
                     self._drain_decode_queue_release()
                     try:
-                        rb.open_video(self._video_path, seek_frame=target)
+                        rb.open_video(
+                            self._video_path,
+                            seek_frame=target,
+                            prefer_hw_decode=bool(self._cfg_store.cfg.pipeline.prefer_hw_decode),
+                        )
                     except Exception as exc:
                         print(f"[pipeline] rust bridge seek failed: {exc}")
                         time.sleep(0.05)
@@ -493,6 +541,9 @@ class VideoPipeline:
                     continue
                 frame, pos_ms, remote_fid = pkt
                 self._frame_id = remote_fid
+                # Кадр — view в буфере RustVideoBridge; копируем, если нет пула.
+                if self._frame_pool is None:
+                    frame = np.copy(frame)
             else:
                 with self._cap_lock:
                     cap = self._cap
@@ -582,6 +633,13 @@ class VideoPipeline:
                 job = self._decode_q.get(timeout=0.2)
             except queue.Empty:
                 continue
+            decode_wait_ms = (time.perf_counter() - float(job.pts)) * 1000.0
+            with self._stats_lock:
+                a0 = 0.15
+                dw0 = float(self._stats["decode_wait_ms_ema"])
+                self._stats["decode_wait_ms_ema"] = (
+                    decode_wait_ms if dw0 <= 0 else dw0 * (1.0 - a0) + decode_wait_ms * a0
+                )
             ts_now = now()
             # Можно запускать тяжелый инференс не на каждом кадре.
             detect_every = max(1, int(self._cfg_store.cfg.pipeline.detect_every_n_frames))
@@ -622,11 +680,13 @@ class VideoPipeline:
 
             if should_infer:
                 try:
+                    t_inf = time.perf_counter()
                     result = self._tracker.infer(
                         job.image,
                         max_roi_count=scheduler_max_roi_count,
                         priority=scheduler_priority,
                     )
+                    infer_only_ms = (time.perf_counter() - t_inf) * 1000.0
                 except Exception as exc:
                     print(f"[pipeline] inference error: {exc}")
                     self._release_pool_idx(job.pool_idx)
@@ -662,6 +722,16 @@ class VideoPipeline:
                         self._stats["inference_ms_avg"] = sum(self._inference_ms_window) / len(
                             self._inference_ms_window
                         )
+                    a = 0.15
+                    io = float(self._stats["inference_only_ms_ema"])
+                    self._stats["inference_only_ms_ema"] = (
+                        infer_only_ms if io <= 0 else io * (1.0 - a) + infer_only_ms * a
+                    )
+                    sm = result.stage_ms or {}
+                    for k, v in sm.items():
+                        key = f"stage_{k}_ms_ema"
+                        prev = float(self._stats.get(key, 0.0))
+                        self._stats[key] = float(v) if prev <= 0 else prev * (1.0 - a) + float(v) * a
             else:
                 # Повторно используем прошлый результат между кадрами,
                 # чтобы разгрузить модель и повысить плавность.
@@ -681,6 +751,14 @@ class VideoPipeline:
             if result is None:
                 self._release_pool_idx(job.pool_idx)
                 continue
+            e2e_ms = (time.perf_counter() - float(job.pts)) * 1000.0
+            with self._stats_lock:
+                a = 0.12
+                e = float(self._stats["e2e_ms_ema"])
+                self._stats["e2e_ms_ema"] = e2e_ms if e <= 0 else e * (1.0 - a) + e2e_ms * a
+                self._stats["full_frames_in_flight"] = int(
+                    self._decode_q.qsize() + self._render_q.qsize() + 1
+                )
             self._dispatch_render(job, result, tracks)
 
     def _enqueue_render(self, job: FrameJob, result: DetectionResult, tracks: list[dict]) -> None:
@@ -704,6 +782,8 @@ class VideoPipeline:
             try:
                 self._render_q.put_nowait(render_job)
             except queue.Full:
+                with self._stats_lock:
+                    self._stats["dropped_render"] += 1
                 self._release_pool_idx(render_job.pool_idx)
 
     def _render_loop(self) -> None:
@@ -715,18 +795,34 @@ class VideoPipeline:
             try:
                 preview_iv = float(self._cfg_store.cfg.pipeline.preview_min_interval_ms or 0)
                 render_every = max(1, int(self._cfg_store.cfg.pipeline.render_every_n_frames))
+                max_fps = float(self._cfg_store.cfg.pipeline.preview_encode_max_fps or 0)
                 with self._latest_lock:
                     lr = self._latest_rendered
                     last_mono = self._last_preview_encode_mono
                 now_m = time.perf_counter()
                 new_encode_ts: Optional[float] = None
+                min_sec_fps = (1.0 / max_fps) if max_fps > 0 else 0.0
+                fps_throttle = max_fps > 0 and lr is not None and (now_m - last_mono) < min_sec_fps
                 if preview_iv > 0 and lr is not None and (now_m - last_mono) * 1000.0 < preview_iv:
+                    jpeg = lr.jpeg
+                elif fps_throttle:
                     jpeg = lr.jpeg
                 elif (job.frame_id % render_every) != 0 and lr is not None:
                     jpeg = lr.jpeg
                 else:
+                    t_enc = time.perf_counter()
                     jpeg = self._render(job, job.result, job.tracks)
                     new_encode_ts = time.perf_counter()
+                    enc_ms = (new_encode_ts - t_enc) * 1000.0
+                    with self._stats_lock:
+                        a = 0.12
+                        prev = float(self._stats["render_ms_ema"])
+                        self._stats["render_ms_ema"] = enc_ms if prev <= 0 else prev * (1.0 - a) + enc_ms * a
+                    if self._forensic_ring is not None and jpeg:
+                        try:
+                            self._forensic_ring.append((job.frame_id, job.pos_ms, bytes(jpeg)))
+                        except Exception:
+                            pass
                 with self._latest_lock:
                     if new_encode_ts is not None:
                         self._last_preview_encode_mono = new_encode_ts

@@ -165,6 +165,10 @@ class ModelConfig:
     unknown_border_px: int = 8
     # Псевдо-confidence для unknown, чтобы Analyzer/UI отображали объект.
     unknown_confidence: float = 0.3
+    # Доля полного разрешения для reference/motion (0.15–1.0). Меньше -> меньше RAM и CPU.
+    unknown_reference_scale: float = 0.25
+    # Сколько lowres gray хранить для интервального сравнения (не full-frame).
+    unknown_gray_history_maxlen: int = 24
 
 
 @dataclass
@@ -214,6 +218,15 @@ class PipelineConfig:
     runtime_control_addr: str = ""
     # Таймаут запроса решения should_infer (сек).
     runtime_control_timeout_sec: float = 0.01
+    # Кольцо последних JPEG preview для диагностики (0 = выкл). Удерживает только сжатые байты.
+    forensic_ring_max: int = 0
+    # Пороги графика RSS в UI (байты).
+    memory_chart_warning_bytes: int = 805306368
+    memory_chart_critical_bytes: int = 1006632960
+    # Ограничение частоты кодирования preview (0 = без лимита).
+    preview_encode_max_fps: float = 15.0
+    # Дополнительные PID для суммирования RSS аналитики (video-bridge, worker).
+    analytics_extra_pids: list[int] = field(default_factory=list)
 
 
 @dataclass

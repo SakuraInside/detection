@@ -40,6 +40,14 @@ _SYSTEM_METRICS_LOCK = threading.Lock()
 _SYSTEM_METRICS_CACHE: dict[str, Any] = {"t_mono": 0.0, "data": None}
 _SYSTEM_METRICS_TTL_SEC = 1.0
 
+# EMA / пик RSS для графика видеоаналитики (основной процесс + analytics_extra_pids).
+_ANALYTICS_MEM_LOCK = threading.Lock()
+_ANALYTICS_MEM_STATE: dict[str, Any] = {
+    "rss_ema_bytes": None,
+    "rss_peak_window_bytes": None,
+    "rss_samples": [],  # (t_mono, rss_sum) для UI-истории
+}
+
 
 def _get_system_metrics_cached() -> dict:
     now = time.perf_counter()
@@ -164,7 +172,7 @@ def create_app() -> FastAPI:
     @app.get("/api/metrics")
     async def _metrics() -> dict:
         return {
-            "process": _process_metrics(),
+            "process": _process_analytics_metrics(cfg_store, pipeline),
             "system": _get_system_metrics_cached(),
             "pipeline": pipeline.metrics(),
         }
@@ -316,6 +324,7 @@ def _process_metrics() -> dict:
     rss_bytes = None
     vms_bytes = None
     cpu_percent = None
+    private_bytes = None
     try:
         import psutil  # type: ignore
 
@@ -324,13 +333,81 @@ def _process_metrics() -> dict:
         rss_bytes = int(mem.rss)
         vms_bytes = int(mem.vms)
         cpu_percent = float(p.cpu_percent(interval=0.0))
+        if hasattr(mem, "private"):
+            private_bytes = int(mem.private)  # type: ignore[attr-defined]
     except Exception:
         pass
     return {
         "pid": os.getpid(),
         "rss_bytes": rss_bytes,
         "vms_bytes": vms_bytes,
+        "private_bytes": private_bytes,
         "cpu_percent": cpu_percent,
+    }
+
+
+def _process_analytics_metrics(cfg_store: ConfigStore, pipeline: VideoPipeline) -> dict:
+    base = _process_metrics()
+    rss_sum = int(base.get("rss_bytes") or 0)
+    extra = list(cfg_store.cfg.pipeline.analytics_extra_pids or [])
+    try:
+        import psutil  # type: ignore
+
+        for pid in extra:
+            try:
+                rss_sum += int(psutil.Process(int(pid)).memory_info().rss)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    cuda_alloc = None
+    cuda_reserved = None
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            cuda_alloc = int(torch.cuda.memory_allocated())
+            cuda_reserved = int(torch.cuda.memory_reserved())
+    except Exception:
+        pass
+    pm = pipeline.metrics()
+    prev_bytes = int(pm.get("buffers", {}).get("forensic_ring_bytes") or 0)
+    preview_bytes_est = prev_bytes
+    now = time.perf_counter()
+    alpha = 0.12
+    ema_f = float(rss_sum)
+    peak_5s = float(rss_sum)
+    hist_slice: list[tuple[float, float]] = []
+    with _ANALYTICS_MEM_LOCK:
+        ema = _ANALYTICS_MEM_STATE["rss_ema_bytes"]
+        if ema is None:
+            ema_f = float(rss_sum)
+        else:
+            ema_f = float(ema) * (1.0 - alpha) + float(rss_sum) * alpha
+        _ANALYTICS_MEM_STATE["rss_ema_bytes"] = ema_f
+        win: list[float] = list(_ANALYTICS_MEM_STATE.get("rss_peak_window_bytes") or [])
+        win.append(float(rss_sum))
+        if len(win) > 120:
+            win = win[-120:]
+        _ANALYTICS_MEM_STATE["rss_peak_window_bytes"] = win
+        peak_5s = max(win[-20:]) if win else float(rss_sum)
+        samples: list[tuple[float, float]] = list(_ANALYTICS_MEM_STATE.get("rss_samples") or [])
+        samples.append((now, ema_f))
+        if len(samples) > 180:
+            samples = samples[-180:]
+        _ANALYTICS_MEM_STATE["rss_samples"] = samples
+        hist_slice = samples[-90:]
+    t0 = hist_slice[0][0] if hist_slice else now
+    rss_history = [{"t": round(t - t0, 3), "rss_ema_bytes": v} for t, v in hist_slice]
+    return {
+        **base,
+        "rss_analytics_sum_bytes": rss_sum,
+        "rss_ema_bytes": round(ema_f, 0),
+        "rss_peak_recent_bytes": int(peak_5s),
+        "cuda_memory_allocated_bytes": cuda_alloc,
+        "cuda_memory_reserved_bytes": cuda_reserved,
+        "preview_memory_bytes_est": preview_bytes_est,
+        "rss_history": rss_history,
     }
 
 
