@@ -17,10 +17,30 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import torch
-from ultralytics import YOLO
 
 from .config import ModelConfig
+
+
+_TORCH = None
+_YOLO_CLASS = None
+
+
+def _get_torch():
+    global _TORCH
+    if _TORCH is None:
+        import torch  # type: ignore
+
+        _TORCH = torch
+    return _TORCH
+
+
+def _get_yolo_class():
+    global _YOLO_CLASS
+    if _YOLO_CLASS is None:
+        from ultralytics import YOLO  # type: ignore
+
+        _YOLO_CLASS = YOLO
+    return _YOLO_CLASS
 
 
 @dataclass
@@ -91,9 +111,10 @@ class _LocalYoloTracker:
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
+        torch = _get_torch()
         self._cfg = cfg
         self._lock = threading.Lock()
-        self._model: Optional[YOLO] = None
+        self._model = None
         # Если GPU недоступен, автоматически откатываемся на CPU.
         self._device = cfg.device if torch.cuda.is_available() else "cpu"
         self._half = cfg.half and self._device.startswith("cuda")
@@ -118,6 +139,7 @@ class _LocalYoloTracker:
         self._load()
 
     def _load(self) -> None:
+        YOLO = _get_yolo_class()
         # При имени официального чекпойнта Ultralytics сам скачает веса.
         weights = self._cfg.weights
         if not Path(weights).exists() and "/" not in weights and "\\" not in weights:
@@ -163,6 +185,7 @@ class _LocalYoloTracker:
                 pass
 
     def reload(self, cfg: ModelConfig) -> None:
+        torch = _get_torch()
         with self._lock:
             # Полная перезагрузка нужна, если меняли веса/девайс/half/tracker.
             self._cfg = cfg
@@ -221,6 +244,7 @@ class _LocalYoloTracker:
         max_roi_count: Optional[int] = None,
         priority: Optional[str] = None,
     ) -> DetectionResult:
+        torch = _get_torch()
         cfg = self._cfg
         self._frame_counter += 1
         # Грубый фильтр по именам классов для подавления ложных тревог
@@ -377,6 +401,7 @@ class _LocalYoloTracker:
         class_min_conf: dict[str, float],
         names: dict[int, str],
     ) -> list[Detection]:
+        torch = _get_torch()
         h, w = frame.shape[:2]
         min_box_size = float(max(1, cfg.min_box_size_px))
         min_box_by_class = {

@@ -100,6 +100,18 @@ Windows one-command запуск:
 .\run_stack.ps1 -Profile external
 ```
 
+Если RAM близко к 90-100%, запускайте low-memory режим:
+
+```powershell
+.\run_stack.ps1 -Profile external -LowMemory
+```
+
+Эквивалент через Python:
+
+```powershell
+python run_stack.py --profile external --low-memory
+```
+
 Профили:
 
 - `legacy` — только текущий Python runtime (без runtime-core и внешнего inference RPC);

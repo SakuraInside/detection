@@ -16,7 +16,7 @@ from runtime_env import (
 )
 
 
-def apply_profile(config_path: Path, profile: str) -> None:
+def apply_profile(config_path: Path, profile: str, low_memory: bool = False) -> None:
     profile = profile.strip().lower()
     with config_path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -67,6 +67,17 @@ def apply_profile(config_path: Path, profile: str) -> None:
         pipeline["rust_video_bridge_addr"] = ""
     else:
         raise ValueError(f"unsupported profile: {profile}")
+
+    if low_memory:
+        # Снижаем memory/compute footprint без отключения AOD-логики.
+        # При необходимости пользователь всегда может вернуться к yolo11x.
+        model["weights"] = "models/yolo11s.pt"
+        model["imgsz"] = 640
+        model["floor_roi_enabled"] = False
+        pipeline["detect_every_n_frames"] = max(2, int(pipeline.get("detect_every_n_frames", 2) or 2))
+        pipeline["render_every_n_frames"] = max(2, int(pipeline.get("render_every_n_frames", 2) or 2))
+        pipeline["decode_queue"] = min(3, int(pipeline.get("decode_queue", 3) or 3))
+        pipeline["result_queue"] = min(3, int(pipeline.get("result_queue", 3) or 3))
 
     with config_path.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)

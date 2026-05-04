@@ -14,6 +14,7 @@ const state = {
   alarms: new Map(),
   ws: null,
   settings: null,
+  metricsTimer: null,
 };
 
 const EVENT_UI = {
@@ -144,6 +145,57 @@ async function refreshInfo() {
   } catch (e) {
     console.warn("info fail", e);
   }
+}
+
+async function refreshMetrics() {
+  try {
+    const data = await api("GET", "/api/metrics");
+    applySystemMetrics(data.system || {});
+  } catch (e) {
+    console.warn("metrics fail", e);
+  }
+}
+
+function fmtBytes(v) {
+  const n = Number(v || 0);
+  if (!isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let x = n;
+  let i = 0;
+  while (x >= 1024 && i < units.length - 1) {
+    x /= 1024;
+    i += 1;
+  }
+  return `${x.toFixed(i <= 1 ? 0 : 1)} ${units[i]}`;
+}
+
+function updateSpeedo(id, pct, usedText, totalText) {
+  const root = document.getElementById(id);
+  if (!root) return;
+  const val = Math.max(0, Math.min(100, Number(pct || 0)));
+  root.style.setProperty("--pct", String(val));
+  const valueEl = root.querySelector(".speedo-value");
+  const subEl = root.querySelector(".speedo-sub");
+  if (valueEl) valueEl.textContent = `${val.toFixed(0)}%`;
+  if (subEl) subEl.textContent = `${usedText} / ${totalText}`;
+}
+
+function applySystemMetrics(system) {
+  const cpu = Number(system.cpu_percent || 0);
+  updateSpeedo("speedo-cpu", cpu, cpu.toFixed(0) + "%", "100%");
+
+  const ramUsed = system.ram_used_bytes || 0;
+  const ramTotal = system.ram_total_bytes || 0;
+  const ramPct = Number(system.ram_percent || 0);
+  updateSpeedo("speedo-ram", ramPct, fmtBytes(ramUsed), fmtBytes(ramTotal));
+
+  const gpu = system.gpu || {};
+  const gpuName = gpu.name || "GPU не обнаружена";
+  $("#gpu-name").textContent = gpuName;
+  const gpuPct = Number(gpu.util_percent || 0);
+  const gpuUsed = fmtBytes(gpu.memory_used_bytes || 0);
+  const gpuTotal = fmtBytes(gpu.memory_total_bytes || 0);
+  updateSpeedo("speedo-gpu", gpuPct, gpuUsed, gpuTotal);
 }
 
 function applyInfo(info) {
@@ -425,7 +477,9 @@ async function main() {
   await refreshFiles();
   await refreshEvents();
   await refreshInfo();
+  await refreshMetrics();
   connectWs();
+  state.metricsTimer = setInterval(refreshMetrics, 1500);
 }
 
 main().catch(console.error);

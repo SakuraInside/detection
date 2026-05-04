@@ -53,6 +53,7 @@ def main() -> None:
     parser.add_argument("--port", default=APP_PORT_DEFAULT, type=int)
     parser.add_argument("--reload", action="store_true")
     parser.add_argument("--no-apply-profile", action="store_true")
+    parser.add_argument("--low-memory", action="store_true", help="apply low-memory runtime tuning")
     args = parser.parse_args()
 
     if args.profile in {"hybrid", "external", "rust-video"} and not shutil.which("cargo"):
@@ -66,8 +67,11 @@ def main() -> None:
         sys.exit(1)
 
     if not args.no_apply_profile:
-        apply_profile(CONFIG_PATH, args.profile)
-        print(f"[run_stack] applied profile={args.profile} to {CONFIG_PATH}")
+        apply_profile(CONFIG_PATH, args.profile, low_memory=args.low_memory)
+        print(
+            f"[run_stack] applied profile={args.profile}"
+            f"{' (low-memory)' if args.low_memory else ''} to {CONFIG_PATH}"
+        )
 
     procs: list[subprocess.Popen] = []
     try:
