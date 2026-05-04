@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from runtime_env import APP_HOST_DEFAULT, APP_PORT_DEFAULT
+from runtime_env import APP_HOST_DEFAULT, APP_PORT_DEFAULT, VIDEO_BRIDGE_ADDR
 from runtime_profiles import (
     INFERENCE_RPC_ADDR,
     RUNTIME_CONTROL_ADDR,
@@ -43,12 +44,26 @@ def _wait_tcp_ready(host: str, port: int, timeout_sec: float = 45.0) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Integra migration stack")
-    parser.add_argument("--profile", choices=["legacy", "hybrid", "external"], default="external")
+    parser.add_argument(
+        "--profile",
+        choices=["legacy", "hybrid", "external", "rust-video"],
+        default="external",
+    )
     parser.add_argument("--host", default=APP_HOST_DEFAULT)
     parser.add_argument("--port", default=APP_PORT_DEFAULT, type=int)
     parser.add_argument("--reload", action="store_true")
     parser.add_argument("--no-apply-profile", action="store_true")
     args = parser.parse_args()
+
+    if args.profile in {"hybrid", "external", "rust-video"} and not shutil.which("cargo"):
+        print(
+            "[run_stack] error: команда `cargo` не найдена в PATH.\n"
+            "  Профили hybrid/external собирают runtime-core; rust-video — video-bridge (декод в Rust).\n"
+            "  Установите toolchain: https://rustup.rs/\n"
+            "  Или: python run_stack.py --profile legacy  # только Python\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not args.no_apply_profile:
         apply_profile(CONFIG_PATH, args.profile)
@@ -56,6 +71,26 @@ def main() -> None:
 
     procs: list[subprocess.Popen] = []
     try:
+        if args.profile == "rust-video":
+            procs.append(
+                subprocess.Popen(
+                    [
+                        "cargo",
+                        "run",
+                        "--manifest-path",
+                        str(ROOT / "video-bridge" / "Cargo.toml"),
+                        "--",
+                        "--listen",
+                        VIDEO_BRIDGE_ADDR,
+                    ],
+                    cwd=str(ROOT),
+                )
+            )
+            print(f"[run_stack] started video-bridge ({VIDEO_BRIDGE_ADDR})")
+            vb_host, vb_port = _split_host_port(VIDEO_BRIDGE_ADDR)
+            _wait_tcp_ready(vb_host, vb_port, timeout_sec=120.0)
+            print("[run_stack] video-bridge TCP is ready")
+
         if args.profile in {"hybrid", "external"}:
             env = os.environ.copy()
             env["RUNTIME_INGEST_ADDR"] = RUNTIME_INGEST_ADDR

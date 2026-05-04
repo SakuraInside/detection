@@ -36,6 +36,94 @@ function fmtTs(ts) {
   return d.toLocaleTimeString("ru-RU", { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
+function fmtBytes(n) {
+  if (n == null || !isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  if (abs >= 1073741824) return `${(n / 1073741824).toFixed(2)} ГиБ`;
+  if (abs >= 1048576) return `${(n / 1048576).toFixed(1)} МиБ`;
+  if (abs >= 1024) return `${(n / 1024).toFixed(0)} КиБ`;
+  return `${Math.round(n)} Б`;
+}
+
+function updateSpeedo(rootSel, pct, valueText, subText) {
+  const root = $(rootSel);
+  if (!root) return;
+  const p = Math.max(0, Math.min(100, Number.isFinite(pct) ? pct : 0));
+  root.style.setProperty("--pct", String(p));
+  const valEl = root.querySelector(".speedo-value");
+  const subEl = root.querySelector(".speedo-sub");
+  if (valEl) valEl.textContent = valueText;
+  if (subEl) subEl.textContent = subText;
+}
+
+let metricsTimer = null;
+
+async function refreshMetrics() {
+  try {
+    const data = await api("GET", "/api/metrics");
+    const sys = data.system || {};
+    const proc = data.process || {};
+    const gpu = sys.gpu || {};
+
+    const cpuPct = sys.cpu_percent;
+    updateSpeedo(
+      "#speedo-cpu",
+      cpuPct ?? 0,
+      cpuPct != null ? `${cpuPct.toFixed(0)}%` : "—",
+      proc.cpu_percent != null ? `процесс ${proc.cpu_percent.toFixed(0)}%` : ""
+    );
+
+    const ramPct = sys.ram_percent;
+    const ramSub =
+      sys.ram_used_bytes != null && sys.ram_total_bytes != null
+        ? `${fmtBytes(sys.ram_used_bytes)} / ${fmtBytes(sys.ram_total_bytes)}`
+        : "";
+    updateSpeedo("#speedo-ram", ramPct ?? 0, ramPct != null ? `${ramPct.toFixed(0)}%` : "—", ramSub);
+
+    const gn = $("#gpu-name");
+    if (gpu.available && gpu.util_percent != null) {
+      const memSub =
+        gpu.memory_used_bytes != null && gpu.memory_total_bytes != null
+          ? `${fmtBytes(gpu.memory_used_bytes)} / ${fmtBytes(gpu.memory_total_bytes)}`
+          : "";
+      updateSpeedo("#speedo-gpu", gpu.util_percent, `${gpu.util_percent.toFixed(0)}%`, memSub);
+      if (gn) gn.textContent = gpu.name || "GPU";
+    } else {
+      updateSpeedo("#speedo-gpu", 0, "—", "нет данных");
+      if (gn) gn.textContent = "GPU не обнаружена (nvidia-smi / драйвер)";
+    }
+  } catch (e) {
+    console.warn("metrics fail", e);
+  }
+}
+
+function switchOperativeTab(tab) {
+  const evBtn = $("#tab-events");
+  const sysBtn = $("#tab-system");
+  const panelEv = $("#panel-events");
+  const panelSys = $("#panel-system");
+  if (!evBtn || !sysBtn || !panelEv || !panelSys) return;
+  if (tab === "events") {
+    evBtn.classList.add("tab-btn-active");
+    sysBtn.classList.remove("tab-btn-active");
+    panelEv.classList.remove("hidden");
+    panelSys.classList.add("hidden");
+    if (metricsTimer != null) {
+      clearInterval(metricsTimer);
+      metricsTimer = null;
+    }
+  } else {
+    sysBtn.classList.add("tab-btn-active");
+    evBtn.classList.remove("tab-btn-active");
+    panelSys.classList.remove("hidden");
+    panelEv.classList.add("hidden");
+    refreshMetrics();
+    if (metricsTimer == null) {
+      metricsTimer = setInterval(refreshMetrics, 2500);
+    }
+  }
+}
+
 async function api(method, path, body) {
   const opts = { method, headers: { "Content-Type": "application/json" } };
   if (body !== undefined) opts.body = JSON.stringify(body);
@@ -326,6 +414,9 @@ function wireControls() {
   };
   $("#btn-reload-settings").onclick = loadSettings;
   $("#settings-form").addEventListener("submit", submitSettings);
+
+  $("#tab-events").onclick = () => switchOperativeTab("events");
+  $("#tab-system").onclick = () => switchOperativeTab("system");
 }
 
 async function main() {

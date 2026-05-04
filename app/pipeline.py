@@ -8,9 +8,12 @@
 
 Политика back-pressure
 ----------------------
-Очередь декодирования ограничена. Если worker не успевает, декодер
-сбрасывает самые старые кадры и кладет новый, чтобы не копить лаг.
-События и логи не зависят от очереди рендера, поэтому не теряются.
+Очередь декодирования ограничена. Перед постановкой нового кадра декодер
+опустошает очередь (latest-only): воркер обрабатывает самый свежий кадр.
+Опционально кадр копируется в пул буферов фиксированного размера (bounded RAM).
+Preview (MJPEG) может даунскейлиться и троттлиться отдельно от аналитики;
+если JPEG переиспользуется, кадр не ставится в очередь рендера — буфер
+сразу возвращается в пул. События и логи не зависят от очереди рендера.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -36,12 +39,51 @@ cv2.setUseOptimized(True)
 # потоков декодера/рендера с инференсом и стабилизирует latency.
 cv2.setNumThreads(1)
 
+_OVERLAY_COLORS = {
+    "candidate": (0, 200, 255),
+    "static": (0, 220, 220),
+    "unattended": (0, 140, 255),
+    "alarm_abandoned": (0, 0, 255),
+    "alarm_disappeared": (255, 0, 200),
+    "person": (255, 0, 0),
+    "default": (180, 180, 180),
+}
+
+
+class FramePool:
+    """Ограниченный пул буферов BGR uint8; обратное давление через блокировку acquire."""
+
+    def __init__(self, height: int, width: int, channels: int, size: int) -> None:
+        self._buffers = [
+            np.empty((height, width, channels), dtype=np.uint8) for _ in range(max(1, size))
+        ]
+        self._free: "queue.Queue[int]" = queue.Queue(maxsize=len(self._buffers))
+        for i in range(len(self._buffers)):
+            self._free.put_nowait(i)
+
+    def acquire_copy_from(
+        self, src: np.ndarray, stop_event: threading.Event
+    ) -> Optional[tuple[np.ndarray, int]]:
+        while not stop_event.is_set():
+            try:
+                idx = self._free.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            np.copyto(self._buffers[idx], src)
+            return self._buffers[idx], idx
+        return None
+
+    def release(self, idx: int) -> None:
+        self._free.put_nowait(idx)
+
+
 @dataclass
 class FrameJob:
     frame_id: int
     pos_ms: float
     image: np.ndarray
     pts: float
+    pool_idx: Optional[int] = None
 
 
 @dataclass
@@ -61,17 +103,7 @@ class RenderJob:
     image: np.ndarray
     result: DetectionResult
     tracks: list[dict]
-
-
-_OVERLAY_COLORS = {
-    "candidate": (0, 200, 255),
-    "static": (0, 220, 220),
-    "unattended": (0, 140, 255),
-    "alarm_abandoned": (0, 0, 255),
-    "alarm_disappeared": (255, 0, 200),
-    "person": (255, 0, 0),
-    "default": (180, 180, 180),
-}
+    pool_idx: Optional[int] = None
 
 
 class VideoPipeline:
@@ -117,8 +149,13 @@ class VideoPipeline:
         self._seek_lock = threading.Lock()
         self._frame_id = 0
 
+        self._frame_pool: Optional[FramePool] = None
+        self._snapshot_resize_buf: Optional[np.ndarray] = None
+        # Декод через внешний `video-bridge` (Rust), иначе OpenCV в этом процессе.
+        self._rust_bridge: Any = None
+
         self._decode_q: "queue.Queue[FrameJob]" = queue.Queue(
-            maxsize=max(2, config_store.cfg.pipeline.decode_queue)
+            maxsize=max(1, int(config_store.cfg.pipeline.decode_queue))
         )
         # Храним только последний отрендеренный кадр для MJPEG.
         self._latest_lock = threading.Lock()
@@ -143,10 +180,14 @@ class VideoPipeline:
             "scheduler_overload_level": 0,
             "scheduler_latency_ema_ms": 0.0,
             "scheduler_max_roi_count": 1,
+            "preview_skip_enqueue": 0,
         }
         self._decode_fps_window: list[float] = []
         self._render_fps_window: list[float] = []
         self._inference_ms_window: list[float] = []
+        # Переиспользуемый буфер для preview (даунскейл перед оверлеем/JPEG).
+        self._preview_buf: Optional[np.ndarray] = None
+        self._last_preview_encode_mono: float = 0.0
 
         self._decoder_thread = threading.Thread(target=self._decoder_loop, name="decoder", daemon=True)
         self._worker_thread = threading.Thread(target=self._worker_loop, name="inference", daemon=True)
@@ -220,32 +261,65 @@ class VideoPipeline:
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(path)
-        # Инициализируем новый VideoCapture под указанным файлом.
-        backend = cv2.CAP_FFMPEG if hasattr(cv2, "CAP_FFMPEG") else cv2.CAP_ANY
-        cap = cv2.VideoCapture(str(p), backend)
-        if not cap.isOpened():
-            raise RuntimeError(f"failed to open video: {p}")
-        if self._cfg_store.cfg.pipeline.prefer_hw_decode:
-            # Мягкая попытка включить аппаратный decode; если backend/сборка
-            # не поддерживает, просто продолжаем без ошибки.
+
+        rust_addr = str(self._cfg_store.cfg.pipeline.rust_video_bridge_addr or "").strip()
+        if rust_addr:
+            from .rust_video_bridge import RustVideoBridge
+
+            if self._rust_bridge is not None:
+                try:
+                    self._rust_bridge.close()
+                except Exception:
+                    pass
+            br = RustVideoBridge(rust_addr)
             try:
-                if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_ANY"):
-                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+                h = br.open_video(str(p))
             except Exception:
-                pass
-        with self._cap_lock:
-            if self._cap is not None:
-                self._cap.release()
-            self._cap = cap
-            self._video_path = str(p)
-            self._fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            self._total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            self._frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-            self._frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                br.close()
+                raise
+            self._rust_bridge = br
+            with self._cap_lock:
+                if self._cap is not None:
+                    self._cap.release()
+                    self._cap = None
+                self._video_path = str(p)
+                self._fps = float(h.get("fps") or 30.0)
+                self._total_frames = int(h.get("frames") or 0)
+                self._frame_w = int(h.get("width") or 0)
+                self._frame_h = int(h.get("height") or 0)
+        else:
+            if self._rust_bridge is not None:
+                try:
+                    self._rust_bridge.close()
+                except Exception:
+                    pass
+                self._rust_bridge = None
+            backend = cv2.CAP_FFMPEG if hasattr(cv2, "CAP_FFMPEG") else cv2.CAP_ANY
+            cap = cv2.VideoCapture(str(p), backend)
+            if not cap.isOpened():
+                raise RuntimeError(f"failed to open video: {p}")
+            if self._cfg_store.cfg.pipeline.prefer_hw_decode:
+                try:
+                    if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_ANY"):
+                        cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+                except Exception:
+                    pass
+            with self._cap_lock:
+                if self._cap is not None:
+                    self._cap.release()
+                self._cap = cap
+                self._video_path = str(p)
+                self._fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                self._total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                self._frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                self._frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
         self._tracker.reset()
         self._analyzer.reset()
-        # После открытия файла сразу запускаем воспроизведение.
         self._last_result = None
+        self._preview_buf = None
+        self._snapshot_resize_buf = None
+        self._setup_frame_pool()
         self._play_event.set()
         return self.info()
 
@@ -263,6 +337,8 @@ class VideoPipeline:
         self._tracker.reset()
         self._analyzer.reset()
         self._last_result = None
+        self._preview_buf = None
+        self._snapshot_resize_buf = None
 
     def reload_model(self) -> None:
         # Применяем изменения model + analyzer (если были).
@@ -305,63 +381,182 @@ class VideoPipeline:
         with self._cap_lock:
             if self._cap is not None:
                 self._cap.release()
+        if self._rust_bridge is not None:
+            try:
+                self._rust_bridge.close()
+            except Exception:
+                pass
+            self._rust_bridge = None
         self._decoder_thread.join(timeout=2.0)
         self._worker_thread.join(timeout=2.0)
         self._render_thread.join(timeout=2.0)
+        self._drain_decode_queue_release()
+        try:
+            while True:
+                j = self._render_q.get_nowait()
+                self._release_pool_idx(j.pool_idx)
+        except queue.Empty:
+            pass
         self._runtime_bridge.close()
         self._tracker.shutdown()
+
+    def _setup_frame_pool(self) -> None:
+        self._frame_pool = None
+        n = int(self._cfg_store.cfg.pipeline.frame_pool_size or 0)
+        if n > 0 and self._frame_h > 0 and self._frame_w > 0:
+            self._frame_pool = FramePool(self._frame_h, self._frame_w, 3, n)
+
+    def _release_pool_idx(self, pool_idx: Optional[int]) -> None:
+        if pool_idx is None or self._frame_pool is None:
+            return
+        self._frame_pool.release(pool_idx)
+
+    def _drain_decode_queue_release(self) -> None:
+        try:
+            while True:
+                j = self._decode_q.get_nowait()
+                self._release_pool_idx(j.pool_idx)
+        except queue.Empty:
+            pass
+
+    def _should_skip_render_enqueue(self, job: FrameJob) -> bool:
+        if not bool(self._cfg_store.cfg.pipeline.preview_skip_redundant_enqueue):
+            return False
+        with self._latest_lock:
+            lr = self._latest_rendered
+            last_mono = self._last_preview_encode_mono
+        now_m = time.perf_counter()
+        preview_iv = float(self._cfg_store.cfg.pipeline.preview_min_interval_ms or 0)
+        if preview_iv > 0 and lr is not None and (now_m - last_mono) * 1000.0 < preview_iv:
+            return True
+        render_every = max(1, int(self._cfg_store.cfg.pipeline.render_every_n_frames))
+        if lr is not None and (job.frame_id % render_every) != 0:
+            return True
+        return False
+
+    def _bump_latest_render_meta(self, job: FrameJob, result: DetectionResult) -> None:
+        with self._latest_lock:
+            lr = self._latest_rendered
+            if lr is None:
+                return
+            self._latest_rendered = RenderedFrame(
+                frame_id=job.frame_id,
+                pos_ms=job.pos_ms,
+                jpeg=lr.jpeg,
+                detections=len(result.detections),
+                persons=len(result.persons),
+                inference_ms=float(result.inference_ms),
+            )
+
+    def _dispatch_render(self, job: FrameJob, result: DetectionResult, tracks: list[dict]) -> None:
+        if self._should_skip_render_enqueue(job):
+            self._bump_latest_render_meta(job, result)
+            with self._stats_lock:
+                self._stats["preview_skip_enqueue"] += 1
+            self._release_pool_idx(job.pool_idx)
+            return
+        self._enqueue_render(job, result, tracks)
 
     # --------------------------------------------------------------- threads
 
     def _decoder_loop(self) -> None:
-        # Поток декодирования: читает кадры из файла и кладет в очередь.
+        # Поток декодирования: OpenCV локально или TCP-поток из Rust video-bridge.
         last_ts = time.perf_counter()
         while not self._stop_event.is_set():
             self._play_event.wait(timeout=0.2)
             if self._stop_event.is_set():
                 break
-            with self._cap_lock:
-                cap = self._cap
-                fps = self._fps
-            if cap is None:
-                time.sleep(0.05)
-                continue
 
-            with self._seek_lock:
-                target = self._seek_to
-                self._seek_to = None
-            if target is not None:
+            rb = self._rust_bridge
+            if rb is not None:
+                with self._seek_lock:
+                    target = self._seek_to
+                    self._seek_to = None
+                if target is not None and self._video_path:
+                    self._drain_decode_queue_release()
+                    try:
+                        rb.open_video(self._video_path, seek_frame=target)
+                    except Exception as exc:
+                        print(f"[pipeline] rust bridge seek failed: {exc}")
+                        time.sleep(0.05)
+                        continue
+                try:
+                    pkt = rb.read_frame()
+                except Exception as exc:
+                    print(f"[pipeline] rust bridge read failed: {exc}")
+                    self._play_event.clear()
+                    time.sleep(0.05)
+                    continue
+                if pkt is None:
+                    self._play_event.clear()
+                    time.sleep(0.05)
+                    continue
+                frame, pos_ms, remote_fid = pkt
+                self._frame_id = remote_fid
+            else:
                 with self._cap_lock:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-                self._drain_decode_queue()
+                    cap = self._cap
+                    fps = self._fps
+                if cap is None:
+                    time.sleep(0.05)
+                    continue
 
-            with self._cap_lock:
-                ok, frame = cap.read()
-                pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-                cur_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            if not ok:
-                # Конец видео: останавливаем воспроизведение, но файл оставляем открытым.
-                self._play_event.clear()
-                time.sleep(0.05)
-                continue
+                with self._seek_lock:
+                    target = self._seek_to
+                    self._seek_to = None
+                if target is not None:
+                    with self._cap_lock:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                    self._drain_decode_queue_release()
 
-            self._frame_id += 1
-            job = FrameJob(frame_id=self._frame_id, pos_ms=pos_ms, image=frame, pts=time.perf_counter())
+                with self._cap_lock:
+                    ok, frame = cap.read()
+                    pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if not ok:
+                    self._play_event.clear()
+                    time.sleep(0.05)
+                    continue
+
+                self._frame_id += 1
+
+            pool_idx: Optional[int] = None
+            if self._frame_pool is not None:
+                got = self._frame_pool.acquire_copy_from(frame, self._stop_event)
+                if got is None:
+                    break
+                image, pool_idx = got
+            else:
+                image = frame
+            job = FrameJob(
+                frame_id=self._frame_id,
+                pos_ms=pos_ms,
+                image=image,
+                pts=time.perf_counter(),
+                pool_idx=pool_idx,
+            )
+            # Latest-only: не держим устаревшие кадры — только самый свежий в очереди.
+            drained = 0
+            try:
+                while True:
+                    dropped = self._decode_q.get_nowait()
+                    drained += 1
+                    self._release_pool_idx(dropped.pool_idx)
+            except queue.Empty:
+                pass
+            if drained:
+                with self._stats_lock:
+                    self._stats["dropped_decode"] += drained
             try:
                 self._decode_q.put_nowait(job)
             except queue.Full:
-                # Если очередь забита, удаляем самый старый кадр:
-                # так держим задержку низкой.
                 try:
-                    self._decode_q.get_nowait()
+                    evicted = self._decode_q.get_nowait()
+                    self._release_pool_idx(evicted.pool_idx)
                     with self._stats_lock:
                         self._stats["dropped_decode"] += 1
-                except queue.Empty:
-                    pass
-                try:
                     self._decode_q.put_nowait(job)
-                except queue.Full:
-                    pass
+                except (queue.Empty, queue.Full):
+                    self._release_pool_idx(job.pool_idx)
 
             with self._stats_lock:
                 self._stats["decoded"] += 1
@@ -370,23 +565,15 @@ class VideoPipeline:
             # Ограничиваем частоту декодирования настройкой target_fps,
             # чтобы не грузить CPU лишними кадрами.
             target_fps = float(self._cfg_store.cfg.pipeline.target_fps or 0)
-            effective_fps = fps
+            effective_fps = float(self._fps)
             if target_fps > 0:
-                effective_fps = min(float(fps), target_fps)
+                effective_fps = min(effective_fps, target_fps)
             period = 1.0 / max(1.0, effective_fps)
             now_ts = time.perf_counter()
             sleep_for = period - (now_ts - last_ts)
             if sleep_for > 0:
                 time.sleep(sleep_for)
             last_ts = time.perf_counter()
-
-    def _drain_decode_queue(self) -> None:
-        # При seek очищаем накопившиеся кадры старой позиции.
-        try:
-            while True:
-                self._decode_q.get_nowait()
-        except queue.Empty:
-            pass
 
     def _worker_loop(self) -> None:
         # Поток инференса: берет кадр из очереди и обрабатывает его.
@@ -442,6 +629,7 @@ class VideoPipeline:
                     )
                 except Exception as exc:
                     print(f"[pipeline] inference error: {exc}")
+                    self._release_pool_idx(job.pool_idx)
                     continue
                 self._last_result = result
 
@@ -490,7 +678,10 @@ class VideoPipeline:
                     "inferred": bool(should_infer),
                 }
             )
-            self._enqueue_render(job, result, tracks)
+            if result is None:
+                self._release_pool_idx(job.pool_idx)
+                continue
+            self._dispatch_render(job, result, tracks)
 
     def _enqueue_render(self, job: FrameJob, result: DetectionResult, tracks: list[dict]) -> None:
         render_job = RenderJob(
@@ -499,19 +690,21 @@ class VideoPipeline:
             image=job.image,
             result=result,
             tracks=tracks,
+            pool_idx=job.pool_idx,
         )
         try:
             self._render_q.put_nowait(render_job)
         except queue.Full:
             # Preview-контур может отставать, но analytics path блокировать нельзя.
             try:
-                self._render_q.get_nowait()
+                old = self._render_q.get_nowait()
+                self._release_pool_idx(old.pool_idx)
             except queue.Empty:
                 pass
             try:
                 self._render_q.put_nowait(render_job)
             except queue.Full:
-                pass
+                self._release_pool_idx(render_job.pool_idx)
 
     def _render_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -519,21 +712,35 @@ class VideoPipeline:
                 job = self._render_q.get(timeout=0.2)
             except queue.Empty:
                 continue
-            render_every = max(1, int(self._cfg_store.cfg.pipeline.render_every_n_frames))
-            if (job.frame_id % render_every) != 0 and self._latest_rendered is not None:
-                jpeg = self._latest_rendered.jpeg
-            else:
-                jpeg = self._render(job, job.result, job.tracks)
-            with self._latest_lock:
-                self._latest_rendered = RenderedFrame(
-                    frame_id=job.frame_id,
-                    pos_ms=job.pos_ms,
-                    jpeg=jpeg,
-                    detections=len(job.result.detections),
-                    persons=len(job.result.persons),
-                    inference_ms=job.result.inference_ms,
-                )
-            self._tick_window(self._render_fps_window, "render_fps")
+            try:
+                preview_iv = float(self._cfg_store.cfg.pipeline.preview_min_interval_ms or 0)
+                render_every = max(1, int(self._cfg_store.cfg.pipeline.render_every_n_frames))
+                with self._latest_lock:
+                    lr = self._latest_rendered
+                    last_mono = self._last_preview_encode_mono
+                now_m = time.perf_counter()
+                new_encode_ts: Optional[float] = None
+                if preview_iv > 0 and lr is not None and (now_m - last_mono) * 1000.0 < preview_iv:
+                    jpeg = lr.jpeg
+                elif (job.frame_id % render_every) != 0 and lr is not None:
+                    jpeg = lr.jpeg
+                else:
+                    jpeg = self._render(job, job.result, job.tracks)
+                    new_encode_ts = time.perf_counter()
+                with self._latest_lock:
+                    if new_encode_ts is not None:
+                        self._last_preview_encode_mono = new_encode_ts
+                    self._latest_rendered = RenderedFrame(
+                        frame_id=job.frame_id,
+                        pos_ms=job.pos_ms,
+                        jpeg=jpeg,
+                        detections=len(job.result.detections),
+                        persons=len(job.result.persons),
+                        inference_ms=job.result.inference_ms,
+                    )
+                self._tick_window(self._render_fps_window, "render_fps")
+            finally:
+                self._release_pool_idx(job.pool_idx)
 
     # --------------------------------------------------------------- вспомогательные методы
 
@@ -547,17 +754,50 @@ class VideoPipeline:
         with self._stats_lock:
             self._stats[stat_key] = float(len(window))
 
+    def _ensure_preview_buf(self, height: int, width: int) -> np.ndarray:
+        need = (height, width, 3)
+        if self._preview_buf is None or self._preview_buf.shape != need:
+            self._preview_buf = np.empty(need, dtype=np.uint8)
+        return self._preview_buf
+
     def _render(self, job: RenderJob, result: DetectionResult, tracks_data: list[dict]) -> bytes:
-        # Рисуем оверлей и кодируем в JPEG для web-стрима.
+        # Рисуем оверлей и кодируем в JPEG для web-стрима (опционально preview даунскейл).
         cfg: AppConfig = self._cfg_store.cfg
-        img = job.image
+        src = job.image
+        fh, fw = int(src.shape[0]), int(src.shape[1])
+        long_edge = max(fh, fw)
+        max_edge = int(cfg.pipeline.preview_max_long_edge or 0)
+        sx = sy = 1.0
+        img: np.ndarray
+        if max_edge > 0:
+            if long_edge > max_edge:
+                scale = max_edge / float(long_edge)
+                nw, nh = int(round(fw * scale)), int(round(fh * scale))
+                buf = self._ensure_preview_buf(nh, nw)
+                cv2.resize(src, (nw, nh), dst=buf, interpolation=cv2.INTER_AREA)
+                img = buf
+                sx = nw / float(fw)
+                sy = nh / float(fh)
+            else:
+                img = src
+        else:
+            img = src
+
         if cfg.pipeline.render_overlay:
-            img = img.copy()
+            if img is src:
+                img = src.copy()
             tracks = {t["id"]: t for t in tracks_data}
+
+            def map_bbox(bbox: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+                if sx == 1.0 and sy == 1.0:
+                    return bbox
+                x1, y1, x2, y2 = bbox
+                return (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
+
             if cfg.ui.show_persons:
                 for p in result.persons:
                     person_label = f"person #{p.track_id} {p.confidence:.2f}"
-                    self._draw_box(img, p.bbox, _OVERLAY_COLORS["person"], person_label)
+                    self._draw_box(img, map_bbox(p.bbox), _OVERLAY_COLORS["person"], person_label)
             for det in result.detections:
                 state = tracks.get(det.track_id, {}).get("state", "candidate")
                 color = _OVERLAY_COLORS.get(state, _OVERLAY_COLORS["default"])
@@ -568,11 +808,15 @@ class VideoPipeline:
                         label_parts.insert(0, f"#{det.track_id}")
                     label_parts.append(state)
                     label = " ".join(label_parts)
-                self._draw_box(img, det.bbox, color, label)
+                self._draw_box(img, map_bbox(det.bbox), color, label)
 
             self._draw_hud(img, result)
 
-        quality = int(max(40, min(95, self._cfg_store.cfg.pipeline.jpeg_quality)))
+        if max_edge > 0 and long_edge > max_edge:
+            q = int(cfg.pipeline.preview_jpeg_quality)
+        else:
+            q = int(cfg.pipeline.jpeg_quality)
+        quality = int(max(40, min(95, q)))
         ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
         return buf.tobytes() if ok else b""
 
@@ -644,17 +888,36 @@ class VideoPipeline:
 
     def _save_snapshot(self, job: FrameJob, ev: AnalyzerEvent) -> Optional[str]:
         try:
+            pc = self._cfg_store.cfg.pipeline
             x1, y1, x2, y2 = (int(v) for v in ev.bbox)
             h, w = job.image.shape[:2]
             # Делаем небольшой отступ вокруг bbox, чтобы контекст был читаемее.
             x1 = max(0, x1 - 20); y1 = max(0, y1 - 20)
             x2 = min(w, x2 + 20); y2 = min(h, y2 + 20)
             crop = job.image[y1:y2, x1:x2] if x2 > x1 and y2 > y1 else job.image
+            out = crop
+            max_edge = int(pc.snapshot_max_long_edge or 0)
+            if max_edge > 0:
+                ch, cw = crop.shape[:2]
+                le = max(ch, cw)
+                if le > max_edge:
+                    scale = max_edge / float(le)
+                    nw, nh = int(round(cw * scale)), int(round(ch * scale))
+                    buf = self._ensure_snapshot_buf(nh, nw)
+                    cv2.resize(crop, (nw, nh), dst=buf, interpolation=cv2.INTER_AREA)
+                    out = buf
+            q = int(max(40, min(95, int(pc.snapshot_jpeg_quality or 85))))
             ts_str = time.strftime("%Y%m%d_%H%M%S")
             fname = f"{ev.type}_{ev.track_id}_{ts_str}_{int(job.pos_ms)}.jpg"
             path = self._snap_dir / fname
-            cv2.imwrite(str(path), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            cv2.imwrite(str(path), out, [int(cv2.IMWRITE_JPEG_QUALITY), q])
             return f"logs/snapshots/{fname}"
         except Exception as exc:
             print(f"[pipeline] snapshot save failed: {exc}")
             return None
+
+    def _ensure_snapshot_buf(self, height: int, width: int) -> np.ndarray:
+        need = (height, width, 3)
+        if self._snapshot_resize_buf is None or self._snapshot_resize_buf.shape != need:
+            self._snapshot_resize_buf = np.empty(need, dtype=np.uint8)
+        return self._snapshot_resize_buf

@@ -57,7 +57,7 @@ class TrackHistory:
     unattended_since_ts: float = 0.0
     abandoned_at_ts: float = 0.0
     last_owner_near_ts: float = 0.0
-    centroid_history: deque = field(default_factory=lambda: deque(maxlen=180))
+    centroid_history: deque = field(default_factory=lambda: deque(maxlen=64))
     presence_count: int = 0
     frames_seen: int = 0
     raised_abandoned: bool = False
@@ -135,11 +135,13 @@ class Analyzer:
             track = self._tracks.get(det.track_id)
             if track is None:
                 # Новому объекту всегда даем начальное состояние CANDIDATE.
+                mlen = max(8, int(cfg.centroid_history_maxlen))
                 track = TrackHistory(
                     track_id=det.track_id,
                     cls_id=det.cls_id,
                     cls_name=det.cls_name,
                     first_seen_ts=ts,
+                    centroid_history=deque(maxlen=mlen),
                 )
                 self._tracks[det.track_id] = track
                 track.state = TrackState.CANDIDATE

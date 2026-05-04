@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,25 @@ SNAPSHOTS_DIR = LOGS_DIR / "snapshots"
 DB_PATH = LOGS_DIR / "events.db"
 DATA_DIR = ROOT / "data"
 STATIC_DIR = ROOT / "static"
+
+# Кеш тяжёлых системных метрик (nvidia-smi / psutil), чтобы UI не дёргал GPU на каждый опрос.
+_SYSTEM_METRICS_LOCK = threading.Lock()
+_SYSTEM_METRICS_CACHE: dict[str, Any] = {"t_mono": 0.0, "data": None}
+_SYSTEM_METRICS_TTL_SEC = 1.0
+
+
+def _get_system_metrics_cached() -> dict:
+    now = time.perf_counter()
+    with _SYSTEM_METRICS_LOCK:
+        cached = _SYSTEM_METRICS_CACHE["data"]
+        t0 = float(_SYSTEM_METRICS_CACHE["t_mono"])
+        if cached is not None and (now - t0) < _SYSTEM_METRICS_TTL_SEC:
+            return cached
+    data = _system_metrics()
+    with _SYSTEM_METRICS_LOCK:
+        _SYSTEM_METRICS_CACHE["data"] = data
+        _SYSTEM_METRICS_CACHE["t_mono"] = time.perf_counter()
+    return data
 
 
 class OpenRequest(BaseModel):
@@ -145,7 +165,7 @@ def create_app() -> FastAPI:
     async def _metrics() -> dict:
         return {
             "process": _process_metrics(),
-            "system": _system_metrics(),
+            "system": _get_system_metrics_cached(),
             "pipeline": pipeline.metrics(),
         }
 

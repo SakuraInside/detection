@@ -43,3 +43,6 @@ INFERENCE_RPC_TIMEOUT_SEC = env_float("INFERENCE_RPC_TIMEOUT_SEC", 20.0)
 
 APP_HOST_DEFAULT = env_str("APP_HOST", "127.0.0.1")
 APP_PORT_DEFAULT = env_int("APP_PORT", 8000)
+
+# TCP `video-bridge` (Rust): python pipeline.rust_video_bridge_addr
+VIDEO_BRIDGE_ADDR = env_str("VIDEO_BRIDGE_ADDR", "127.0.0.1:9876")

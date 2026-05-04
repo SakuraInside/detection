@@ -12,6 +12,7 @@ from runtime_env import (
     RUNTIME_CONTROL_TIMEOUT_SEC,
     RUNTIME_CORE_TIMEOUT_SEC,
     RUNTIME_INGEST_ADDR,
+    VIDEO_BRIDGE_ADDR,
 )
 
 
@@ -44,16 +45,26 @@ def apply_profile(config_path: Path, profile: str) -> None:
         model["inference_rpc_addr"] = ""
         pipeline["runtime_core_addr"] = ""
         pipeline["runtime_control_addr"] = ""
+        pipeline["rust_video_bridge_addr"] = ""
+    elif profile == "rust-video":
+        # Декод в процессе video-bridge (Rust); YOLO + Analyzer в Python.
+        model["use_inference_worker"] = False
+        model["inference_rpc_addr"] = ""
+        pipeline["runtime_core_addr"] = ""
+        pipeline["runtime_control_addr"] = ""
+        pipeline["rust_video_bridge_addr"] = VIDEO_BRIDGE_ADDR
     elif profile == "hybrid":
         model["use_inference_worker"] = True
         model["inference_rpc_addr"] = ""
         pipeline["runtime_core_addr"] = RUNTIME_INGEST_ADDR
         pipeline["runtime_control_addr"] = RUNTIME_CONTROL_ADDR
+        pipeline["rust_video_bridge_addr"] = ""
     elif profile == "external":
         model["use_inference_worker"] = True
         model["inference_rpc_addr"] = INFERENCE_RPC_ADDR
         pipeline["runtime_core_addr"] = RUNTIME_INGEST_ADDR
         pipeline["runtime_control_addr"] = RUNTIME_CONTROL_ADDR
+        pipeline["rust_video_bridge_addr"] = ""
     else:
         raise ValueError(f"unsupported profile: {profile}")
 

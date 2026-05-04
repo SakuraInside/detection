@@ -91,7 +91,7 @@ class ModelConfig:
     merge_iou_threshold: float = 0.45
     # Запускать YOLO в отдельном Python worker-процессе (thin inference layer).
     # Это снижает влияние модели на основной runtime и упрощает дальнейший вынос оркестрации.
-    use_inference_worker: bool = True
+    use_inference_worker: bool = False
     # Ограничение IPC-очередей запросов/ответов к worker.
     worker_queue_size: int = 2
     # Таймаут RPC-запросов к worker (сек).
@@ -170,8 +170,9 @@ class ModelConfig:
 @dataclass
 class PipelineConfig:
     # Размер очередей между потоками декодирования и обработки.
-    decode_queue: int = 4
-    result_queue: int = 4
+    # Меньше значения -> меньше пиковая RAM (меньше полных кадров в ожидании).
+    decode_queue: int = 1
+    result_queue: int = 1
     # Запускать детекцию на каждом N-м кадре.
     detect_every_n_frames: int = 1
     # Ограничение частоты декодирования.
@@ -184,6 +185,27 @@ class PipelineConfig:
     jpeg_quality: int = 80
     # Кодировать JPEG не для каждого кадра (ускоряет рендер на слабом CPU).
     render_every_n_frames: int = 1
+    # --- Preview path (снижение RAM/CPU): отдельно от аналитики ---
+    # 0 = MJPEG в полном разрешении; иначе ограничить длинную сторону кадра (px) перед оверлеем и JPEG.
+    preview_max_long_edge: int = 960
+    # Качество JPEG для preview (ниже -> меньше размер буфера в сети и чуть меньше работы кодека).
+    preview_jpeg_quality: int = 55
+    # Минимальный интервал между перекодированием preview (мс); 0 = без ограничения.
+    # Снижает частоту аллокаций сжатого буфера и нагрузку на CPU.
+    preview_min_interval_ms: float = 100.0
+    # Не ставить кадр в очередь рендера, если MJPEG всё равно переиспользует старый JPEG
+    # (тот же интервал/шаг render_every). Освобождает буфер пула без ожидания render-потока.
+    preview_skip_redundant_enqueue: bool = True
+    # Число переиспользуемых полноразмерных RGB-буферов (0 = без пула, буфер из cap.read).
+    # Пул ограничивает одновременно «живые» полные кадры и даёт обратное давление декодеру.
+    frame_pool_size: int = 3
+    # Длинная сторона JPEG снимка тревоги (0 = без даунскейла перед записью на диск).
+    snapshot_max_long_edge: int = 1280
+    # Качество JPEG для снимков abandoned/disappeared.
+    snapshot_jpeg_quality: int = 82
+    # Декод видео во внешнем процессе `video-bridge` (Rust). Пусто = OpenCV в Python.
+    # Запуск: cargo run --manifest-path video-bridge/Cargo.toml -- --listen 127.0.0.1:9876
+    rust_video_bridge_addr: str = ""
     # Адрес Rust runtime-core ingest bridge (JSON line protocol), например "127.0.0.1:7878".
     runtime_core_addr: str = ""
     # Таймаут отправки метаданных в runtime-core (сек).
@@ -196,6 +218,8 @@ class PipelineConfig:
 
 @dataclass
 class AnalyzerConfig:
+    # Длина истории центроидов на трек (меньше -> меньше RAM на активные треки).
+    centroid_history_maxlen: int = 64
     # Порог смещения и окно времени для признания объекта статичным.
     static_displacement_px: float = 8.0
     static_window_sec: float = 3.0
