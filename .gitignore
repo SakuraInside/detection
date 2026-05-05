@@ -13,3 +13,11 @@ logs/events.db-*
 runtime-core/target/
 video-bridge/target/
 native/build/
+
+# local video data (too large for git)
+data/*.mkv
+data/*.mp4
+data/*.avi
+data/*.mov
+data/*.webm
+data/*.m4v
