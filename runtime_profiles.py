@@ -69,15 +69,19 @@ def apply_profile(config_path: Path, profile: str, low_memory: bool = False) -> 
         raise ValueError(f"unsupported profile: {profile}")
 
     if low_memory:
-        # Снижаем memory/compute footprint без отключения AOD-логики.
-        # При необходимости пользователь всегда может вернуться к yolo11x.
+        # Сильнее ужимаем RAM/CPU: меньшая модель, ниже imgsz, реже ROI и меньше буферов.
         model["weights"] = "models/yolo11s.pt"
-        model["imgsz"] = 640
-        model["floor_roi_enabled"] = False
+        model["imgsz"] = min(int(model.get("imgsz", 576) or 576), 576)
+        model["floor_roi_enabled"] = True
+        model["floor_roi_imgsz"] = min(int(model.get("floor_roi_imgsz", 480) or 480), 480)
+        model["table_roi_imgsz"] = min(int(model.get("table_roi_imgsz", 512) or 512), 512)
+        model["table_roi_every_n_frames"] = max(2, int(model.get("table_roi_every_n_frames", 2) or 2))
         pipeline["detect_every_n_frames"] = max(2, int(pipeline.get("detect_every_n_frames", 2) or 2))
         pipeline["render_every_n_frames"] = max(2, int(pipeline.get("render_every_n_frames", 2) or 2))
-        pipeline["decode_queue"] = min(3, int(pipeline.get("decode_queue", 3) or 3))
-        pipeline["result_queue"] = min(3, int(pipeline.get("result_queue", 3) or 3))
+        pipeline["decode_queue"] = min(2, int(pipeline.get("decode_queue", 2) or 2))
+        pipeline["result_queue"] = min(2, int(pipeline.get("result_queue", 2) or 2))
+        pipeline["frame_pool_size"] = min(2, int(pipeline.get("frame_pool_size", 2) or 2))
+        pipeline["forensic_ring_max"] = 0
 
     with config_path.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)

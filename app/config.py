@@ -17,19 +17,19 @@ from typing import Any
 
 @dataclass
 class ModelConfig:
-    # Путь к весам модели детектора.
-    weights: str = "yolo11x.pt"
+    # Путь к весам модели детектора (см. `models/` и `config.json`).
+    weights: str = "models/yolo11l.pt"
     # Размер входного изображения для инференса.
-    imgsz: int = 640
+    imgsz: int = 736
     # Устройство вычислений: "cpu" или "cuda:0".
     device: str = "cuda:0"
     # FP16 ускоряет инференс на GPU (если поддерживается).
     half: bool = True
     # Порог уверенности и IoU для фильтрации детекций.
-    conf: float = 0.35
+    conf: float = 0.22
     iou: float = 0.5
-    # Конфиг трекера Ultralytics.
-    tracker: str = "botsort.yaml"
+    # Конфиг трекера Ultralytics (мелкие/закрытые объекты — см. configs/botsort_loose.yaml).
+    tracker: str = "configs/botsort_loose.yaml"
     # ID классов COCO, которые считаем "целевыми предметами" (+ человек).
     # Пустой список => учитываем все классы (кроме исключенных в excluded_class_names).
     object_classes: list[int] = field(
@@ -58,6 +58,10 @@ class ModelConfig:
     )
     # ID класса "person" в COCO.
     person_class: int = 0
+    # Минимальная сторона bbox для person (дальние люди; общий min_box_size_px часто слишком жёсткий).
+    person_min_box_px: int = 12
+    # Дополнительное послабление min_conf у person у краёв кадра (вход в кадр, обрезка).
+    person_min_conf_border: float = 0.055
     # ID класса "cup" в COCO.
     cup_class: int = 41
     # Адаптивный confidence-фильтр по вертикали кадра:
@@ -65,33 +69,35 @@ class ModelConfig:
     # Для нее разрешаем более низкий confidence.
     upper_region_y_ratio: float = 0.62
     min_conf_upper: float = 0.08
-    min_conf_lower: float = 0.20
+    min_conf_lower: float = 0.14
     # Дополнительное послабление у нижней кромки кадра (частично обрезанные объекты).
     bottom_region_y_ratio: float = 0.88
-    min_conf_bottom: float = 0.12
+    min_conf_bottom: float = 0.10
     # Послабление для bbox, касающихся границ кадра.
     border_relax_px: int = 24
-    min_conf_border: float = 0.10
+    min_conf_border: float = 0.09
     # Классовые минимальные пороги confidence (по имени класса YOLO).
     # Нужны, когда отдельный класс (например bottle) стабильно теряется.
     class_min_conf: dict[str, float] = field(
         default_factory=lambda: {
-            "bottle": 0.03,
-            "cup": 0.0015,
-            "wine glass": 0.0015,
-            "bowl": 0.003,
+            "bottle": 0.02,
+            "cup": 0.008,
+            "wine glass": 0.008,
+            "bowl": 0.012,
+            "sink": 0.38,
+            "person": 0.085,
         }
     )
     # Дополнительный проход детекции по зоне пола (нижняя часть кадра).
     floor_roi_enabled: bool = True
     floor_roi_y_ratio: float = 0.55
-    floor_roi_imgsz: int = 960
-    floor_roi_conf: float = 0.04
+    floor_roi_imgsz: int = 672
+    floor_roi_conf: float = 0.035
     # Порог IoU для дедупликации "full frame" и "floor ROI" детекций.
-    merge_iou_threshold: float = 0.45
+    merge_iou_threshold: float = 0.42
     # Запускать YOLO в отдельном Python worker-процессе (thin inference layer).
     # Это снижает влияние модели на основной runtime и упрощает дальнейший вынос оркестрации.
-    use_inference_worker: bool = False
+    use_inference_worker: bool = True
     # Ограничение IPC-очередей запросов/ответов к worker.
     worker_queue_size: int = 2
     # Таймаут RPC-запросов к worker (сек).
@@ -116,13 +122,13 @@ class ModelConfig:
     table_roi_x2: float = 0.50
     table_roi_y2: float = 0.66
     # Параметры инференса cup-only на ROI.
-    table_roi_imgsz: int = 1280
-    table_roi_conf: float = 0.01
+    table_roi_imgsz: int = 800
+    table_roi_conf: float = 0.012
     table_roi_iou: float = 0.50
     # Детектить ROI не на каждом кадре для экономии FPS.
-    table_roi_every_n_frames: int = 2
+    table_roi_every_n_frames: int = 1
     # Минимальная ширина/высота bbox для учета детекции.
-    min_box_size_px: int = 20
+    min_box_size_px: int = 22
     # Пониженный минимум bbox для отдельных маленьких классов.
     min_box_size_by_class: dict[str, int] = field(
         default_factory=lambda: {
@@ -175,8 +181,8 @@ class ModelConfig:
 class PipelineConfig:
     # Размер очередей между потоками декодирования и обработки.
     # Меньше значения -> меньше пиковая RAM (меньше полных кадров в ожидании).
-    decode_queue: int = 1
-    result_queue: int = 1
+    decode_queue: int = 2
+    result_queue: int = 2
     # Запускать детекцию на каждом N-м кадре.
     detect_every_n_frames: int = 1
     # Ограничение частоты декодирования.
@@ -186,25 +192,25 @@ class PipelineConfig:
     # Пытаемся включить аппаратное ускорение декодирования (если доступно).
     prefer_hw_decode: bool = True
     # Качество JPEG для web-стрима. Ниже -> меньше CPU и сеть.
-    jpeg_quality: int = 80
-    # Кодировать JPEG не для каждого кадра (ускоряет рендер на слабом CPU).
+    jpeg_quality: int = 68
+    # Кодировать JPEG не для каждого N-го кадра (1 = каждый кадр превью).
     render_every_n_frames: int = 1
     # --- Preview path (снижение RAM/CPU): отдельно от аналитики ---
     # 0 = MJPEG в полном разрешении; иначе ограничить длинную сторону кадра (px) перед оверлеем и JPEG.
-    preview_max_long_edge: int = 960
+    preview_max_long_edge: int = 720
     # Качество JPEG для preview (ниже -> меньше размер буфера в сети и чуть меньше работы кодека).
     preview_jpeg_quality: int = 55
     # Минимальный интервал между перекодированием preview (мс); 0 = без ограничения.
     # Снижает частоту аллокаций сжатого буфера и нагрузку на CPU.
-    preview_min_interval_ms: float = 100.0
+    preview_min_interval_ms: float = 33.0
     # Не ставить кадр в очередь рендера, если MJPEG всё равно переиспользует старый JPEG
     # (тот же интервал/шаг render_every). Освобождает буфер пула без ожидания render-потока.
     preview_skip_redundant_enqueue: bool = True
     # Число переиспользуемых полноразмерных RGB-буферов (0 = без пула, буфер из cap.read).
     # Пул ограничивает одновременно «живые» полные кадры и даёт обратное давление декодеру.
-    frame_pool_size: int = 3
+    frame_pool_size: int = 2
     # Длинная сторона JPEG снимка тревоги (0 = без даунскейла перед записью на диск).
-    snapshot_max_long_edge: int = 1280
+    snapshot_max_long_edge: int = 960
     # Качество JPEG для снимков abandoned/disappeared.
     snapshot_jpeg_quality: int = 82
     # Декод видео во внешнем процессе `video-bridge` (Rust). Пусто = OpenCV в Python.
@@ -221,10 +227,10 @@ class PipelineConfig:
     # Кольцо последних JPEG preview для диагностики (0 = выкл). Удерживает только сжатые байты.
     forensic_ring_max: int = 0
     # Пороги графика RSS в UI (байты).
-    memory_chart_warning_bytes: int = 805306368
-    memory_chart_critical_bytes: int = 1006632960
+    memory_chart_warning_bytes: int = 536870912
+    memory_chart_critical_bytes: int = 805306368
     # Ограничение частоты кодирования preview (0 = без лимита).
-    preview_encode_max_fps: float = 15.0
+    preview_encode_max_fps: float = 28.0
     # Дополнительные PID для суммирования RSS аналитики (video-bridge, worker).
     analytics_extra_pids: list[int] = field(default_factory=list)
 
@@ -232,9 +238,9 @@ class PipelineConfig:
 @dataclass
 class AnalyzerConfig:
     # Длина истории центроидов на трек (меньше -> меньше RAM на активные треки).
-    centroid_history_maxlen: int = 64
+    centroid_history_maxlen: int = 72
     # Порог смещения и окно времени для признания объекта статичным.
-    static_displacement_px: float = 8.0
+    static_displacement_px: float = 7.0
     static_window_sec: float = 3.0
     # Через сколько секунд без владельца поднимать тревогу "abandoned".
     abandon_time_sec: float = 15.0
@@ -244,9 +250,9 @@ class AnalyzerConfig:
     # Задержка перед событием "disappeared", чтобы отсечь кратковременные пропуски трека.
     disappear_grace_sec: float = 4.0
     # Минимальная площадь объекта в пикселях (фильтр шума).
-    min_object_area_px: float = 600.0
+    min_object_area_px: float = 100.0
     # Доля присутствия в окне наблюдения для устойчивых решений FSM.
-    presence_ratio_threshold: float = 0.7
+    presence_ratio_threshold: float = 0.68
 
 
 @dataclass

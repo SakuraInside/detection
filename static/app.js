@@ -132,6 +132,8 @@ function applySystemMetrics(system) {
   const gpuUsed = fmtBytes(gpu.memory_used_bytes || 0);
   const gpuTotal = fmtBytes(gpu.memory_total_bytes || 0);
   updateSpeedo("speedo-gpu", gpuPct, gpuUsed, gpuTotal);
+
+  renderProcessesTopRss(system.processes_top_rss || []);
 }
 
 function applyProcessAnalyticsMetrics(proc, pipe) {
@@ -146,26 +148,86 @@ function applyProcessAnalyticsMetrics(proc, pipe) {
   const st = pipe.stats || {};
   const leg = $("#mem-chart-legend");
   if (leg) {
+    const pipe = proc.rss_pipeline_bytes;
+    const inf = proc.rss_inference_worker_bytes;
     const parts = [
-      `RSS Σ ${fmtBytes(rss)}`,
+      `Σ RSS ${fmtBytes(rss)}`,
       `EMA ${fmtBytes(ema)}`,
+      pipe != null ? `пайплайн ${fmtBytes(pipe)}` : null,
+      inf != null && inf > 0 ? `инференс ${fmtBytes(inf)}` : null,
       `пик(окно) ${fmtBytes(proc.rss_peak_recent_bytes)}`,
       `decode ${q.decode_size ?? "—"}/${q.decode_max ?? "—"}`,
       `render ${q.render_size ?? "—"}/${q.render_max ?? "—"}`,
       `e2e EMA ${(st.e2e_ms_ema || 0).toFixed(0)} мс`,
-    ];
+    ].filter(Boolean);
     if (cudaR != null) parts.push(`CUDA ${fmtBytes(cudaR)}`);
     if (buf.frame_pool_free != null) parts.push(`pool своб. ${buf.frame_pool_free}/${buf.frame_pool_slots || "—"}`);
     parts.push(`forensic ${buf.forensic_ring_len || 0}`);
     leg.textContent = parts.join(" · ");
   }
   drawMemChart(proc.rss_history || [], warnB, critB);
+  renderMemoryBreakdown(proc.memory_breakdown || []);
+}
+
+function renderMemoryBreakdown(rows) {
+  const el = $("#mem-breakdown");
+  if (!el) return;
+  el.replaceChildren();
+  if (!rows.length) {
+    el.textContent = "—";
+    return;
+  }
+  for (const row of rows) {
+    const block = document.createElement("div");
+    block.className = "mb-1.5 border-b border-slate-100 pb-1 last:border-0";
+    const line = document.createElement("div");
+    line.className = "flex justify-between gap-2";
+    const lab = document.createElement("span");
+    lab.className = "text-slate-600 truncate";
+    lab.textContent =
+      row.label + (row.pid != null && row.kind === "process_rss" ? " · pid " + row.pid : "");
+    const val = document.createElement("span");
+    val.className = "text-slate-800 font-mono shrink-0";
+    val.textContent = row.bytes != null ? fmtBytes(row.bytes) : "—";
+    line.append(lab, val);
+    block.appendChild(line);
+    if (row.hint) {
+      const hint = document.createElement("div");
+      hint.className = "text-slate-400 text-[9px] mt-0.5";
+      hint.textContent = row.hint;
+      block.appendChild(hint);
+    }
+    el.appendChild(block);
+  }
+}
+
+function renderProcessesTopRss(rows) {
+  const el = $("#sys-top-procs");
+  if (!el) return;
+  el.replaceChildren();
+  if (!rows.length) {
+    el.textContent = "нет данных (psutil недоступен или ни один процесс не выше 80 MB RSS)";
+    return;
+  }
+  for (const row of rows) {
+    const line = document.createElement("div");
+    line.className = "flex justify-between gap-2 mb-0.5 font-mono text-[9px]";
+    const lab = document.createElement("span");
+    lab.className = "text-slate-600 truncate";
+    lab.textContent = (row.name || "?") + " · " + (row.pid ?? "—");
+    const val = document.createElement("span");
+    val.className = "text-slate-800 shrink-0";
+    val.textContent = fmtBytes(row.rss_bytes || 0);
+    line.append(lab, val);
+    el.appendChild(line);
+  }
 }
 
 function drawMemChart(hist, warnB, critB) {
   const cv = $("#mem-chart");
   if (!cv || !cv.getContext) return;
   const ctx = cv.getContext("2d");
+  const padL = 44;
   const w = cv.clientWidth || cv.width;
   const h = 120;
   if (cv.width !== w) cv.width = w;
@@ -173,43 +235,78 @@ function drawMemChart(hist, warnB, critB) {
   ctx.fillStyle = "#f8fafc";
   ctx.fillRect(0, 0, w, h);
   if (!hist.length) return;
-  const vals = hist.map((p) => Number(p.rss_ema_bytes) || 0);
-  const maxV = Math.max(critB * 1.02, ...vals, 1);
+  const totalPts = hist.map((p) => Number(p.rss_total_bytes ?? p.rss_ema_bytes) || 0);
+  const pipePts = hist.map((p) => Number(p.rss_pipeline_bytes ?? p.rss_total_bytes ?? p.rss_ema_bytes) || 0);
+  const inferPts = hist.map((p) => (p.rss_inference_bytes != null ? Number(p.rss_inference_bytes) || 0 : 0));
+  const hasInfer = inferPts.some((v) => v > 1e5);
+  const maxV = Math.max(critB * 1.02, ...totalPts, ...pipePts, ...(hasInfer ? inferPts : [0]), 1);
   const t0 = hist[0].t;
   const t1 = hist[hist.length - 1].t;
   const maxT = Math.max(t1 - t0, 1e-6);
+  const plotW = w - padL - 4;
+  const lineY = (bytes) => h - 8 - (bytes / maxV) * (h - 16);
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "9px sans-serif";
+  ctx.textAlign = "right";
+  for (const frac of [0, 0.5, 1]) {
+    const b = maxV * frac;
+    const y = lineY(b);
+    ctx.fillText(fmtBytes(b), padL - 4, y + 3);
+  }
+  ctx.textAlign = "left";
   ctx.strokeStyle = "#e2e8f0";
   for (let i = 0; i <= 4; i++) {
     const y = 8 + (i / 4) * (h - 16);
     ctx.beginPath();
-    ctx.moveTo(0, y);
+    ctx.moveTo(padL, y);
     ctx.lineTo(w, y);
     ctx.stroke();
   }
-  const lineY = (bytes) => h - 8 - (bytes / maxV) * (h - 16);
   ctx.strokeStyle = "#fbbf24";
   ctx.setLineDash([5, 5]);
   ctx.beginPath();
-  ctx.moveTo(0, lineY(warnB));
+  ctx.moveTo(padL, lineY(warnB));
   ctx.lineTo(w, lineY(warnB));
   ctx.stroke();
   ctx.setLineDash([]);
   ctx.strokeStyle = "#f87171";
   ctx.beginPath();
-  ctx.moveTo(0, lineY(critB));
+  ctx.moveTo(padL, lineY(critB));
   ctx.lineTo(w, lineY(critB));
   ctx.stroke();
-  ctx.beginPath();
-  ctx.strokeStyle = "#1d4ed8";
-  ctx.lineWidth = 1.5;
-  hist.forEach((pt, i) => {
-    const x = ((pt.t - t0) / maxT) * (w - 4) + 2;
-    const y = lineY(Number(pt.rss_ema_bytes) || 0);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-  ctx.lineWidth = 1;
+
+  const strokeSeries = (pts, color, width, dash) => {
+    ctx.setLineDash(dash || []);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    hist.forEach((pt, i) => {
+      const x = padL + ((pt.t - t0) / maxT) * (plotW - 2) + 1;
+      const y = lineY(pts[i]);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
+  };
+
+  strokeSeries(pipePts, "#1d4ed8", 1.8, []);
+  if (hasInfer) strokeSeries(inferPts, "#059669", 1.5, [4, 3]);
+  else strokeSeries(totalPts, "#64748b", 1, [2, 2]);
+
+  ctx.font = "9px sans-serif";
+  ctx.textAlign = "right";
+  if (hasInfer) {
+    ctx.fillStyle = "#1d4ed8";
+    ctx.fillText("— пайплайн (декод, FSM, API)", w - 4, 12);
+    ctx.fillStyle = "#059669";
+    ctx.fillText("— инференс (YOLO+трекер)", w - 4, 24);
+  } else {
+    ctx.fillStyle = "#64748b";
+    ctx.fillText("— суммарный RSS (YOLO в этом процессе)", w - 4, 12);
+  }
+  ctx.textAlign = "left";
 }
 
 function applyInfo(info) {

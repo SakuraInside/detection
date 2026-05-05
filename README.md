@@ -395,7 +395,7 @@ python benchmark_profiles.py --profiles legacy,hybrid,external --duration-sec 20
 Чтобы максимально грузить видеокарту:
 - `device = "cuda:0"`
 - `half = true`
-- модель под вашу VRAM (`yolo11x` точнее, `yolo11n/s` быстрее)
+- модель под вашу VRAM (`yolo11x` точнее, `yolo11n/s/m` быстрее)
 - при необходимости увеличить `detect_every_n_frames` до `2`.
 
 Что остается на CPU:

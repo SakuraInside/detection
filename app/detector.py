@@ -269,10 +269,12 @@ class _LocalYoloTracker:
             # в отдельной ветке), чтобы не терять "неочевидные" объекты.
             classes = None if not cfg.object_classes else list(set(cfg.object_classes + [cfg.person_class]))
             # persist=True сохраняет внутреннее состояние трекера между кадрами.
-            # Для сохранения мелких объектов в верхней/дальней зоне запускаем
-            # модель с более низким "сырым" conf, а окончательную фильтрацию
-            # делаем ниже адаптивно по Y-координате.
-            raw_conf = float(min(cfg.conf, cfg.min_conf_upper, cfg.min_conf_lower))
+            # Сырой conf для Ultralytics: не используем min(conf, upper, lower) — он
+            # занижал порог до min(upper,lower) (~0.03) и засорял трекер шумом.
+            # Берём min(conf, max(upper, lower)) — ниже «средней» зоны не опускаемся без нужды.
+            raw_conf = float(
+                min(float(cfg.conf), max(float(cfg.min_conf_upper), float(cfg.min_conf_lower)))
+            )
             with torch.inference_mode():
                 results = self._model.track(
                     source=frame,
@@ -323,7 +325,11 @@ class _LocalYoloTracker:
                 # Убираем заведомо "шумные" классы из пользовательского blacklist.
                 continue
             x1, y1, x2, y2 = box
-            min_box_size_cls = float(max(1, min_box_by_class.get(cls_norm, int(min_box_size))))
+            if int(c) == cfg.person_class:
+                person_floor = float(max(8, min(int(cfg.person_min_box_px), int(min_box_size))))
+                min_box_size_cls = float(max(1, min_box_by_class.get(cls_norm, int(person_floor))))
+            else:
+                min_box_size_cls = float(max(1, min_box_by_class.get(cls_norm, int(min_box_size))))
             if (x2 - x1) < min_box_size_cls or (y2 - y1) < min_box_size_cls:
                 continue
             cx = (x1 + x2) / 2.0
@@ -341,6 +347,8 @@ class _LocalYoloTracker:
             )
             if touches_border:
                 min_conf = min(min_conf, float(cfg.min_conf_border))
+            if int(c) == cfg.person_class and touches_border:
+                min_conf = min(min_conf, float(cfg.person_min_conf_border))
             if cls_norm in class_min_conf:
                 min_conf = min(min_conf, class_min_conf[cls_norm])
             if float(p) < min_conf:
@@ -494,6 +502,7 @@ class _LocalYoloTracker:
         if crop.size == 0:
             return []
 
+        torch = _get_torch()
         with self._lock:
             assert self._model is not None
             with torch.inference_mode():
@@ -612,7 +621,12 @@ class _LocalYoloTracker:
                         m.bbox = d.bbox
                         m.confidence = d.confidence
                         m.centroid = d.centroid
-                        m.track_id = d.track_id
+                        # Вспомогательные id из floor/table ROI (>=1_000_000) не подменяют
+                        # стабильный id трекера — иначе объект «мигает» и пропадает из FSM.
+                        if int(d.track_id) >= 1_000_000 and int(m.track_id) < 1_000_000:
+                            pass
+                        else:
+                            m.track_id = int(d.track_id)
                     break
             if not duplicate:
                 merged.append(d)
@@ -1202,6 +1216,15 @@ class YoloTracker:
         priority: Optional[str] = None,
     ) -> DetectionResult:
         return self._impl.infer(frame, max_roi_count=max_roi_count, priority=priority)
+
+    def worker_pid(self) -> Optional[int]:
+        """PID отдельного inference-процесса (только при use_inference_worker)."""
+        impl = self._impl
+        if isinstance(impl, _WorkerYoloTracker):
+            proc = getattr(impl, "_proc", None)
+            if proc is not None and proc.is_alive():
+                return int(proc.pid)
+        return None
 
     def shutdown(self) -> None:
         if hasattr(self._impl, "shutdown"):

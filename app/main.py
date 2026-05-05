@@ -45,7 +45,8 @@ _ANALYTICS_MEM_LOCK = threading.Lock()
 _ANALYTICS_MEM_STATE: dict[str, Any] = {
     "rss_ema_bytes": None,
     "rss_peak_window_bytes": None,
-    "rss_samples": [],  # (t_mono, rss_sum) для UI-истории
+    # (t_mono, total_rss, pipeline_rss, inference_rss); inference=0 если YOLO в основном процессе.
+    "rss_samples_v2": [],
 }
 
 
@@ -348,18 +349,36 @@ def _process_metrics() -> dict:
 
 def _process_analytics_metrics(cfg_store: ConfigStore, pipeline: VideoPipeline) -> dict:
     base = _process_metrics()
-    rss_sum = int(base.get("rss_bytes") or 0)
+    main_rss = int(base.get("rss_bytes") or 0)
     extra = list(cfg_store.cfg.pipeline.analytics_extra_pids or [])
+    extras_rss = 0
     try:
         import psutil  # type: ignore
 
         for pid in extra:
             try:
-                rss_sum += int(psutil.Process(int(pid)).memory_info().rss)
+                extras_rss += int(psutil.Process(int(pid)).memory_info().rss)
             except Exception:
                 pass
     except Exception:
         pass
+
+    pm = pipeline.metrics()
+    worker_pid = pm.get("inference_worker_pid")
+    infer_rss = 0
+    if worker_pid:
+        try:
+            import psutil  # type: ignore
+
+            infer_rss = int(psutil.Process(int(worker_pid)).memory_info().rss)
+        except Exception:
+            infer_rss = 0
+
+    # Пайплайн (декод, FSM, веб, MJPEG, …) без отдельного inference-процесса; инференс — отдельная линия на графике.
+    pipeline_rss = int(main_rss + extras_rss)
+    total_footprint = int(pipeline_rss + infer_rss)
+    rss_sum = total_footprint
+
     cuda_alloc = None
     cuda_reserved = None
     try:
@@ -370,14 +389,14 @@ def _process_analytics_metrics(cfg_store: ConfigStore, pipeline: VideoPipeline) 
             cuda_reserved = int(torch.cuda.memory_reserved())
     except Exception:
         pass
-    pm = pipeline.metrics()
+
     prev_bytes = int(pm.get("buffers", {}).get("forensic_ring_bytes") or 0)
     preview_bytes_est = prev_bytes
     now = time.perf_counter()
     alpha = 0.12
     ema_f = float(rss_sum)
     peak_5s = float(rss_sum)
-    hist_slice: list[tuple[float, float]] = []
+    hist_slice: list[tuple[float, float, float, float]] = []
     with _ANALYTICS_MEM_LOCK:
         ema = _ANALYTICS_MEM_STATE["rss_ema_bytes"]
         if ema is None:
@@ -391,23 +410,155 @@ def _process_analytics_metrics(cfg_store: ConfigStore, pipeline: VideoPipeline) 
             win = win[-120:]
         _ANALYTICS_MEM_STATE["rss_peak_window_bytes"] = win
         peak_5s = max(win[-20:]) if win else float(rss_sum)
-        samples: list[tuple[float, float]] = list(_ANALYTICS_MEM_STATE.get("rss_samples") or [])
-        samples.append((now, ema_f))
+        samples: list[tuple[float, float, float, float]] = list(_ANALYTICS_MEM_STATE.get("rss_samples_v2") or [])
+        samples.append((now, float(rss_sum), float(pipeline_rss), float(infer_rss)))
         if len(samples) > 180:
             samples = samples[-180:]
-        _ANALYTICS_MEM_STATE["rss_samples"] = samples
+        _ANALYTICS_MEM_STATE["rss_samples_v2"] = samples
         hist_slice = samples[-90:]
     t0 = hist_slice[0][0] if hist_slice else now
-    rss_history = [{"t": round(t - t0, 3), "rss_ema_bytes": v} for t, v in hist_slice]
+    rss_history = [
+        {
+            "t": round(t - t0, 3),
+            "rss_total_bytes": int(tr),
+            "rss_pipeline_bytes": int(pr),
+            "rss_inference_bytes": int(ir) if ir > 0 else None,
+            # обратная совместимость для старых клиентов графика
+            "rss_ema_bytes": int(tr),
+        }
+        for t, tr, pr, ir in hist_slice
+    ]
+
+    memory_breakdown: list[dict[str, Any]] = []
+    wpath = Path(cfg_store.cfg.model.weights)
+    if not wpath.is_absolute():
+        wpath = ROOT / wpath
+    if wpath.exists():
+        memory_breakdown.append(
+            {
+                "kind": "disk",
+                "label": "Файл весов (только диск)",
+                "pid": None,
+                "bytes": int(wpath.stat().st_size),
+                "hint": str(wpath.name),
+            }
+        )
+
+    if infer_rss > 0 and worker_pid:
+        memory_breakdown.append(
+            {
+                "kind": "process_rss",
+                "label": "Инференс: YOLO + трекер",
+                "pid": int(worker_pid),
+                "bytes": int(infer_rss),
+                "hint": "отдельный процесс (model.use_inference_worker)",
+            }
+        )
+    else:
+        memory_breakdown.append(
+            {
+                "kind": "note",
+                "label": "Инференс: YOLO + трекер",
+                "pid": None,
+                "bytes": None,
+                "hint": "сейчас внутри основного процесса (включено в «Пайплайн»). Для отдельной линии на графике включите model.use_inference_worker",
+            }
+        )
+
+    memory_breakdown.append(
+        {
+            "kind": "process_rss",
+            "label": "Пайплайн: декод, очереди, FSM, веб-API, MJPEG",
+            "pid": base.get("pid"),
+            "bytes": int(main_rss),
+            "hint": "без отдельного inference-worker; браузер сюда не входит",
+        }
+    )
+    try:
+        import psutil  # type: ignore
+
+        for pid in extra:
+            try:
+                pr = psutil.Process(int(pid))
+                br = int(pr.memory_info().rss)
+                memory_breakdown.append(
+                    {
+                        "kind": "process_rss",
+                        "label": f"Доп. процесс (PID {int(pid)})",
+                        "pid": int(pid),
+                        "bytes": br,
+                        "hint": pr.name(),
+                    }
+                )
+            except Exception:
+                memory_breakdown.append(
+                    {
+                        "kind": "process_rss",
+                        "label": f"Доп. PID {int(pid)}",
+                        "pid": int(pid),
+                        "bytes": None,
+                        "hint": "нет доступа / процесс завершён",
+                    }
+                )
+    except Exception:
+        pass
+    if cuda_reserved is not None:
+        memory_breakdown.append(
+            {
+                "kind": "vram",
+                "label": "CUDA VRAM (зарезервировано)",
+                "pid": None,
+                "bytes": int(cuda_reserved),
+                "hint": "учёт на GPU, не RSS ОЗУ",
+            }
+        )
+    if cuda_alloc is not None:
+        memory_breakdown.append(
+            {
+                "kind": "vram",
+                "label": "CUDA VRAM (аллоцировано)",
+                "pid": None,
+                "bytes": int(cuda_alloc),
+                "hint": "учёт на GPU, не RSS ОЗУ",
+            }
+        )
+    buf = pm.get("buffers") or {}
+    fpb = int(buf.get("frame_pool_bytes") or 0)
+    if fpb > 0:
+        slots = buf.get("frame_pool_slots")
+        memory_breakdown.append(
+            {
+                "kind": "buffer",
+                "label": "Пул кадров BGR (оценка внутри процесса)",
+                "pid": None,
+                "bytes": fpb,
+                "hint": f"до {slots} полных кадров" if slots is not None else None,
+            }
+        )
+    frb = int(buf.get("forensic_ring_bytes") or 0)
+    if frb > 0:
+        memory_breakdown.append(
+            {
+                "kind": "buffer",
+                "label": "Forensic ring (JPEG)",
+                "pid": None,
+                "bytes": frb,
+                "hint": "диагностические снимки в RAM",
+            }
+        )
+
     return {
         **base,
         "rss_analytics_sum_bytes": rss_sum,
+        "rss_pipeline_bytes": pipeline_rss,
+        "rss_inference_worker_bytes": int(infer_rss) if infer_rss else None,
         "rss_ema_bytes": round(ema_f, 0),
         "rss_peak_recent_bytes": int(peak_5s),
         "cuda_memory_allocated_bytes": cuda_alloc,
         "cuda_memory_reserved_bytes": cuda_reserved,
         "preview_memory_bytes_est": preview_bytes_est,
         "rss_history": rss_history,
+        "memory_breakdown": memory_breakdown,
     }
 
 
@@ -416,6 +567,7 @@ def _system_metrics() -> dict:
     ram_used = None
     ram_total = None
     ram_percent = None
+    processes_top_rss: list[dict[str, Any]] = []
     try:
         import psutil  # type: ignore
 
@@ -424,6 +576,21 @@ def _system_metrics() -> dict:
         ram_used = int(vm.used)
         ram_total = int(vm.total)
         ram_percent = float(vm.percent)
+        scored: list[tuple[int, int, str]] = []
+        for p in psutil.process_iter(attrs=["pid", "name", "memory_info"]):
+            try:
+                mi = p.info.get("memory_info")
+                if mi is None:
+                    continue
+                r = int(mi.rss)
+                if r < 80_000_000:
+                    continue
+                scored.append((r, int(p.info["pid"]), str(p.info["name"] or "?")))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        scored.sort(key=lambda x: -x[0])
+        for r, pid, name in scored[:10]:
+            processes_top_rss.append({"rss_bytes": r, "pid": pid, "name": name[:48]})
     except Exception:
         pass
     return {
@@ -432,6 +599,7 @@ def _system_metrics() -> dict:
         "ram_total_bytes": ram_total,
         "ram_percent": ram_percent,
         "gpu": _gpu_metrics(),
+        "processes_top_rss": processes_top_rss,
     }
 
 

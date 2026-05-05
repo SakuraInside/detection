@@ -130,9 +130,19 @@
               </div>
             </div>
             <div class="mt-3 rounded border border-slate-200 bg-slate-50 p-2">
-              <div class="text-[11px] font-medium text-slate-700 mb-1">Память видеоаналитики (RSS EMA)</div>
+              <div class="text-[11px] font-medium text-slate-700 mb-1">ОЗУ: пайплайн vs инференс (браузер не измеряется). При model.use_inference_worker — две линии; иначе одна суммарная.</div>
               <canvas id="mem-chart" width="520" height="120" class="w-full h-[120px]"></canvas>
               <div id="mem-chart-legend" class="text-[10px] text-slate-500 mt-1 leading-snug">—</div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2 text-[10px]">
+                <div>
+                  <div class="font-medium text-slate-700 mb-1">Разбор этого приложения</div>
+                  <div id="mem-breakdown" class="text-slate-600 leading-snug">—</div>
+                </div>
+                <div>
+                  <div class="font-medium text-slate-700 mb-1">Топ процессов в ОС (&gt;80&nbsp;MB RSS)</div>
+                  <div id="sys-top-procs" class="text-slate-600 leading-snug">—</div>
+                </div>
+              </div>
             </div>
           </div>
         </div>

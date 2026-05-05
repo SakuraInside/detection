@@ -3,6 +3,10 @@ name = "runtime-core"
 version = "0.1.0"
 edition = "2021"
 
+# Релиз под десктоп/сервер интеграции (меньший бинарь, без отладочных символов).
+[profile.release]
+strip = true
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

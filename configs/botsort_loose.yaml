@@ -5,13 +5,13 @@
 tracker_type: botsort
 
 # Lower thresholds compared to default botsort.yaml.
-track_high_thresh: 0.12
+track_high_thresh: 0.11
 track_low_thresh: 0.02
-new_track_thresh: 0.08
+new_track_thresh: 0.07
 
 # Matching / persistence.
-match_thresh: 0.80
-track_buffer: 90
+match_thresh: 0.76
+track_buffer: 150
 fuse_score: true
 
 # Camera motion compensation helps for slight jitter.

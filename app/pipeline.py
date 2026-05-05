@@ -157,6 +157,8 @@ class VideoPipeline:
         self._seek_to: Optional[int] = None
         self._seek_lock = threading.Lock()
         self._frame_id = 0
+        # Пауза декодера по дельте pos_ms (контейнер) — устойчивее, чем CAP_PROP_FPS при битых метаданных.
+        self._decode_last_pos_ms: Optional[float] = None
 
         self._frame_pool: Optional[FramePool] = None
         self._snapshot_resize_buf: Optional[np.ndarray] = None
@@ -260,6 +262,7 @@ class VideoPipeline:
             forensic_bytes = sum(len(x[2]) for x in self._forensic_ring)
         return {
             "stats": stats,
+            "inference_worker_pid": self._tracker.worker_pid(),
             "queues": {
                 "decode_size": self._decode_q.qsize(),
                 "decode_max": self._decode_q.maxsize,
@@ -360,6 +363,7 @@ class VideoPipeline:
         self._last_result = None
         self._preview_buf = None
         self._snapshot_resize_buf = None
+        self._decode_last_pos_ms = None
         self._setup_frame_pool()
         self._play_event.set()
         return self.info()
@@ -374,6 +378,7 @@ class VideoPipeline:
         # Не двигаем курсор напрямую из API-потока: делегируем декодеру.
         with self._seek_lock:
             self._seek_to = max(0, int(frame_index))
+        self._decode_last_pos_ms = None
         # После seek старые треки/состояния больше невалидны.
         self._tracker.reset()
         self._analyzer.reset()
@@ -518,6 +523,7 @@ class VideoPipeline:
                     self._seek_to = None
                 if target is not None and self._video_path:
                     self._drain_decode_queue_release()
+                    self._decode_last_pos_ms = None
                     try:
                         rb.open_video(
                             self._video_path,
@@ -559,6 +565,7 @@ class VideoPipeline:
                     with self._cap_lock:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, target)
                     self._drain_decode_queue_release()
+                    self._decode_last_pos_ms = None
 
                 with self._cap_lock:
                     ok, frame = cap.read()
@@ -613,18 +620,38 @@ class VideoPipeline:
                 self._stats["decoded"] += 1
             self._tick_window(self._decode_fps_window, "decode_fps")
 
-            # Ограничиваем частоту декодирования настройкой target_fps,
-            # чтобы не грузить CPU лишними кадрами.
-            target_fps = float(self._cfg_store.cfg.pipeline.target_fps or 0)
-            effective_fps = float(self._fps)
-            if target_fps > 0:
-                effective_fps = min(effective_fps, target_fps)
-            period = 1.0 / max(1.0, effective_fps)
+            # Пауза между кадрами: 1) по дельте pos_ms из контейнера (устойчиво при битом CAP_PROP_FPS);
+            # 2) иначе по FPS: при target_fps>0 и «нормальном» file_fps — min(target, file), чтобы не
+            # ускорять 10p-файл до 30; при подозрительно низком file_fps — только target (старый кейс).
             now_ts = time.perf_counter()
-            sleep_for = period - (now_ts - last_ts)
+            pm = float(pos_ms) if pos_ms is not None else -1.0
+            sleep_for: float = 0.0
+            used_ts_pacing = False
+            if self._decode_last_pos_ms is not None and pm >= 0.0:
+                delta_ms = pm - float(self._decode_last_pos_ms)
+                if delta_ms < -20.0:
+                    self._decode_last_pos_ms = None
+                elif 0.8 <= delta_ms <= 650.0:
+                    wall_dt = min(0.65, max(1.0 / 240.0, delta_ms / 1000.0))
+                    sleep_for = wall_dt - (now_ts - last_ts)
+                    used_ts_pacing = True
+            if not used_ts_pacing:
+                target_fps = float(self._cfg_store.cfg.pipeline.target_fps or 0)
+                file_fps = float(self._fps) if self._fps and self._fps > 1e-3 else 30.0
+                if target_fps > 0:
+                    if file_fps >= 15.0:
+                        effective_fps = min(target_fps, file_fps)
+                    else:
+                        effective_fps = target_fps
+                else:
+                    effective_fps = file_fps if file_fps >= 15.0 else 30.0
+                period = 1.0 / max(1.0, effective_fps)
+                sleep_for = period - (now_ts - last_ts)
             if sleep_for > 0:
                 time.sleep(sleep_for)
             last_ts = time.perf_counter()
+            if pm >= 0.0:
+                self._decode_last_pos_ms = pm
 
     def _worker_loop(self) -> None:
         # Поток инференса: берет кадр из очереди и обрабатывает его.
