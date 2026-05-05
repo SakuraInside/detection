@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -66,10 +66,15 @@ def _get_system_metrics_cached() -> dict:
 
 class OpenRequest(BaseModel):
     path: str
+    stream_id: str | None = None
 
 
 class SeekRequest(BaseModel):
     frame: int
+
+
+class StreamRequest(BaseModel):
+    stream_id: str
 
 
 class SettingsPatch(BaseModel):
@@ -122,28 +127,66 @@ class WSHub:
 def create_app() -> FastAPI:
     app = FastAPI(title="Integra-LOST", version="0.1.0")
     cfg_store = ConfigStore(CONFIG_PATH)
-    logger = EventLogger(DB_PATH)
     hub = WSHub()
+    streams_lock = threading.RLock()
+    streams: dict[str, dict[str, Any]] = {}
 
-    pipeline = VideoPipeline(
-        config_store=cfg_store,
-        logger=logger,
-        snapshots_dir=SNAPSHOTS_DIR,
-        on_event=lambda payload: hub.broadcast_threadsafe({"type": "event", **payload}),
-    )
+    def _norm_stream_id(raw: str | None) -> str:
+        sid = (raw or "main").strip() or "main"
+        if not sid.replace("-", "_").isalnum():
+            raise HTTPException(400, "stream_id должен содержать только буквы/цифры/_/-")
+        return sid[:64]
+
+    def _create_stream(stream_id: str) -> dict[str, Any]:
+        sid = _norm_stream_id(stream_id)
+        snap_dir = SNAPSHOTS_DIR / sid
+        db_path = LOGS_DIR / f"events_{sid}.db"
+        logger = EventLogger(db_path)
+        pipeline = VideoPipeline(
+            config_store=cfg_store,
+            logger=logger,
+            snapshots_dir=snap_dir,
+            on_event=lambda payload, s=sid: hub.broadcast_threadsafe(
+                {"type": "event", "stream_id": s, **payload}
+            ),
+        )
+        slot = {"id": sid, "pipeline": pipeline, "logger": logger}
+        streams[sid] = slot
+        return slot
+
+    def _get_slot(stream_id: str | None, create: bool = True) -> dict[str, Any]:
+        sid = _norm_stream_id(stream_id)
+        with streams_lock:
+            slot = streams.get(sid)
+            if slot is None and create:
+                slot = _create_stream(sid)
+            if slot is None:
+                raise HTTPException(404, f"stream {sid} not found")
+            return slot
+
+    _get_slot("main", create=True)
 
     @app.on_event("startup")
     async def _startup() -> None:
         # Поднимаем периодическую рассылку статуса в WebSocket.
         loop = asyncio.get_running_loop()
         hub.attach(loop)
-        loop.create_task(_status_pump(hub, pipeline))
+        loop.create_task(_status_pump(hub, streams, streams_lock))
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         # Корректно завершаем фоновые компоненты.
-        pipeline.shutdown()
-        logger.close()
+        with streams_lock:
+            slots = list(streams.values())
+        for slot in slots:
+            try:
+                slot["pipeline"].shutdown()
+            except Exception:
+                pass
+            try:
+                slot["logger"].close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ static UI
     # Отдача SPA-страницы и статических ресурсов.
@@ -167,16 +210,82 @@ def create_app() -> FastAPI:
     # Управление воспроизведением, настройками и журналом.
 
     @app.get("/api/info")
-    async def _info() -> dict:
-        return pipeline.info()
+    async def _info(stream_id: str = "main") -> dict:
+        slot = _get_slot(stream_id)
+        return slot["pipeline"].info()
 
     @app.get("/api/metrics")
-    async def _metrics() -> dict:
+    async def _metrics(stream_id: str = "main") -> dict:
+        slot = _get_slot(stream_id)
+        pipeline = slot["pipeline"]
         return {
             "process": _process_analytics_metrics(cfg_store, pipeline),
             "system": _get_system_metrics_cached(),
             "pipeline": pipeline.metrics(),
         }
+
+    @app.get("/api/streams")
+    async def _streams() -> dict:
+        with streams_lock:
+            items = list(streams.items())
+        base_proc = _process_metrics()
+        main_rss = int(base_proc.get("rss_bytes") or 0)
+        share = int(main_rss / max(1, len(items)))
+        out: list[dict[str, Any]] = []
+        for sid, slot in items:
+            pipe = slot["pipeline"]
+            info = pipe.info()
+            pm = pipe.metrics()
+            worker_pid = pm.get("inference_worker_pid")
+            worker_rss = 0
+            if worker_pid:
+                try:
+                    import psutil  # type: ignore
+
+                    worker_rss = int(psutil.Process(int(worker_pid)).memory_info().rss)
+                except Exception:
+                    worker_rss = 0
+            buffers = pm.get("buffers") or {}
+            frame_pool = int(buffers.get("frame_pool_bytes") or 0)
+            forensic = int(buffers.get("forensic_ring_bytes") or 0)
+            out.append(
+                {
+                    "stream_id": sid,
+                    "loaded": bool(info.get("loaded")),
+                    "playing": bool(info.get("playing")),
+                    "video_path": info.get("video_path"),
+                    "memory": {
+                        "estimated_total_bytes": int(share + worker_rss + frame_pool + forensic),
+                        "main_process_share_bytes": share,
+                        "worker_rss_bytes": worker_rss or None,
+                        "frame_pool_bytes": frame_pool,
+                        "forensic_ring_bytes": forensic,
+                    },
+                }
+            )
+        return {"streams": out}
+
+    @app.post("/api/streams")
+    async def _create_stream_api(req: StreamRequest) -> dict:
+        sid = _norm_stream_id(req.stream_id)
+        with streams_lock:
+            if sid in streams:
+                return {"ok": True, "stream_id": sid, "created": False}
+            _create_stream(sid)
+        return {"ok": True, "stream_id": sid, "created": True}
+
+    @app.delete("/api/streams/{stream_id}")
+    async def _delete_stream_api(stream_id: str) -> dict:
+        sid = _norm_stream_id(stream_id)
+        if sid == "main":
+            raise HTTPException(400, "stream main нельзя удалить")
+        with streams_lock:
+            slot = streams.pop(sid, None)
+        if slot is None:
+            raise HTTPException(404, f"stream {sid} not found")
+        slot["pipeline"].shutdown()
+        slot["logger"].close()
+        return {"ok": True, "stream_id": sid}
 
     @app.get("/api/files")
     async def _files() -> dict:
@@ -195,8 +304,36 @@ def create_app() -> FastAPI:
                 )
         return {"data_dir": str(DATA_DIR), "files": videos}
 
+    @app.post("/api/upload_video")
+    async def _upload_video(file: UploadFile = File(...)) -> dict:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        src_name = Path(file.filename or "video.bin").name
+        ext = Path(src_name).suffix.lower()
+        allowed = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v"}
+        if ext not in allowed:
+            raise HTTPException(400, f"unsupported extension: {ext or 'none'}")
+        stem = Path(src_name).stem or "video"
+        target = DATA_DIR / src_name
+        i = 1
+        while target.exists():
+            target = DATA_DIR / f"{stem}_{i}{ext}"
+            i += 1
+        size = 0
+        with target.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                size += len(chunk)
+        await file.close()
+        return {"ok": True, "path": str(target), "name": target.name, "size_bytes": size}
+
     @app.post("/api/open")
     async def _open(req: OpenRequest) -> dict:
+        sid = _norm_stream_id(req.stream_id)
+        slot = _get_slot(sid, create=True)
+        pipeline = slot["pipeline"]
         # Разрешаем и абсолютный путь, и имя файла внутри data/.
         candidate = Path(req.path)
         if not candidate.is_absolute():
@@ -209,17 +346,20 @@ def create_app() -> FastAPI:
             raise HTTPException(400, str(exc))
 
     @app.post("/api/play")
-    async def _play() -> dict:
+    async def _play(stream_id: str = "main") -> dict:
+        pipeline = _get_slot(stream_id)["pipeline"]
         pipeline.play()
         return {"playing": True}
 
     @app.post("/api/pause")
-    async def _pause() -> dict:
+    async def _pause(stream_id: str = "main") -> dict:
+        pipeline = _get_slot(stream_id)["pipeline"]
         pipeline.pause()
         return {"playing": False}
 
     @app.post("/api/seek")
-    async def _seek(req: SeekRequest) -> dict:
+    async def _seek(req: SeekRequest, stream_id: str = "main") -> dict:
+        pipeline = _get_slot(stream_id)["pipeline"]
         pipeline.seek(req.frame)
         return {"ok": True, "frame": req.frame}
 
@@ -232,20 +372,26 @@ def create_app() -> FastAPI:
     async def _put_settings(patch: SettingsPatch) -> dict:
         body = patch.model_dump(exclude_none=True)
         snapshot = cfg_store.update(body)
-        # Если менялся блок model — перегружаем веса.
-        # Иначе достаточно обновить пороги анализатора "на лету".
-        if "model" in body:
-            pipeline.reload_model()
-        else:
-            pipeline.update_settings()
+        with streams_lock:
+            slots = list(streams.values())
+        # Если менялся блок model — перегружаем веса во всех потоках.
+        # Иначе обновляем только легкие настройки анализатора.
+        for slot in slots:
+            pipeline = slot["pipeline"]
+            if "model" in body:
+                pipeline.reload_model()
+            else:
+                pipeline.update_settings()
         return snapshot
 
     @app.get("/api/events")
-    async def _events(limit: int = 200) -> dict:
+    async def _events(limit: int = 200, stream_id: str = "main") -> dict:
+        logger = _get_slot(stream_id)["logger"]
         return {"events": logger.recent(limit=max(1, min(limit, 1000)))}
 
     @app.delete("/api/events")
-    async def _clear_events() -> dict:
+    async def _clear_events(stream_id: str = "main") -> dict:
+        logger = _get_slot(stream_id)["logger"]
         logger.clear()
         return {"ok": True}
 
@@ -253,7 +399,8 @@ def create_app() -> FastAPI:
     # MJPEG для живого видео и WS для событий/метрик.
 
     @app.get("/video_feed")
-    def _video_feed():
+    def _video_feed(stream_id: str = "main"):
+        pipeline = _get_slot(stream_id)["pipeline"]
         boundary = "frame"
 
         def gen():
@@ -291,7 +438,8 @@ def create_app() -> FastAPI:
         await ws.accept()
         await hub.add(ws)
         try:
-            await ws.send_text(json.dumps({"type": "hello", "info": pipeline.info()}))
+            main = _get_slot("main")["pipeline"]
+            await ws.send_text(json.dumps({"type": "hello", "stream_id": "main", "info": main.info()}))
             while True:
                 # Входящие сообщения не используем (кроме ping), сокет нужен
                 # как push-канал сервер -> клиент.
@@ -308,11 +456,14 @@ def create_app() -> FastAPI:
     return app
 
 
-async def _status_pump(hub: WSHub, pipeline: VideoPipeline) -> None:
+async def _status_pump(hub: WSHub, streams: dict[str, dict[str, Any]], lock: threading.RLock) -> None:
     """Периодически рассылает статус пайплайна и снимок треков."""
     while True:
         try:
-            await hub.broadcast({"type": "status", "info": pipeline.info()})
+            with lock:
+                items = list(streams.items())
+            for sid, slot in items:
+                await hub.broadcast({"type": "status", "stream_id": sid, "info": slot["pipeline"].info()})
         except Exception:
             pass
         await asyncio.sleep(0.5)

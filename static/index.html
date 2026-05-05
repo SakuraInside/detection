@@ -25,80 +25,149 @@
         <span id="hud-inf" class="metric">инф 0 мс</span>
         <span id="hud-events" class="metric">событий 0</span>
         <span id="hud-conn" class="metric metric-bad">не в сети</span>
+        <button id="btn-theme" class="theme-toggle" title="Сменить тему">🌙</button>
       </div>
     </header>
 
-    <main class="flex-1 grid grid-cols-12 gap-4 p-4">
-      <!-- Левая колонка: видео и управление -->
-      <section class="col-span-8 flex flex-col gap-3">
-        <div class="relative rounded-md overflow-hidden border border-slate-300 bg-slate-900 aspect-video shadow-sm">
-          <img id="video" src="/video_feed" class="w-full h-full object-contain" alt="video"/>
-          <div id="alarm-overlay" class="hidden absolute inset-0 ring-4 ring-rose-500 animate-pulse pointer-events-none"></div>
-          <div id="no-video" class="absolute inset-0 flex items-center justify-center text-slate-300 text-sm">
-            Откройте видеофайл для начала анализа
-          </div>
-        </div>
+    <main class="flex-1 p-4">
+      <div class="mb-4 flex items-center gap-2">
+        <button id="nav-monitor" class="nav-pill nav-pill-active">Мониторинг</button>
+        <button id="nav-resources" class="nav-pill">Ресурсы</button>
+      </div>
 
-        <!-- Панель управления плеером -->
-        <div class="card flex flex-col gap-3 p-4">
-          <div class="flex items-center gap-3">
-            <button id="btn-play" class="btn btn-primary">▶ Воспроизведение</button>
-            <button id="btn-pause" class="btn btn-secondary">⏸ Пауза</button>
-            <span id="time-cur" class="ml-2 text-xs font-mono text-slate-600">00:00.00</span>
-            <input id="seek" type="range" min="0" max="0" value="0" step="1" class="flex-1 seek-slider"/>
-            <span id="time-total" class="text-xs font-mono text-slate-600">00:00.00</span>
-          </div>
-          <div class="flex items-center gap-3 text-xs text-slate-500">
-            <span id="frame-info">кадр 0 / 0</span>
-            <span class="dot"></span>
-            <span id="fps-info">— fps</span>
-            <span class="dot"></span>
-            <span id="resolution-info">— × —</span>
-            <span class="dot"></span>
-            <span id="dropped-info">пропущено 0</span>
-          </div>
-        </div>
-
-        <!-- Выбор видеофайла -->
-        <div class="card p-4">
-          <div class="flex items-center justify-between mb-3">
-            <h2 class="section-title">Видеофайлы</h2>
-            <button id="btn-refresh-files" class="btn-link">Обновить</button>
-          </div>
-          <div id="files-list" class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm"></div>
-          <div class="mt-4 flex gap-2">
-            <input id="custom-path" type="text" placeholder="…или абсолютный путь к .mkv" class="input flex-1"/>
-            <button id="btn-open-path" class="btn btn-secondary">Открыть</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- Правая колонка: тревоги, журнал, настройки -->
-      <aside class="col-span-4 flex flex-col gap-4">
-        <div class="card p-4">
-          <div class="flex items-center justify-between mb-3">
-            <h2 class="section-title">Активные тревоги</h2>
-            <span id="alarm-count" class="badge badge-neutral">0</span>
-          </div>
-          <div id="alarms" class="flex flex-col gap-2 max-h-56 overflow-auto pr-1"></div>
-        </div>
-
-        <div class="card p-4 flex-1 flex flex-col">
-          <div class="flex items-center justify-between mb-3">
-            <h2 class="section-title">Оперативная панель</h2>
-            <div class="tabs">
-              <button id="tab-events" class="tab-btn tab-btn-active">События</button>
-              <button id="tab-system" class="tab-btn">Ресурсы</button>
+      <section id="page-monitor" class="page-panel page-panel-active grid grid-cols-12 gap-4">
+        <section class="col-span-8 flex flex-col gap-3">
+          <div class="relative rounded-xl overflow-hidden border border-slate-300 bg-slate-900 aspect-video shadow-sm card-animated">
+            <img id="video" src="/video_feed" class="w-full h-full object-contain" alt="video"/>
+            <div id="alarm-overlay" class="hidden absolute inset-0 ring-4 ring-rose-500 animate-pulse pointer-events-none"></div>
+            <div id="no-video" class="absolute inset-0 flex items-center justify-center text-slate-300 text-sm">
+              Откройте видеофайл для начала анализа
             </div>
           </div>
-          <div id="panel-events" class="flex-1 flex flex-col">
-            <div class="flex items-center justify-end mb-2 gap-3">
-              <button id="btn-refresh-events" class="btn-link">Обновить</button>
-              <button id="btn-clear-events" class="btn-link btn-link-danger">Очистить</button>
+
+          <div class="card card-animated flex flex-col gap-3 p-4">
+            <div class="flex items-center gap-3">
+              <button id="btn-play" class="btn btn-primary">▶ Воспроизведение</button>
+              <button id="btn-pause" class="btn btn-secondary">⏸ Пауза</button>
+              <span id="time-cur" class="ml-2 text-xs font-mono text-slate-600">00:00.00</span>
+              <input id="seek" type="range" min="0" max="0" value="0" step="1" class="flex-1 seek-slider"/>
+              <span id="time-total" class="text-xs font-mono text-slate-600">00:00.00</span>
+            </div>
+            <div class="flex items-center gap-3 text-xs text-slate-500">
+              <span id="frame-info">кадр 0 / 0</span>
+              <span class="dot"></span>
+              <span id="fps-info">— fps</span>
+              <span class="dot"></span>
+              <span id="resolution-info">— × —</span>
+              <span class="dot"></span>
+              <span id="dropped-info">пропущено 0</span>
+            </div>
+          </div>
+
+          <div class="card card-animated p-4">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="section-title">Видеофайлы</h2>
+              <button id="btn-refresh-files" class="btn-link">Обновить</button>
+            </div>
+            <div class="mb-3">
+              <div class="flex items-center justify-between mb-2">
+                <h3 class="text-xs font-semibold uppercase tracking-wide text-slate-600">Поток для видео</h3>
+                <div class="flex items-center gap-2">
+                  <button id="btn-add-stream" class="btn-link">+ Добавить поток</button>
+                  <button id="btn-refresh-streams" class="btn-link">Обновить потоки</button>
+                </div>
+              </div>
+              <div id="streams-tabs" class="flex flex-wrap gap-2"></div>
+            </div>
+            <div id="files-list" class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm"></div>
+            <div class="mt-3 flex items-center gap-2">
+              <input id="video-file-picker" type="file" accept="video/*,.mkv,.mp4,.avi,.mov,.webm,.m4v" class="hidden"/>
+              <button id="btn-open-system-file" class="btn btn-secondary">Открыть через проводник</button>
+              <span id="picked-file-name" class="text-xs text-slate-500 truncate">Файл не выбран</span>
+            </div>
+            <div class="mt-4 flex gap-2">
+              <input id="custom-path" type="text" placeholder="…или абсолютный путь к .mkv" class="input flex-1"/>
+              <button id="btn-open-path" class="btn btn-secondary">Открыть</button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="col-span-4 flex flex-col gap-4">
+          <div class="card card-animated p-4">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="section-title">Активные тревоги</h2>
+              <span id="alarm-count" class="badge badge-neutral">0</span>
+            </div>
+            <div id="alarms" class="flex flex-col gap-2 max-h-56 overflow-auto pr-1"></div>
+          </div>
+
+          <div class="card card-animated p-4 flex-1 flex flex-col">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="section-title">События</h2>
+              <div class="flex items-center gap-3">
+                <button id="btn-refresh-events" class="btn-link">Обновить</button>
+                <button id="btn-clear-events" class="btn-link btn-link-danger">Очистить</button>
+              </div>
             </div>
             <div id="events" class="flex flex-col gap-2 overflow-auto pr-1 max-h-[26rem]"></div>
           </div>
-          <div id="panel-system" class="hidden flex-1 flex flex-col">
+
+          <div class="card card-animated p-4">
+            <button id="btn-toggle-settings" class="w-full text-left flex justify-between items-center section-title">
+              <span>Настройки</span>
+              <span id="settings-arrow" class="text-slate-400 text-xs">▾</span>
+            </button>
+            <form id="settings-form" class="mt-4 hidden grid grid-cols-2 gap-3 text-xs">
+              <fieldset class="col-span-2 fieldset">
+                <legend class="fieldset-legend">Модель</legend>
+                <label class="block">Вес модели
+                  <input data-section="model" data-key="weights" type="text" class="input input-sm"/>
+                </label>
+                <div class="grid grid-cols-2 gap-2 mt-2">
+                  <label>Размер кадра (imgsz)<input data-section="model" data-key="imgsz" type="number" class="input input-sm"/></label>
+                  <label>Устройство (device)<input data-section="model" data-key="device" type="text" class="input input-sm"/></label>
+                  <label>Порог уверенности (conf)<input data-section="model" data-key="conf" type="number" step="0.01" class="input input-sm"/></label>
+                  <label>Порог IoU<input data-section="model" data-key="iou" type="number" step="0.01" class="input input-sm"/></label>
+                  <label class="flex items-center gap-2 mt-1">Половинная точность (half)<input data-section="model" data-key="half" type="checkbox" class="checkbox"/></label>
+                  <label>Трекер<input data-section="model" data-key="tracker" type="text" class="input input-sm"/></label>
+                </div>
+              </fieldset>
+
+              <fieldset class="col-span-2 fieldset">
+                <legend class="fieldset-legend">Параметры тревоги (FSM)</legend>
+                <div class="grid grid-cols-2 gap-2">
+                  <label>Окно неподвижности (сек)<input data-section="analyzer" data-key="static_window_sec" type="number" step="0.1" class="input input-sm"/></label>
+                  <label>Смещение неподвижности (px)<input data-section="analyzer" data-key="static_displacement_px" type="number" step="0.5" class="input input-sm"/></label>
+                  <label>Время до тревоги (сек)<input data-section="analyzer" data-key="abandon_time_sec" type="number" step="0.5" class="input input-sm"/></label>
+                  <label>Время без владельца (сек)<input data-section="analyzer" data-key="owner_left_sec" type="number" step="0.5" class="input input-sm"/></label>
+                  <label>Дистанция владельца (px)<input data-section="analyzer" data-key="owner_proximity_px" type="number" step="1" class="input input-sm"/></label>
+                  <label>Пауза перед "пропал" (сек)<input data-section="analyzer" data-key="disappear_grace_sec" type="number" step="0.5" class="input input-sm"/></label>
+                  <label>Мин. площадь объекта (px²)<input data-section="analyzer" data-key="min_object_area_px" type="number" step="50" class="input input-sm"/></label>
+                  <label>Порог присутствия<input data-section="analyzer" data-key="presence_ratio_threshold" type="number" step="0.05" class="input input-sm"/></label>
+                </div>
+              </fieldset>
+
+              <fieldset class="col-span-2 fieldset">
+                <legend class="fieldset-legend">Интерфейс</legend>
+                <div class="grid grid-cols-3 gap-2 items-center">
+                  <label class="flex items-center gap-2">Звук тревоги<input data-section="ui" data-key="alarm_sound" type="checkbox" class="checkbox"/></label>
+                  <label class="flex items-center gap-2">Показывать людей<input data-section="ui" data-key="show_persons" type="checkbox" class="checkbox"/></label>
+                  <label class="flex items-center gap-2">Показывать ID треков<input data-section="ui" data-key="show_track_ids" type="checkbox" class="checkbox"/></label>
+                </div>
+              </fieldset>
+
+              <div class="col-span-2 flex justify-end gap-2 mt-1">
+                <button type="button" id="btn-reload-settings" class="btn btn-secondary">Сбросить</button>
+                <button type="submit" class="btn btn-primary">Применить</button>
+              </div>
+            </form>
+          </div>
+        </aside>
+      </section>
+
+      <section id="page-resources" class="page-panel hidden">
+        <div class="grid grid-cols-12 gap-4">
+          <div class="col-span-12 card card-animated p-4">
             <div class="speedo-grid">
               <div class="speedo-card">
                 <div class="speedo-title">CPU</div>
@@ -133,6 +202,10 @@
               <div class="text-[11px] font-medium text-slate-700 mb-1">ОЗУ: пайплайн vs инференс (браузер не измеряется). При model.use_inference_worker — две линии; иначе одна суммарная.</div>
               <canvas id="mem-chart" width="520" height="120" class="w-full h-[120px]"></canvas>
               <div id="mem-chart-legend" class="text-[10px] text-slate-500 mt-1 leading-snug">—</div>
+              <div class="mt-2">
+                <div class="text-[11px] font-medium text-slate-700 mb-1">ОЗУ по потокам</div>
+                <div id="streams-mem-list" class="text-[10px] text-slate-600 leading-snug">—</div>
+              </div>
               <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2 text-[10px]">
                 <div>
                   <div class="font-medium text-slate-700 mb-1">Разбор этого приложения</div>
@@ -146,58 +219,7 @@
             </div>
           </div>
         </div>
-
-        <div class="card p-4">
-          <button id="btn-toggle-settings" class="w-full text-left flex justify-between items-center section-title">
-            <span>Настройки</span>
-            <span id="settings-arrow" class="text-slate-400 text-xs">▾</span>
-          </button>
-          <form id="settings-form" class="mt-4 hidden grid grid-cols-2 gap-3 text-xs">
-            <fieldset class="col-span-2 fieldset">
-              <legend class="fieldset-legend">Модель</legend>
-              <label class="block">Вес модели
-                <input data-section="model" data-key="weights" type="text" class="input input-sm"/>
-              </label>
-              <div class="grid grid-cols-2 gap-2 mt-2">
-                <label>Размер кадра (imgsz)<input data-section="model" data-key="imgsz" type="number" class="input input-sm"/></label>
-                <label>Устройство (device)<input data-section="model" data-key="device" type="text" class="input input-sm"/></label>
-                <label>Порог уверенности (conf)<input data-section="model" data-key="conf" type="number" step="0.01" class="input input-sm"/></label>
-                <label>Порог IoU<input data-section="model" data-key="iou" type="number" step="0.01" class="input input-sm"/></label>
-                <label class="flex items-center gap-2 mt-1">Половинная точность (half)<input data-section="model" data-key="half" type="checkbox" class="checkbox"/></label>
-                <label>Трекер<input data-section="model" data-key="tracker" type="text" class="input input-sm"/></label>
-              </div>
-            </fieldset>
-
-            <fieldset class="col-span-2 fieldset">
-              <legend class="fieldset-legend">Параметры тревоги (FSM)</legend>
-              <div class="grid grid-cols-2 gap-2">
-                <label>Окно неподвижности (сек)<input data-section="analyzer" data-key="static_window_sec" type="number" step="0.1" class="input input-sm"/></label>
-                <label>Смещение неподвижности (px)<input data-section="analyzer" data-key="static_displacement_px" type="number" step="0.5" class="input input-sm"/></label>
-                <label>Время до тревоги (сек)<input data-section="analyzer" data-key="abandon_time_sec" type="number" step="0.5" class="input input-sm"/></label>
-                <label>Время без владельца (сек)<input data-section="analyzer" data-key="owner_left_sec" type="number" step="0.5" class="input input-sm"/></label>
-                <label>Дистанция владельца (px)<input data-section="analyzer" data-key="owner_proximity_px" type="number" step="1" class="input input-sm"/></label>
-                <label>Пауза перед "пропал" (сек)<input data-section="analyzer" data-key="disappear_grace_sec" type="number" step="0.5" class="input input-sm"/></label>
-                <label>Мин. площадь объекта (px²)<input data-section="analyzer" data-key="min_object_area_px" type="number" step="50" class="input input-sm"/></label>
-                <label>Порог присутствия<input data-section="analyzer" data-key="presence_ratio_threshold" type="number" step="0.05" class="input input-sm"/></label>
-              </div>
-            </fieldset>
-
-            <fieldset class="col-span-2 fieldset">
-              <legend class="fieldset-legend">Интерфейс</legend>
-              <div class="grid grid-cols-3 gap-2 items-center">
-                <label class="flex items-center gap-2">Звук тревоги<input data-section="ui" data-key="alarm_sound" type="checkbox" class="checkbox"/></label>
-                <label class="flex items-center gap-2">Показывать людей<input data-section="ui" data-key="show_persons" type="checkbox" class="checkbox"/></label>
-                <label class="flex items-center gap-2">Показывать ID треков<input data-section="ui" data-key="show_track_ids" type="checkbox" class="checkbox"/></label>
-              </div>
-            </fieldset>
-
-            <div class="col-span-2 flex justify-end gap-2 mt-1">
-              <button type="button" id="btn-reload-settings" class="btn btn-secondary">Сбросить</button>
-              <button type="submit" class="btn btn-primary">Применить</button>
-            </div>
-          </form>
-        </div>
-      </aside>
+      </section>
     </main>
 
     <footer class="px-6 py-2 border-t border-slate-200 bg-white text-[11px] text-slate-400">

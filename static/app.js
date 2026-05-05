@@ -7,6 +7,9 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 const state = {
   loaded: false,
   playing: false,
+  activeStreamId: "main",
+  currentPage: "monitor",
+  streams: [],
   totalFrames: 0,
   fps: 30,
   seekDragging: false,
@@ -15,6 +18,8 @@ const state = {
   ws: null,
   settings: null,
   metricsTimer: null,
+  streamsTimer: null,
+  theme: "light",
 };
 
 const EVENT_UI = {
@@ -57,37 +62,33 @@ function updateSpeedo(rootSel, pct, valueText, subText) {
   if (subEl) subEl.textContent = subText;
 }
 
-function switchOperativeTab(tab) {
-  const evBtn = $("#tab-events");
-  const sysBtn = $("#tab-system");
-  const panelEv = $("#panel-events");
-  const panelSys = $("#panel-system");
-  if (!evBtn || !sysBtn || !panelEv || !panelSys) return;
-  if (tab === "events") {
-    evBtn.classList.add("tab-btn-active");
-    sysBtn.classList.remove("tab-btn-active");
-    panelEv.classList.remove("hidden");
-    panelSys.classList.add("hidden");
-    if (metricsTimer != null) {
-      clearInterval(metricsTimer);
-      metricsTimer = null;
-    }
-  } else {
-    sysBtn.classList.add("tab-btn-active");
-    evBtn.classList.remove("tab-btn-active");
-    panelSys.classList.remove("hidden");
-    panelEv.classList.add("hidden");
+function switchPage(page) {
+  state.currentPage = page;
+  const isResources = page === "resources";
+  $("#nav-monitor").classList.toggle("nav-pill-active", !isResources);
+  $("#nav-resources").classList.toggle("nav-pill-active", isResources);
+  $("#page-monitor").classList.toggle("hidden", isResources);
+  $("#page-resources").classList.toggle("hidden", !isResources);
+  $("#page-monitor").classList.toggle("page-panel-active", !isResources);
+  $("#page-resources").classList.toggle("page-panel-active", isResources);
+  if (isResources) {
     refreshMetrics();
-    if (metricsTimer == null) {
-      metricsTimer = setInterval(refreshMetrics, 2500);
-    }
+    if (state.metricsTimer == null) state.metricsTimer = setInterval(refreshMetrics, 2500);
+  } else if (state.metricsTimer != null) {
+    clearInterval(state.metricsTimer);
+    state.metricsTimer = null;
   }
 }
 
 async function api(method, path, body) {
   const opts = { method, headers: { "Content-Type": "application/json" } };
   if (body !== undefined) opts.body = JSON.stringify(body);
-  const r = await fetch(path, opts);
+  let r;
+  try {
+    r = await fetch(path, opts);
+  } catch (e) {
+    throw new Error("Сервер недоступен. Проверьте, что python run.py запущен.");
+  }
   if (!r.ok) {
     const text = await r.text();
     throw new Error(`${r.status}: ${text}`);
@@ -95,11 +96,34 @@ async function api(method, path, body) {
   return r.json();
 }
 
+function withStream(path, streamId = state.activeStreamId) {
+  const hasQ = path.includes("?");
+  return `${path}${hasQ ? "&" : "?"}stream_id=${encodeURIComponent(streamId)}`;
+}
+
+function applyTheme(theme) {
+  state.theme = theme === "dark" ? "dark" : "light";
+  document.body.classList.toggle("theme-dark", state.theme === "dark");
+  const btn = $("#btn-theme");
+  if (btn) btn.textContent = state.theme === "dark" ? "☀" : "🌙";
+  try { localStorage.setItem("integra_theme", state.theme); } catch {}
+}
+
+function renderSkeletonList(root, rows = 4) {
+  if (!root) return;
+  root.innerHTML = "";
+  for (let i = 0; i < rows; i++) {
+    const line = document.createElement("div");
+    line.className = "skeleton h-7 mb-2";
+    root.appendChild(line);
+  }
+}
+
 // ----------------------------------------------------------- опрос статуса
 
 async function refreshInfo() {
   try {
-    const info = await api("GET", "/api/info");
+    const info = await api("GET", withStream("/api/info"));
     applyInfo(info);
   } catch (e) {
     console.warn("info fail", e);
@@ -108,9 +132,10 @@ async function refreshInfo() {
 
 async function refreshMetrics() {
   try {
-    const data = await api("GET", "/api/metrics");
+    const data = await api("GET", withStream("/api/metrics"));
     applySystemMetrics(data.system || {});
     applyProcessAnalyticsMetrics(data.process || {}, data.pipeline || {});
+    renderStreamsMemory(state.streams || []);
   } catch (e) {
     console.warn("metrics fail", e);
   }
@@ -353,6 +378,76 @@ function applyInfo(info) {
   renderAlarms();
 }
 
+async function refreshStreams() {
+  try {
+    const data = await api("GET", "/api/streams");
+    state.streams = data.streams || [];
+    if (!state.streams.some((s) => s.stream_id === state.activeStreamId)) {
+      state.activeStreamId = "main";
+    }
+    renderStreamsTabs();
+    renderStreamsMemory(state.streams);
+  } catch (e) {
+    console.warn("streams fail", e);
+  }
+}
+
+function renderStreamsTabs() {
+  const root = $("#streams-tabs");
+  if (!root) return;
+  root.innerHTML = "";
+  if (!state.streams.length) {
+    root.innerHTML = '<div class="text-xs text-slate-400">Потоки не созданы</div>';
+    return;
+  }
+  for (const s of state.streams) {
+    const btn = document.createElement("button");
+    const active = s.stream_id === state.activeStreamId;
+    btn.className = active ? "stream-chip stream-chip-active" : "stream-chip";
+    const baseName = s.stream_id;
+    const status = s.playing ? "▶" : "⏸";
+    btn.textContent = `${status} ${baseName}`;
+    btn.onclick = () => selectStream(s.stream_id);
+    root.appendChild(btn);
+  }
+}
+
+function renderStreamsMemory(streams) {
+  const root = $("#streams-mem-list");
+  if (!root) return;
+  root.replaceChildren();
+  if (!streams.length) {
+    root.textContent = "—";
+    return;
+  }
+  for (const s of streams) {
+    const row = document.createElement("div");
+    row.className = "flex items-center justify-between gap-2 mb-0.5";
+    const label = document.createElement("span");
+    label.className = "truncate";
+    label.textContent = `${s.stream_id}${s.stream_id === state.activeStreamId ? " (активный)" : ""}`;
+    const total = s.memory?.estimated_total_bytes;
+    const worker = s.memory?.worker_rss_bytes;
+    const val = document.createElement("span");
+    val.className = "font-mono text-slate-800";
+    val.textContent = `${fmtBytes(total)}${worker ? ` · worker ${fmtBytes(worker)}` : ""}`;
+    row.append(label, val);
+    root.appendChild(row);
+  }
+}
+
+async function selectStream(streamId) {
+  state.activeStreamId = streamId;
+  state.alarms.clear();
+  renderAlarms();
+  renderStreamsTabs();
+  await refreshInfo();
+  await refreshEvents();
+  await refreshMetrics();
+  const v = $("#video");
+  v.src = withStream("/video_feed?ts=" + Date.now(), streamId);
+}
+
 function renderAlarms() {
   const root = $("#alarms");
   root.innerHTML = "";
@@ -384,7 +479,8 @@ function renderAlarms() {
 
 async function refreshEvents() {
   try {
-    const data = await api("GET", "/api/events?limit=200");
+    renderSkeletonList($("#events"), 5);
+    const data = await api("GET", withStream("/api/events?limit=200"));
     renderEvents(data.events || []);
   } catch (e) { console.warn(e); }
 }
@@ -428,8 +524,9 @@ function renderEvents(events) {
 // ----------------------------------------------------------- список видеофайлов
 
 async function refreshFiles() {
-  const data = await api("GET", "/api/files");
   const root = $("#files-list");
+  renderSkeletonList(root, 4);
+  const data = await api("GET", "/api/files");
   root.innerHTML = "";
   if (!data.files.length) {
     root.innerHTML = `<div class="col-span-2 text-xs text-slate-400">Положите .mkv в ${data.data_dir}</div>`;
@@ -446,13 +543,40 @@ async function refreshFiles() {
 
 async function openVideo(path) {
   try {
-    await api("POST", "/api/open", { path });
+    await api("POST", "/api/open", { path, stream_id: state.activeStreamId });
+    await refreshStreams();
     await refreshInfo();
     await refreshEvents();
     // Принудительно переподключаем MJPEG-поток через смену query-параметра.
     const v = $("#video");
-    v.src = "/video_feed?ts=" + Date.now();
+    v.src = withStream("/video_feed?ts=" + Date.now());
   } catch (e) { alert("Не удалось открыть: " + e.message); }
+}
+
+async function openVideoFromSystemPicker(file) {
+  if (!file) return;
+  $("#picked-file-name").textContent = `Загрузка: ${file.name}`;
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  try {
+    let r;
+    try {
+      r = await fetch("/api/upload_video", { method: "POST", body: fd });
+    } catch (e) {
+      throw new Error("Сервер недоступен. Проверьте, что python run.py запущен.");
+    }
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`${r.status}: ${t}`);
+    }
+    const data = await r.json();
+    $("#picked-file-name").textContent = `Загружен: ${data.name}`;
+    await refreshFiles();
+    await openVideo(data.path);
+  } catch (e) {
+    $("#picked-file-name").textContent = "Ошибка загрузки";
+    alert("Не удалось загрузить файл: " + e.message);
+  }
 }
 
 // ----------------------------------------------------------- настройки
@@ -520,13 +644,17 @@ function connectWs() {
   ws.onmessage = (m) => {
     let msg;
     try { msg = JSON.parse(m.data); } catch { return; }
-    if (msg.type === "status") applyInfo(msg.info);
-    else if (msg.type === "hello") applyInfo(msg.info);
+    if (msg.type === "status") {
+      if (!msg.stream_id || msg.stream_id === state.activeStreamId) applyInfo(msg.info);
+    } else if (msg.type === "hello") {
+      if (!msg.stream_id || msg.stream_id === state.activeStreamId) applyInfo(msg.info);
+    }
     else if (msg.type === "event") onEventMessage(msg);
   };
 }
 
 function onEventMessage(ev) {
+  if (ev.stream_id && ev.stream_id !== state.activeStreamId) return;
   refreshEvents();
   if (ev.type === "abandoned" || ev.type === "disappeared") {
     if (state.settings?.ui?.alarm_sound) {
@@ -538,8 +666,8 @@ function onEventMessage(ev) {
 // ----------------------------------------------------------- привязка обработчиков UI
 
 function wireControls() {
-  $("#btn-play").onclick = () => api("POST", "/api/play").then(refreshInfo);
-  $("#btn-pause").onclick = () => api("POST", "/api/pause").then(refreshInfo);
+  $("#btn-play").onclick = () => api("POST", withStream("/api/play")).then(refreshInfo);
+  $("#btn-pause").onclick = () => api("POST", withStream("/api/pause")).then(refreshInfo);
 
   const seek = $("#seek");
   seek.addEventListener("mousedown", () => state.seekDragging = true);
@@ -548,25 +676,39 @@ function wireControls() {
     if (!state.seekDragging) return;
     state.seekDragging = false;
     // Отправляем seek один раз при отпускании ползунка.
-    api("POST", "/api/seek", { frame: Number(seek.value) }).then(refreshInfo);
+    api("POST", withStream("/api/seek"), { frame: Number(seek.value) }).then(refreshInfo);
   };
   seek.addEventListener("mouseup", release);
   seek.addEventListener("touchend", release);
   seek.addEventListener("change", () => {
     if (!state.seekDragging) {
-      api("POST", "/api/seek", { frame: Number(seek.value) }).then(refreshInfo);
+      api("POST", withStream("/api/seek"), { frame: Number(seek.value) }).then(refreshInfo);
     }
   });
 
   $("#btn-refresh-files").onclick = refreshFiles;
+  $("#btn-refresh-streams").onclick = refreshStreams;
+  $("#btn-add-stream").onclick = async () => {
+    const sid = prompt("Введите ID потока (латиница/цифры/_/-):", "");
+    if (!sid) return;
+    await api("POST", "/api/streams", { stream_id: sid });
+    await refreshStreams();
+    await selectStream(sid);
+  };
   $("#btn-open-path").onclick = () => {
     const p = $("#custom-path").value.trim();
     if (p) openVideo(p);
   };
+  $("#btn-open-system-file").onclick = () => $("#video-file-picker").click();
+  $("#video-file-picker").addEventListener("change", async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    await openVideoFromSystemPicker(file);
+    ev.target.value = "";
+  });
   $("#btn-refresh-events").onclick = refreshEvents;
   $("#btn-clear-events").onclick = async () => {
     if (!confirm("Очистить журнал?")) return;
-    await api("DELETE", "/api/events");
+    await api("DELETE", withStream("/api/events"));
     refreshEvents();
   };
 
@@ -577,20 +719,31 @@ function wireControls() {
   };
   $("#btn-reload-settings").onclick = loadSettings;
   $("#settings-form").addEventListener("submit", submitSettings);
-
-  $("#tab-events").onclick = () => switchOperativeTab("events");
-  $("#tab-system").onclick = () => switchOperativeTab("system");
+  $("#nav-monitor").onclick = () => switchPage("monitor");
+  $("#nav-resources").onclick = () => switchPage("resources");
+  $("#btn-theme").onclick = () => applyTheme(state.theme === "dark" ? "light" : "dark");
 }
 
 async function main() {
+  try {
+    const savedTheme = localStorage.getItem("integra_theme");
+    if (savedTheme) applyTheme(savedTheme);
+    else applyTheme("light");
+  } catch {
+    applyTheme("light");
+  }
   wireControls();
   await loadSettings();
+  await refreshStreams();
   await refreshFiles();
   await refreshEvents();
   await refreshInfo();
   await refreshMetrics();
+  switchPage("monitor");
+  const v = $("#video");
+  v.src = withStream("/video_feed?ts=" + Date.now());
   connectWs();
-  state.metricsTimer = setInterval(refreshMetrics, 1500);
+  state.streamsTimer = setInterval(refreshStreams, 4000);
 }
 
 main().catch(console.error);

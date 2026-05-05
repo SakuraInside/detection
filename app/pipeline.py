@@ -75,7 +75,12 @@ class FramePool:
         return None
 
     def release(self, idx: int) -> None:
-        self._free.put_nowait(idx)
+        # При гонках shutdown/очередей один и тот же буфер может освободиться повторно.
+        # Не даем этой ситуации уронить render-thread.
+        try:
+            self._free.put_nowait(idx)
+        except queue.Full:
+            pass
 
     def free_slots(self) -> int:
         return int(self._free.qsize())
