@@ -1,11 +1,19 @@
 #include "integra/alarm_sink.hpp"
 
-#include <arpa/inet.h>
 #include <cstdio>
 #include <cstring>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
+#else
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <sstream>
 #include <string_view>
@@ -30,6 +38,20 @@ std::string json_esc(std::string_view s) {
   return o;
 }
 
+#ifdef _WIN32
+using socket_len_t = int;
+static bool ensure_winsock() {
+  static bool inited = false;
+  static bool ok = false;
+  if (!inited) {
+    WSADATA wsa;
+    ok = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+    inited = true;
+  }
+  return ok;
+}
+#endif
+
 }  // namespace
 
 void AlarmJsonlSink::configure(const std::string& host, int port) {
@@ -39,9 +61,13 @@ void AlarmJsonlSink::configure(const std::string& host, int port) {
 }
 
 void AlarmJsonlSink::close() {
-  if (fd_ >= 0) {
-    ::close(fd_);
-    fd_ = -1;
+  if (fd_ != static_cast<alarm_socket_t>(-1)) {
+#ifdef _WIN32
+    closesocket(static_cast<SOCKET>(fd_));
+#else
+    ::close(static_cast<int>(fd_));
+#endif
+    fd_ = static_cast<alarm_socket_t>(-1);
   }
   port_ = 0;
 }
@@ -50,7 +76,12 @@ void AlarmJsonlSink::send(const AlarmEvent& ev) {
   if (port_ <= 0) {
     return;
   }
-  if (fd_ < 0) {
+#ifdef _WIN32
+  if (!ensure_winsock()) {
+    return;
+  }
+#endif
+  if (fd_ == static_cast<alarm_socket_t>(-1)) {
     char port_buf[16];
     std::snprintf(port_buf, sizeof(port_buf), "%d", port_);
     struct addrinfo hints {};
@@ -69,14 +100,18 @@ void AlarmJsonlSink::send(const AlarmEvent& ev) {
       if (connect(s, p->ai_addr, p->ai_addrlen) == 0) {
         break;
       }
+#ifdef _WIN32
+      closesocket(s);
+#else
       ::close(s);
+#endif
       s = -1;
     }
     freeaddrinfo(res);
     if (s < 0) {
       return;
     }
-    fd_ = s;
+    fd_ = static_cast<alarm_socket_t>(s);
   }
 
   std::ostringstream os;
@@ -92,10 +127,20 @@ void AlarmJsonlSink::send(const AlarmEvent& ev) {
   }
   os << "}\n";
   const std::string line = os.str();
-  ssize_t n = ::send(fd_, line.data(), line.size(), MSG_NOSIGNAL);
+#ifdef _WIN32
+  int n = static_cast<int>(
+      ::send(static_cast<SOCKET>(fd_), line.data(), static_cast<int>(line.size()), MSG_NOSIGNAL));
+#else
+  int n = static_cast<int>(
+      ::send(static_cast<int>(fd_), line.data(), static_cast<int>(line.size()), MSG_NOSIGNAL));
+#endif
   if (n < 0 || static_cast<std::size_t>(n) != line.size()) {
-    ::close(fd_);
-    fd_ = -1;
+#ifdef _WIN32
+    closesocket(static_cast<SOCKET>(fd_));
+#else
+    ::close(static_cast<int>(fd_));
+#endif
+    fd_ = static_cast<alarm_socket_t>(-1);
   }
 }
 

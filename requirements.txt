@@ -1,21 +1,15 @@
-# Integra-LOST: Abandoned/Disappeared Object Detector
-# Tested with Python 3.10. PyTorch must be installed separately with the
-# right CUDA build for your GPU (see README).
-
-ultralytics>=8.3.0          # YOLOv11 family + built-in BoT-SORT/ByteTrack
-opencv-python>=4.10.0       # MKV decoding (FFmpeg backend) + drawing
-# NumPy 2.x has an ABI break vs PyTorch 2.3 wheels.  If your torch was
-# compiled for NumPy 1.x (default for torch <= 2.3), keep numpy < 2.
-numpy>=1.26,<2.0
-pillow>=10.0.0
-lap>=0.5.12                 # required by BoT-SORT (linear assignment)
-
-fastapi>=0.115
-uvicorn[standard]>=0.30
-python-multipart>=0.0.9     # file uploads
-pydantic>=2.7
-websockets>=12.0
-psutil>=6.0.0               # /api/metrics: CPU/RAM в UI «Ресурсы»
-
-# Optional but recommended for hardware-accelerated decoding (NVDEC):
-# pip install av
+# Integra Native — Rust-only runtime.
+#
+# Python в РАНТАЙМЕ не используется (см. README). Все три процесса (video-bridge,
+# backend_gateway, integra_ffi) — нативный код. Сам launcher `run.py` написан
+# на чистой stdlib и НЕ требует pip-зависимостей.
+#
+# Pip-deps здесь оставлены ПУСТЫМИ намеренно: если они когда-нибудь снова
+# потребуются (тулинг, экспорт .onnx → .engine, бенчмарки), добавьте сюда.
+#
+# Для запуска достаточно:
+#   • Python >= 3.10 (только для run.py)
+#   • Rust toolchain (cargo)
+#   • CMake + C++17 (для integra_ffi)
+#   • OpenCV (для video-bridge: opencv-rust требует libclang при сборке)
+#   • CUDA + TensorRT — опционально, для GPU inference (Linux рекомендуется)

@@ -15,6 +15,7 @@ std::unique_ptr<IInferenceEngine> make_onnx_engine();
 #if INTEGRA_HAS_TENSORRT
 std::unique_ptr<IInferenceEngine> make_tensorrt_engine();
 #endif
+std::unique_ptr<IInferenceEngine> make_opencv_dnn_engine();
 
 namespace {
 
@@ -32,6 +33,8 @@ class StubEngine final : public IInferenceEngine {
 #endif
     return true;
   }
+
+  bool is_stub() const override { return true; }
 };
 
 }  // namespace
@@ -54,6 +57,9 @@ std::unique_ptr<IInferenceEngine> make_inference_engine(const std::string& kind)
                  "и укажите --model file.engine\n";
     return std::make_unique<StubEngine>();
 #endif
+  }
+  if (kind == "opencv") {
+    return make_opencv_dnn_engine();
   }
   if (kind.empty() || kind == "stub") {
     return std::make_unique<StubEngine>();

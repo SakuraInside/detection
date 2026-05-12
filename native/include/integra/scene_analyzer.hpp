@@ -18,6 +18,19 @@ struct AnalyzerParams {
   double min_object_area_px = 600.0;
   int centroid_history_maxlen = 64;
   int person_class_id = 0;
+  // Жесткий предел активных треков в памяти (защита от всплеска ложных детекций).
+  int max_active_tracks = 256;
+};
+
+struct TrackSnapshot {
+  int id = 0;
+  std::string cls;
+  std::string state;  // candidate|static|unattended|alarm_abandoned|alarm_disappeared
+  float bbox[4] = {0, 0, 0, 0};
+  float conf = 0.f;
+  double static_for_sec = 0.0;
+  double unattended_for_sec = 0.0;
+  bool alarm = false;
 };
 
 /// FSM abandoned / disappeared — порт логики `app/analyzer.py` (без Web/UI).
@@ -35,6 +48,9 @@ class SceneAnalyzer {
   std::vector<AlarmEvent> ingest(double ts, double video_pos_ms, const std::string& camera_id,
                                  const std::vector<Detection>& objects,
                                  const std::vector<Detection>& persons);
+
+  /// Снимок треков для UI (аналог Python Analyzer.tracks_snapshot()).
+  std::vector<TrackSnapshot> tracks_snapshot(double now_ts) const;
 
  private:
   struct Impl;

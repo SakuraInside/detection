@@ -49,7 +49,10 @@ cmake --build "${BUILD_DIR}" -j"$(nproc)"
 echo
 echo "Готово:"
 echo "  ${BUILD_DIR}/integra-pipeline"
+echo "  ${BUILD_DIR}/integra-analyticsd"
 echo "  ${BUILD_DIR}/integra-alarmd"
+echo "  ${BUILD_DIR}/integra_trt_bake   # ONNX → .engine (FP16), INTEGRA_WITH_TENSORRT=ON"
+echo "  ${BUILD_DIR}/integra_ffi"
 echo
 echo "Если при запуске ругается на libnvinfer / libonnxruntime:"
 echo "  export LD_LIBRARY_PATH=\"${TENSORRT_ROOT}/lib:\${LD_LIBRARY_PATH}\""

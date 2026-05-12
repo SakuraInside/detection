@@ -357,7 +357,8 @@ function applyInfo(info) {
   $("#hud-render").textContent = `рендер ${(s.render_fps || 0).toFixed(0)} fps`;
   $("#hud-inf").textContent = `инф ${(s.inference_ms_avg || 0).toFixed(1)} мс`;
   $("#hud-events").textContent = `событий ${s.events || 0}`;
-  $("#dropped-info").textContent = `пропуск decode ${s.dropped_decode || 0} · render ${s.dropped_render || 0}`;
+  const pipeFps = s.pipeline_fps != null ? s.pipeline_fps.toFixed(0) : "—";
+  $("#dropped-info").textContent = `пропуск decode ${s.dropped_decode || 0} · render ${s.dropped_render || 0} · пайплайн ${pipeFps} fps`;
 
   // Синхронизируем локальную карту тревог с актуальным snapshot треков.
   const liveAlarms = new Set();
@@ -445,7 +446,7 @@ async function selectStream(streamId) {
   await refreshEvents();
   await refreshMetrics();
   const v = $("#video");
-  v.src = withStream("/video_feed?ts=" + Date.now(), streamId);
+  attachVideoStream(streamId);
 }
 
 function renderAlarms() {
@@ -498,8 +499,8 @@ function renderEvents(events) {
     const card = document.createElement("div");
     card.className = `event-card event-${ev.type}`;
     const img = ev.snapshot_path
-      ? `<a href="/${ev.snapshot_path}" target="_blank" rel="noopener noreferrer" title="Открыть снимок">
-           <img src="/${ev.snapshot_path}" alt="снимок события"/>
+      ? `<a href="${ev.snapshot_path}" target="_blank" rel="noopener noreferrer" title="Открыть снимок">
+           <img src="${ev.snapshot_path}" alt="снимок события"/>
          </a>`
       : '<div class="placeholder">нет</div>';
     const note = ev.note ? `<div class="text-[11px] text-slate-500 mt-1">${ev.note}</div>` : "";
@@ -548,8 +549,7 @@ async function openVideo(path) {
     await refreshInfo();
     await refreshEvents();
     // Принудительно переподключаем MJPEG-поток через смену query-параметра.
-    const v = $("#video");
-    v.src = withStream("/video_feed?ts=" + Date.now());
+    attachVideoStream(state.activeStreamId);
   } catch (e) { alert("Не удалось открыть: " + e.message); }
 }
 
@@ -741,9 +741,28 @@ async function main() {
   await refreshMetrics();
   switchPage("monitor");
   const v = $("#video");
-  v.src = withStream("/video_feed?ts=" + Date.now());
+  attachVideoStream(state.activeStreamId);
   connectWs();
   state.streamsTimer = setInterval(refreshStreams, 4000);
+}
+
+function attachVideoStream(streamId) {
+  const v = $("#video");
+  if (!v) return;
+  // Reset any previous handlers/intervals
+  if (v._snapshotPoll) {
+    clearInterval(v._snapshotPoll);
+    v._snapshotPoll = null;
+  }
+  v.onerror = () => {
+    // MJPEG failed — fallback to polling single-image snapshot.
+    if (v._snapshotPoll) return;
+    v._snapshotPoll = setInterval(() => {
+      v.src = withStream("/video_snapshot?ts=" + Date.now(), streamId);
+    }, 300);
+  };
+  // Try MJPEG first (cache-buster)
+  v.src = withStream("/video_feed?ts=" + Date.now(), streamId);
 }
 
 main().catch(console.error);

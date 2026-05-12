@@ -6,12 +6,18 @@
 #include <chrono>
 #include <cmath>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 namespace integra {
 
 namespace {
+
+// Не отдаём в UI/оверлей «кандидатов», пока объект не продержался N кадров подряд —
+// срезает одноразовые ложные срабатывания модели при умеренном model.conf.
+// Баланс: меньше мусора в оверлее, чем 5 кадров, но не «глушим» появление треков как при 12+.
+constexpr int kMinCandidateFramesForSnapshot = 8;
 
 enum class St {
   kNone = 0,
@@ -240,7 +246,11 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
         events.push_back(make_ev("disappeared", camera_id, video_pos_ms, tr, note));
       }
     }
-    if (!tr.raised_abandoned && silent_for > std::max(10.0, p.disappear_grace_sec * 2.0)) {
+    // Кандидат без детекции долго — мигание/шум; интервал мягче 2 с, чтобы не рвать редкие детекции.
+    if (tr.state == St::kCandidate && silent_for >= 3.5) {
+      to_drop.push_back(tid);
+    } else if (!tr.raised_abandoned &&
+               silent_for > std::max(10.0, p.disappear_grace_sec * 2.0)) {
       to_drop.push_back(tid);
     }
   }
@@ -248,7 +258,78 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
     tracks.erase(tid);
   }
 
+  const int max_tracks = std::max(64, p.max_active_tracks);
+  if (static_cast<int>(tracks.size()) > max_tracks) {
+    std::vector<std::tuple<double, int>> evict;
+    evict.reserve(tracks.size());
+    for (const auto& kv : tracks) {
+      const TH& t = kv.second;
+      if (t.raised_abandoned || t.raised_disappeared) {
+        continue;
+      }
+      evict.emplace_back(t.last_seen_ts, kv.first);
+    }
+    std::sort(evict.begin(), evict.end(),
+              [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+    int overflow = static_cast<int>(tracks.size()) - max_tracks;
+    for (const auto& it : evict) {
+      if (overflow <= 0) {
+        break;
+      }
+      tracks.erase(std::get<1>(it));
+      --overflow;
+    }
+  }
+
   return events;
+}
+
+std::vector<TrackSnapshot> SceneAnalyzer::tracks_snapshot(double now_ts) const {
+  const auto& p = impl_->p;
+  (void)p;
+  std::vector<TrackSnapshot> out;
+  out.reserve(impl_->tracks.size());
+  for (const auto& kv : impl_->tracks) {
+    const TH& t = kv.second;
+    if (t.state == St::kCandidate && t.frames_seen < kMinCandidateFramesForSnapshot) {
+      continue;
+    }
+    if (t.state == St::kNone) {
+      continue;
+    }
+    TrackSnapshot s;
+    s.id = t.track_id;
+    s.cls = t.cls_name;
+    switch (t.state) {
+      case St::kNone:
+      case St::kCandidate:
+        s.state = "candidate";
+        break;
+      case St::kStatic:
+        s.state = "static";
+        break;
+      case St::kUnattended:
+        s.state = "unattended";
+        break;
+      case St::kAlarmAbandoned:
+        s.state = "alarm_abandoned";
+        break;
+      case St::kAlarmDisappeared:
+        s.state = "alarm_disappeared";
+        break;
+    }
+    s.bbox[0] = t.last_bbox.x1;
+    s.bbox[1] = t.last_bbox.y1;
+    s.bbox[2] = t.last_bbox.x2;
+    s.bbox[3] = t.last_bbox.y2;
+    s.conf = t.last_conf;
+    s.static_for_sec = t.static_since_ts > 0 ? std::max(0.0, now_ts - t.static_since_ts) : 0.0;
+    s.unattended_for_sec =
+        t.unattended_since_ts > 0 ? std::max(0.0, now_ts - t.unattended_since_ts) : 0.0;
+    s.alarm = (t.state == St::kAlarmAbandoned || t.state == St::kAlarmDisappeared);
+    out.push_back(std::move(s));
+  }
+  return out;
 }
 
 }  // namespace integra

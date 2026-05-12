@@ -20,7 +20,7 @@ if(INTEGRA_WITH_TENSORRT AND NOT INTEGRA_ENABLE_CUDA)
   message(FATAL_ERROR "INTEGRA_WITH_TENSORRT=ON требует INTEGRA_ENABLE_CUDA=ON")
 endif()
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio dnn)
 find_package(Threads REQUIRED)
 
 if(INTEGRA_ENABLE_CUDA)
@@ -36,10 +36,13 @@ add_library(integra_core STATIC
   src/video_source.cpp
   src/gpu_preprocess.cpp
   src/inference_stub.cpp
+  src/shared_engine.cpp
+  src/opencv_dnn_engine.cpp
   src/yolo_postprocess.cpp
   src/iou_tracker.cpp
   src/scene_analyzer.cpp
   src/alarm_sink.cpp
+  src/frame_filter.cpp
   src/pipeline.cpp
 )
 
@@ -75,24 +78,43 @@ if(INTEGRA_WITH_TENSORRT)
   find_path(TENSORRT_INCLUDE NAMES NvInfer.h
     HINTS "${TENSORRT_ROOT}/include" "$ENV{TENSORRT_ROOT}/include"
     PATHS /usr/include/x86_64-linux-gnu /usr/local/include)
-  find_library(TENSORRT_NVINFER NAMES nvinfer
+  find_library(TENSORRT_NVINFER NAMES nvinfer nvinfer_10
+    HINTS "${TENSORRT_ROOT}/lib" "$ENV{TENSORRT_ROOT}/lib"
+    PATHS /usr/lib/x86_64-linux-gnu /usr/local/lib)
+  find_library(TENSORRT_NVONNXPARSER NAMES nvonnxparser nvonnxparser_10
     HINTS "${TENSORRT_ROOT}/lib" "$ENV{TENSORRT_ROOT}/lib"
     PATHS /usr/lib/x86_64-linux-gnu /usr/local/lib)
   if(NOT TENSORRT_INCLUDE OR NOT TENSORRT_NVINFER)
     message(FATAL_ERROR "INTEGRA_WITH_TENSORRT=ON: не найден TensorRT (NvInfer.h, libnvinfer). Задайте TENSORRT_ROOT.")
   endif()
+  if(NOT TENSORRT_NVONNXPARSER)
+    message(FATAL_ERROR "INTEGRA_WITH_TENSORRT=ON: не найден libnvonnxparser (нужен для integra_trt_bake). Проверьте TENSORRT_ROOT/lib.")
+  endif()
   message(STATUS "TensorRT include: ${TENSORRT_INCLUDE}")
-  message(STATUS "TensorRT lib: ${TENSORRT_NVINFER}")
+  message(STATUS "TensorRT nvinfer: ${TENSORRT_NVINFER}")
+  message(STATUS "TensorRT nvonnxparser: ${TENSORRT_NVONNXPARSER}")
   target_sources(integra_core PRIVATE src/tensorrt_engine.cpp)
   target_include_directories(integra_core PRIVATE "${TENSORRT_INCLUDE}")
   target_link_libraries(integra_core PRIVATE "${TENSORRT_NVINFER}")
   target_compile_definitions(integra_core PUBLIC INTEGRA_HAS_TENSORRT=1)
+
+  # Утилита: ONNX → serialized engine (off-line, перед запуском gateway).
+  add_executable(integra_trt_bake src/trt_bake_main.cpp)
+  target_include_directories(integra_trt_bake PRIVATE "${TENSORRT_INCLUDE}")
+  target_link_libraries(integra_trt_bake PRIVATE
+    "${TENSORRT_NVINFER}"
+    "${TENSORRT_NVONNXPARSER}"
+  )
+  if(INTEGRA_ENABLE_CUDA)
+    target_link_libraries(integra_trt_bake PRIVATE CUDA::cudart)
+  endif()
 endif()
 
 if(INTEGRA_ENABLE_CUDA)
   target_sources(integra_core PRIVATE cuda/preprocess.cu)
   target_compile_definitions(integra_core PUBLIC INTEGRA_HAS_CUDA=1)
   set_property(TARGET integra_core PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+  set_property(TARGET integra_core PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   target_link_libraries(integra_core PUBLIC CUDA::cudart)
 else()
   target_compile_definitions(integra_core PUBLIC INTEGRA_HAS_CUDA=0)
@@ -101,7 +123,39 @@ endif()
 add_executable(integra-pipeline src/main.cpp)
 target_link_libraries(integra-pipeline PRIVATE integra_core)
 
+add_executable(integra-analyticsd src/analyticsd_main.cpp)
+target_link_libraries(integra-analyticsd PRIVATE integra_core Threads::Threads)
+
+if(WIN32)
+  target_link_libraries(integra-analyticsd PRIVATE ws2_32)
+endif()
+
 add_executable(integra-alarmd alarmd/main.cpp)
 target_link_libraries(integra-alarmd PRIVATE Threads::Threads)
+if(WIN32)
+  target_link_libraries(integra-alarmd PRIVATE ws2_32)
+endif()
 
-install(TARGETS integra-pipeline integra-alarmd RUNTIME DESTINATION bin)
+# integra_ffi: SHARED library — C ABI для Rust/любого другого языка.
+add_library(integra_ffi SHARED src/integra_ffi.cpp)
+target_compile_definitions(integra_ffi PRIVATE INTEGRA_FFI_BUILD=1)
+target_link_libraries(integra_ffi PRIVATE integra_core Threads::Threads)
+if(WIN32)
+  set_target_properties(integra_ffi PROPERTIES PREFIX "")
+  target_link_libraries(integra_ffi PRIVATE ws2_32)
+endif()
+set_target_properties(integra_ffi PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+
+install(TARGETS integra-pipeline integra-analyticsd integra-alarmd RUNTIME DESTINATION bin)
+if(INTEGRA_WITH_TENSORRT)
+  install(TARGETS integra_trt_bake RUNTIME DESTINATION bin)
+endif()
+install(TARGETS integra_ffi
+  RUNTIME DESTINATION bin
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+)
+install(FILES include/integra/integra_ffi.h DESTINATION include/integra)

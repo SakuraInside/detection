@@ -14,8 +14,9 @@ match_thresh: 0.76
 track_buffer: 150
 fuse_score: true
 
-# Camera motion compensation helps for slight jitter.
-gmc_method: sparseOptFlow
+# GMC sparse optical flow сильно нагружает CPU на битых/шумных H264 потоках.
+# Для стабильного FPS в desktop-режиме отключаем компенсацию движения камеры.
+gmc_method: none
 
 # ReID off for speed/stability on single camera scenario.
 proximity_thresh: 0.5

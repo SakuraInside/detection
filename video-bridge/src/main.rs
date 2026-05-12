@@ -1,12 +1,23 @@
-//! Декод видео в Rust, выдача BGR в TCP для Python (модель + Analyzer остаются в Python).
+//! Декод видео в Rust, выдача BGR-кадров в TCP. Используется backend_gateway.
 //!
-//! 1) Клиент: `{"cmd":"open","path":"/path.mp4","seek_frame":null}\n`
+//! Протокол:
+//! 1) Клиент: `{"cmd":"open","path":"/path.mp4","seek_frame":null,"prefer_hw_decode":true}\n`
 //! 2) Сервер: handshake JSON + `\n`
-//! 3) Кадры: JSON meta + `\n` + 4 байта LE u32 + BGR (H*W*3)
+//! 3) Кадры: JSON meta + `\n` + 4 байта LE u32 (длина BGR) + BGR (H*W*3)
+//!
+//! После handshake клиент может слать команды (одна на строку, `\n`-terminated):
+//!   {"cmd":"seek","frame":N}     — переместиться к кадру N
+//!   {"cmd":"seek","ms":12345.0}  — переместиться к позиции в миллисекундах
+//!   {"cmd":"pause"}              — приостановить выдачу кадров (соединение остаётся)
+//!   {"cmd":"play"}               — возобновить выдачу
+//!   {"cmd":"close"}              — корректно завершить сессию
+//!
+//! Команды применяются перед чтением следующего кадра (задержка ≤ длительности одного кадра).
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -14,8 +25,8 @@ use clap::Parser;
 use opencv::core::Mat;
 use opencv::prelude::*;
 use opencv::videoio::{
-    VideoCapture, VideoCaptureTrait, CAP_FFMPEG, CAP_PROP_FPS, CAP_PROP_FRAME_COUNT, CAP_PROP_FRAME_HEIGHT,
-    CAP_PROP_FRAME_WIDTH, CAP_PROP_POS_FRAMES, CAP_PROP_POS_MSEC,
+    VideoCapture, VideoCaptureTrait, CAP_FFMPEG, CAP_PROP_FPS, CAP_PROP_FRAME_COUNT,
+    CAP_PROP_FRAME_HEIGHT, CAP_PROP_FRAME_WIDTH, CAP_PROP_POS_FRAMES, CAP_PROP_POS_MSEC,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -55,6 +66,15 @@ struct FrameMeta {
     height: i32,
 }
 
+#[derive(Debug)]
+enum SessionCommand {
+    SeekFrame(i32),
+    SeekMs(f64),
+    Pause,
+    Play,
+    Close,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -63,8 +83,8 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let listener = TcpListener::bind(&args.listen)
-        .with_context(|| format!("bind {}", args.listen))?;
+    let listener =
+        TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
     info!(addr = %args.listen, "video-bridge listening (Python: pipeline.rust_video_bridge + this address)");
 
     for stream in listener.incoming() {
@@ -98,7 +118,10 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        let seek_frame = v.get("seek_frame").and_then(|x| x.as_u64()).map(|x| x as i32);
+        let seek_frame = v
+            .get("seek_frame")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as i32);
         let prefer_hw_decode = v
             .get("prefer_hw_decode")
             .and_then(|x| x.as_bool())
@@ -193,6 +216,52 @@ fn run_session(
     writeln!(stream, "{}", serde_json::to_string(&hs)?)?;
     stream.flush()?;
 
+    // Поднимаем отдельный command-reader thread: он читает JSON-команды от клиента
+    // по `\n` и шлёт их в основной цикл через mpsc-канал. Когда основной цикл
+    // завершается, мы делаем shutdown(Read) — read_line возвращает Ok(0), thread выходит.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+    let cmd_stream = stream
+        .try_clone()
+        .map_err(|e| anyhow!("clone stream: {e}"))?;
+    let cmd_thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(cmd_stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let cmd = match v.get("cmd").and_then(|x| x.as_str()) {
+                        Some("seek") => {
+                            if let Some(f) = v.get("frame").and_then(|x| x.as_i64()) {
+                                SessionCommand::SeekFrame(f as i32)
+                            } else if let Some(ms) = v.get("ms").and_then(|x| x.as_f64()) {
+                                SessionCommand::SeekMs(ms)
+                            } else {
+                                continue;
+                            }
+                        }
+                        Some("pause") => SessionCommand::Pause,
+                        Some("play") => SessionCommand::Play,
+                        Some("close") => {
+                            let _ = cmd_tx.send(SessionCommand::Close);
+                            break;
+                        }
+                        _ => continue,
+                    };
+                    if cmd_tx.send(cmd).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let period = if target_fps > 0 {
         Some(Duration::from_secs_f64(1.0 / target_fps as f64))
     } else {
@@ -200,9 +269,60 @@ fn run_session(
     };
     let mut next_tick = Instant::now();
     let mut frame_id: u64 = 0;
+    let mut paused = false;
     let mut mat = Mat::default();
 
-    loop {
+    let result: Result<()> = (|| loop {
+        // Драйним команды, накопившиеся между кадрами.
+        let mut should_close = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                SessionCommand::SeekFrame(f) => {
+                    let target = f.max(0) as f64;
+                    if cap.set(CAP_PROP_POS_FRAMES, target).unwrap_or(false) {
+                        frame_id = f.max(0) as u64;
+                        info!(frame = f, "seek by frame");
+                    } else {
+                        warn!(frame = f, "seek by frame failed");
+                    }
+                    // Сбрасываем темпинг — иначе после seek next_tick может быть в будущем.
+                    next_tick = Instant::now();
+                }
+                SessionCommand::SeekMs(ms) => {
+                    if cap.set(CAP_PROP_POS_MSEC, ms.max(0.0)).unwrap_or(false) {
+                        info!(ms = ms, "seek by ms");
+                        // frame_id обновится из cap на следующем кадре (через pos_msec).
+                    } else {
+                        warn!(ms = ms, "seek by ms failed");
+                    }
+                    next_tick = Instant::now();
+                }
+                SessionCommand::Pause => {
+                    paused = true;
+                    info!("paused");
+                }
+                SessionCommand::Play => {
+                    paused = false;
+                    next_tick = Instant::now();
+                    info!("resumed");
+                }
+                SessionCommand::Close => {
+                    info!("close requested by client");
+                    should_close = true;
+                }
+            }
+        }
+        if should_close {
+            return Ok(());
+        }
+
+        if paused {
+            // Не декодируем и не пишем — соединение остаётся живым, клиент в любой момент
+            // может прислать seek/play/close. Минимальный sleep, чтобы CPU не крутился вхолостую.
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        }
+
         if let Some(p) = period {
             next_tick += p;
             let now = Instant::now();
@@ -215,12 +335,13 @@ fn run_session(
 
         let ok = cap.read(&mut mat)?;
         if !ok || mat.empty() {
-            break;
+            return Ok(());
         }
 
         if !mat.is_continuous() {
             let mut cont = Mat::default();
-            mat.copy_to(&mut cont).map_err(|e| anyhow!("copy_to: {e}"))?;
+            mat.copy_to(&mut cont)
+                .map_err(|e| anyhow!("copy_to: {e}"))?;
             mat = cont;
         }
 
@@ -240,8 +361,15 @@ fn run_session(
         let len = slice.len() as u32;
         stream.write_all(&len.to_le_bytes())?;
         stream.write_all(slice)?;
-        stream.flush()?;
-    }
+        if let Err(e) = stream.flush() {
+            // Клиент закрыл соединение — корректно выходим.
+            warn!(error = %e, "stream flush failed; closing");
+            return Ok(());
+        }
+    })();
 
-    Ok(())
+    // Корректно гасим command thread: после Shutdown::Both read_line вернёт Ok(0) или Err.
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = cmd_thread.join();
+    result
 }

@@ -21,3 +21,22 @@ data/*.avi
 data/*.mov
 data/*.webm
 data/*.m4v
+
+# Local / MSVC CMake output
+native/build-msvc/
+
+# OpenCV or other huge local build trees
+/build/
+
+# Runtime: snapshots, dumps, SQLite (не коммитить с рабочей машины)
+logs/**/*.jpg
+logs/**/*.jpeg
+logs/**/*.png
+logs/events*.db
+logs/events*.db-shm
+logs/events*.db-wal
+logs/*.json
+smoke-*.log
+
+# ONNX веса часто сотни МБ — держите локально или через LFS
+models/*.onnx

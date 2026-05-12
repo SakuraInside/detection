@@ -1,475 +1,223 @@
-# Integra-LOST: подробное описание системы
+# Integra Native
 
-Система обнаруживает и сопровождает объекты в видео, после чего по правилам
-FSM формирует тревоги двух типов:
-- **Обнаружен предмет** (`abandoned`) — предмет оставлен без владельца;
-- **Предмет пропал** (`disappeared`) — ранее тревожный предмет исчез из кадра.
+Детектор оставленных / пропавших предметов, целиком на C++ / Rust.
+Python в рантайме не используется — `run.py` это только launcher двух
+нативных процессов.
 
-Проект состоит из Python backend (FastAPI + YOLO + FSM + SQLite) и web-интерфейса
-на чистом JS/CSS.
+Два типа тревог:
 
----
-
-## 1) Как работает система (поток данных)
-
-1. Пользователь открывает видео через UI.
-2. `VideoPipeline` запускает два потока:
-   - **decoder** читает кадры из файла;
-   - **worker** запускает нейросеть и анализатор.
-3. `YoloTracker` (Ultralytics `YOLO.track`) возвращает боксы и track-id.
-4. `Analyzer` обновляет FSM каждого трека и генерирует события.
-5. `EventLogger` пишет события в SQLite, `pipeline` сохраняет snapshot.
-6. UI получает:
-   - live-видео через MJPEG (`/video_feed`);
-   - статус/события через WebSocket (`/ws`);
-   - журнал через REST (`/api/events`).
-
-Схема:
-
-```
-Видео файл
-   ↓
-decoder thread (cv2.VideoCapture)
-   ↓ bounded queue
-worker thread (YOLO + tracker)
-   ↓
-Analyzer (FSM)
-   ├── EventLogger (SQLite)
-   ├── snapshot (JPEG в logs/snapshots)
-   └── WS push в UI
-
-Параллельно:
-latest rendered JPEG → /video_feed (MJPEG)
-```
+- **`alarm_abandoned`** — предмет стал статичным, владелец рядом не появляется → тревога;
+- **`alarm_disappeared`** — ранее тревожный предмет исчез из кадра.
 
 ---
 
-## 2) FSM и логика тревог
-
-Состояния объекта:
+## 1. Архитектура
 
 ```
-NONE → CANDIDATE → STATIC → UNATTENDED → ALARM_ABANDONED
-                                            ↓ (нет в кадре >= disappear_grace_sec)
-                                          ALARM_DISAPPEARED
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Браузер (static/index.html, app.js, styles.css)                         │
+│       │  HTTP/REST + WebSocket + MJPEG                                   │
+└────────────────────────────┬─────────────────────────────────────────────┘
+                             │
+        ┌────────────────────▼────────────────────────────────┐
+        │ backend_gateway  (Rust / axum, runtime-core)        │
+        │  • /api/info, /api/open, /api/metrics, /api/events  │
+        │  • /video_feed (MJPEG c bbox-overlay)               │
+        │  • /ws (broadcast событий и status тиков)           │
+        └────┬──────────────────────────────┬─────────────────┘
+             │ TCP :9876 (BGR кадры)         │ FFI (C ABI)
+             │                                │
+   ┌─────────▼──────────┐         ┌──────────▼──────────────────────┐
+   │ video-bridge       │         │ integra_ffi  (C++ shared lib)   │
+   │ (Rust + opencv)    │         │  • SharedEngine (TRT / OpenCV)  │
+   │  HW-accel decode   │         │  • IouTracker + SceneAnalyzer   │
+   │  → BGR frames      │         │  • frame_filter (anti-noise)    │
+   └────────────────────┘         │  • IntegraPipeline (per-stream) │
+                                  └─────────────────────────────────┘
 ```
 
-Ключевая идея:
-- сначала объект должен стать **статичным**;
-- затем должен остаться **без человека рядом**;
-- только после этого поднимается тревога **обнаружен предмет**;
-- если тревожный объект исчезает — событие **предмет пропал**.
+Все три компонента — независимые бинарники / разделяемые библиотеки.
+Pipeline вычислительной части (декод → preprocess → inference → NMS →
+tracker → FSM) исполняется в C++ / CUDA, без переключений в Python.
 
----
+## 2. Структура репозитория
 
-## 3) Запуск и установка
+```
+.
+├── native/              # C++ ядро: integra_core, integra_ffi, analyticsd, alarmd, pipeline
+│   ├── include/integra/ # Публичные заголовки (frame_filter.hpp, inference_engine.hpp, ...)
+│   ├── src/             # Реализации (shared_engine.cpp, tensorrt_engine.cpp, integra_ffi.cpp, ...)
+│   ├── CMakeLists.txt
+│   └── README.md        # Подробности по C++ ядру
+├── runtime-core/        # Rust workspace member: backend_gateway + integra Rust bindings
+│   ├── src/integra/     # FFI обёртки (ffi.rs, pipeline.rs, stream.rs, events.rs)
+│   ├── src/bin/backend_gateway.rs
+│   └── Cargo.toml
+├── video-bridge/        # Rust workspace member: TCP-сервер с BGR-кадрами (opencv-rust)
+├── static/              # Frontend (index.html, app.js, styles.css)
+├── data/                # Видеофайлы (mkv, mp4, ...)
+├── logs/snapshots/      # JPEG snapshots алармовых событий (создаётся автоматически)
+├── models/              # Веса (yolo11n.onnx, yolo11n.engine, ...)
+├── config.json          # Параметры pipeline (engine, conf/iou, analyzer thresholds)
+├── run.py               # Python-launcher: запускает video-bridge + backend_gateway
+└── README.md
+```
 
-### Linux/macOS
+## 3. Сборка
+
+### 3.1. Нативная библиотека `integra_ffi`
+
+**Windows (MSBuild):**
+```powershell
+cmake -S native -B native\build-msvc -G "Visual Studio 17 2022" -A x64
+cmake --build native\build-msvc --config RelWithDebInfo --target integra_ffi
+```
+Результат: `native\build-msvc\RelWithDebInfo\integra_ffi.dll`.
+
+**Linux:**
+```bash
+cmake -S native -B native/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build native/build --target integra_ffi -j
+```
+Если на машине доступен TensorRT — он подхватится автоматически
+(`INTEGRA_HAS_TENSORRT=1`), и для движка `kind="tensorrt"` будет
+использоваться `SharedTRTEngine` + per-stream `IExecutionContext`.
+Иначе движок `opencv` / `onnx` через OpenCV DNN.
+
+Детали — в [`native/README.md`](native/README.md).
+
+### 3.2. Rust workspace
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python run.py
+cargo build --release --workspace
 ```
 
-### Windows (PowerShell)
+Для `video-bridge` нужен libclang (зависимость `opencv-rust` через
+bindgen):
+- Windows: `pip install libclang` → `LIBCLANG_PATH=.venv\Lib\site-packages\clang\native`;
+- Linux: `apt install libclang-dev`.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python run.py
-```
+### 3.3. TensorRT: сборка `.engine` из `.onnx` (Linux, production)
 
-Открыть UI: [http://127.0.0.1:8000](http://127.0.0.1:8000)
+Рантайм ожидает **уже собранный** serialized engine (см. `native_analytics.model_path`).
 
-### Быстрый запуск migration-стека
+- Утилита **`integra_trt_bake`** (входит в сборку при `INTEGRA_WITH_TENSORRT=ON`):  
+  `integra_trt_bake --onnx models/yolo11n.onnx --out models/yolo11n_fp16.engine --fp16`
+- Кеш с детерминированным именем: **`native/scripts/trt_bake_cached.sh`** (sha256 + compute capability).
 
-Единая команда запуска с профилями:
+Подробности — [native/README.md](native/README.md) (раздел «TensorRT: ONNX → .engine»).
+
+## 4. Запуск
 
 ```bash
-python run_stack.py --profile external
+python run.py --release
 ```
 
-Windows one-command запуск:
+`run.py` найдёт `integra_ffi.dll/.so`, выставит `INTEGRA_FFI_PATH` и
+запустит:
 
-```powershell
-.\run_stack.ps1 -Profile external
+1. `video-bridge` (Rust) — TCP :9876, отдаёт BGR кадры из видео;
+2. `backend_gateway` (Rust) — HTTP :8000, грузит `integra_ffi`, рулит
+   FFI Pipeline, отдаёт UI.
+
+UI откроется на [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+Полезные флаги:
+
+| Флаг              | Что делает                                          |
+|-------------------|-----------------------------------------------------|
+| `--release`       | `cargo run --release` (рекомендуется для прод)       |
+| `--port 8095`     | Сменить порт UI                                      |
+| `--bridge-addr`   | Сменить адрес TCP video-bridge                       |
+| `--no-bridge`     | Запустить gateway без bridge (smoke без видео)       |
+
+Переменные среды:
+
+| ENV                          | Назначение                                       |
+|------------------------------|--------------------------------------------------|
+| `INTEGRA_FFI_PATH`           | Путь к `integra_ffi.{dll,so}` (берётся run.py)   |
+| `INTEGRA_BACKEND_HOST/PORT`  | Где слушает gateway                              |
+| `INTEGRA_VIDEO_BRIDGE_ADDR`  | TCP-адрес video-bridge                           |
+| `INTEGRA_ENGINE_KIND`        | `tensorrt` / `opencv` / `onnx` / `stub`          |
+| `INTEGRA_PROJECT_ROOT`       | Корень проекта (для static/, data/, logs/)      |
+| `RUST_LOG`                   | Уровень логов axum / runtime-core                |
+
+## 5. REST / WS API (для фронтенда)
+
+| Метод | Путь                          | Описание                                          |
+|------:|-------------------------------|---------------------------------------------------|
+|  GET  | `/`, `/static/*`              | Фронтенд (HTML/JS/CSS)                            |
+|  GET  | `/health`                     | Liveness probe                                    |
+|  GET  | `/api/info`                   | Снапшот стрима: tracks, stats, fps, ...           |
+|  POST | `/api/open`                   | `{path}` — открыть видео, запустить pipeline     |
+|  POST | `/api/play`, `/api/pause`     | Управление playback (форвардятся в video-bridge) |
+|  POST | `/api/seek`                   | `{"frame":N}` — seek по номеру кадра             |
+|  GET  | `/api/metrics`                | process RSS/CPU + system + pipeline EMA          |
+|  GET  | `/api/files`                  | Список видео в `data/`                            |
+|  GET  | `/api/streams`                | Список стримов                                    |
+|  GET  | `/api/events?limit=N`         | Лог последних событий                             |
+|  GET/PUT | `/api/settings`            | Чтение / deep-merge правка `config.json`         |
+|  GET  | `/video_feed`                 | MJPEG c bbox-overlay (multipart/x-mixed-replace) |
+|  GET  | `/video_snapshot`             | JPEG последнего кадра                            |
+|  GET  | `/logs/snapshots/main/*.jpg`  | JPG алармовых событий                            |
+|  WS   | `/ws`                         | hello → status (каждые 500мс) + event (по факту) |
+
+WS-сообщения:
+
+```jsonc
+{"type":"hello",  "stream_id":"main", "info":{...full info...}}
+{"type":"status", "stream_id":"main", "info":{...full info...}}
+{"type":"event",  "stream_id":"main", "event":{"type":"alarm_abandoned", "snapshot_path":"/logs/snapshots/main/...jpg", ...}}
 ```
 
-Если RAM близко к 90-100%, запускайте low-memory режим:
+## 6. Конфигурация — `config.json`
 
-```powershell
-.\run_stack.ps1 -Profile external -LowMemory
+Минимально необходимое:
+
+```json
+{
+  "native_analytics": {
+    "engine": "tensorrt",
+    "model_path": "models/yolo11n_fp16.engine",
+    "input_size": 640
+  },
+  "model": {
+    "conf": 0.25,
+    "iou": 0.45,
+    "person_class": 0,
+    "object_classes": [24, 26, 28],
+    "min_box_size_px": 20
+  },
+  "analyzer": {
+    "static_displacement_px": 12,
+    "static_window_sec": 3.0,
+    "abandon_time_sec": 12.0,
+    "owner_proximity_px": 220.0,
+    "owner_left_sec": 5.0,
+    "disappear_grace_sec": 5.0,
+    "min_object_area_px": 400
+  }
+}
 ```
 
-Эквивалент через Python:
-
-```powershell
-python run_stack.py --profile external --low-memory
-```
-
-Профили:
-
-- `legacy` — только текущий Python runtime (без runtime-core и внешнего inference RPC);
-- `hybrid` — Python runtime + внутренний inference worker + runtime-core control/ingest;
-- `external` — целевой режим: runtime-core + внешний Python inference service + app.
-
-### Сравнительный benchmark профилей
-
-```bash
-python benchmark_profiles.py --profiles legacy,hybrid,external --duration-sec 20
-```
-
-Результат сохраняется в `logs/benchmark_profiles.json` и показывает:
-
-- `decode_fps_avg`, `render_fps_avg`, `inference_ms_avg`;
-- `rss_mb_avg`, `rss_mb_peak`;
-- активный `scheduler_mode`.
-
----
-
-## 4) Подробно по файлам (кто за что отвечает)
-
-### Корень проекта
-
-- `run.py`  
-  Это самый первый файл, который вы запускаете командой `python run.py`.  
-  Простыми словами: он "включает" весь сервер приложения.
-  - Запускает веб-сервер `uvicorn`.
-  - Говорит серверу, где находится приложение: `app.main:app`.
-  - После запуска именно этот процесс начинает слушать порт `8000`, чтобы открылся сайт в браузере.
-  
-  Если этот файл удалить или сломать:
-  - проект не стартует привычной командой;
-  - придется вручную запускать `uvicorn` длинной командой.
-  
-  Обычно вы редактируете `run.py` редко — только если хотите менять порт, режим запуска или способ старта приложения.
-
-- `config.json`  
-  Это главный "пульт настроек" всей системы в виде JSON-файла.  
-  Здесь лежат параметры, которые определяют поведение детектора, анализатора и интерфейса.
-  - Какие веса модели использовать (`weights`).
-  - На чем считать (`cpu` или `cuda:0`).
-  - Насколько строгой должна быть детекция (`conf`, `iou`).
-  - Как быстро обрабатывать кадры и как часто запускать инференс.
-  - Через сколько секунд объект считать брошенным и через сколько считать исчезнувшим.
-  
-  Важно: настройки можно менять через веб-интерфейс, и они применяются без полной переустановки проекта.
-  
-  Если внести в файл некорректный JSON (например, пропустить запятую), приложение может не загрузить конфигурацию.
-
-- `requirements.txt`  
-  Список библиотек Python, без которых проект не работает.
-  - `fastapi`, `uvicorn` — веб-часть.
-  - `opencv`, `ultralytics` — видео и нейросеть.
-  - и другие вспомогательные пакеты.
-  
-  Когда вы выполняете `pip install -r requirements.txt`, Python ставит все нужное автоматически.
-  
-  Если какой-то пакет отсутствует или версия несовместима, обычно появляются ошибки при старте (`ModuleNotFoundError` и т.п.).
-
-- `README.md`  
-  Это "инструкция к проекту" для разработчика и оператора:
-  - как запустить систему;
-  - что делает каждый модуль;
-  - какие есть API;
-  - как настраивать и диагностировать проблемы.
-  
-  По сути, если человек впервые видит этот проект, он начинает именно отсюда.
-
----
-
-### Папка `app/`
-
-- `app/main.py`  
-  Это "диспетчер" веб-приложения на FastAPI.  
-  Через него браузер общается с backend.
-  
-  Что здесь обычно находится:
-  - REST API-методы (`/api/open`, `/api/play`, `/api/settings`, `/api/events` и т.д.);
-  - endpoint ` /video_feed` для живого MJPEG-видео;
-  - WebSocket `/ws` для мгновенных обновлений без перезагрузки страницы;
-  - подключение статических файлов (`index.html`, `app.js`, `styles.css`).
-  
-  Если объяснить максимально просто:
-  - пользователь нажал кнопку "Play" в браузере;
-  - запрос пришел в `main.py`;
-  - `main.py` передал команду в pipeline;
-  - pipeline начал обработку, а интерфейс получил обновленный статус.
-
-- `app/pipeline.py`  
-  Это центральный "мотор" проекта. Именно здесь кадры превращаются в результат.
-  
-  Основные обязанности:
-  - запуск декодирования видео (чтение кадров из файла);
-  - запуск анализа кадров в рабочем потоке;
-  - контроль очереди кадров (чтобы не копилась задержка);
-  - объединение результата детекции и логики FSM;
-  - отрисовка рамок/подписей поверх кадра;
-  - подготовка JPEG для живого стрима в браузер;
-  - отправка событий в БД, WebSocket и сохранение snapshot.
-  
-  Почему это важно:
-  - если `pipeline.py` работает плохо, интерфейс "тормозит";
-  - если очередь не ограничивать, картинка отстанет на десятки секунд;
-  - если неправильно настроить drop-policy, можно потерять актуальность видео.
-
-- `app/detector.py`  
-  Это слой, который напрямую общается с YOLO-моделью.
-  
-  Его задача — скрыть "технические детали" нейросети от остального кода:
-  - загрузить модель по пути к весам;
-  - перевести вычисления на нужное устройство (`cpu`/`gpu`);
-  - запускать `track(...)`, чтобы получать не только боксы, но и `track_id`;
-  - фильтровать лишние классы;
-  - отдельно хранить людей (`person`) и целевые объекты (сумки, коробки и т.д.).
-  
-  Практический смысл:
-  - `analyzer.py` получает уже удобные, очищенные данные;
-  - остальной код не зависит от конкретных внутренних деталей Ultralytics API.
-
-- `app/analyzer.py`  
-  Это "мозг правил" системы, построенный как FSM (конечный автомат состояний).
-  
-  Что делает анализатор:
-  - для каждого `track_id` хранит текущее состояние объекта;
-  - проверяет, двигается объект или стоит на месте;
-  - определяет, есть ли рядом человек-владелец;
-  - считает время отсутствия владельца;
-  - переводит объект в тревожные состояния;
-  - генерирует события `abandoned` и `disappeared`.
-  
-  Самое важное:
-  - именно здесь определяется "логика тревоги", а не в YOLO;
-  - YOLO только "видит", а `analyzer.py` "понимает контекст во времени".
-
-- `app/logger_db.py`  
-  Это модуль ведения журнала событий в SQLite.
-  
-  Он нужен, чтобы тревоги не исчезали после перезапуска страницы:
-  - каждое событие записывается в таблицу `events`;
-  - запись идет через очередь, чтобы не тормозить основной поток обработки;
-  - доступны методы чтения последних записей;
-  - есть очистка журнала по запросу пользователя.
-  
-  Польза для эксплуатации:
-  - можно открыть историю и проверить, когда сработала тревога;
-  - можно связать событие со snapshot и провести разбор инцидента.
-
-- `app/config.py`  
-  Это "контроллер конфигурации": безопасно читает, обновляет и сохраняет настройки.
-  
-  Что обычно реализовано в этом файле:
-  - структуры (dataclass) для разделов `model`, `pipeline`, `analyzer`, `ui`;
-  - преобразование сырых JSON-данных в удобные Python-объекты;
-  - проверки и аккуратное слияние новых параметров;
-  - потокобезопасная запись на диск, чтобы избежать повреждения файла.
-  
-  Для новичка:
-  - если `config.json` — это "данные настроек",
-  - то `config.py` — это "правила работы с этими данными".
-
-- `app/__init__.py`  
-  Технический файл Python-пакета.
-  - Показывает интерпретатору, что `app/` — это модуль, который можно импортировать.
-  - Может быть пустым, и это нормально.
-  
-  Обычно этот файл не трогают, если нет специальных задач по инициализации пакета.
-
----
-
-### Папка `static/`
-
-- `static/index.html`  
-  Каркас веб-страницы (структура интерфейса).
-  - Здесь описано, какие блоки видит пользователь: окно видео, кнопки управления, раздел тревог, журнал, форма настроек.
-  - Сам по себе HTML почти не содержит логики, он задает "скелет" экрана.
-  
-  Если упростить: `index.html` отвечает за "что находится на странице".
-
-- `static/app.js`  
-  Главный скрипт клиентской части (логика интерфейса в браузере).
-  
-  Типичные задачи:
-  - отправка REST-запросов на backend (play/pause/open/settings/events);
-  - подключение к WebSocket для realtime-обновлений;
-  - обновление элементов страницы без перезагрузки;
-  - отображение новых тревог и статусов;
-  - обработка кликов по кнопкам и ввода в форме настроек.
-  
-  Иными словами:
-  - `index.html` рисует пустые "контейнеры",
-  - `app.js` наполняет их живыми данными и реакцией на действия пользователя.
-
-- `static/styles.css`  
-  Оформление интерфейса: цвета, отступы, шрифты, размеры, вид карточек и бейджей.
-  - Делает UI читаемым и удобным.
-  - Позволяет визуально разделять типы событий (например, тревожные/информационные).
-  
-  Если отключить этот файл, система продолжит работать, но страница будет выглядеть "сырой" и менее понятной.
-
----
-
-### Рабочие каталоги
-
-- `data/`  
-  Папка с исходными видеофайлами для анализа.
-  - Обычно сюда кладут записи с камер.
-  - Endpoint `/api/files` показывает именно содержимое этой директории.
-  
-  Рекомендация: использовать понятные имена файлов (дата, камера, место), чтобы было легче выбирать нужный ролик.
-
-- `logs/events.db`  
-  Локальная база данных SQLite с историей событий.
-  - Хранит тип события, время, объект, вероятно путь к snapshot и служебные поля.
-  - Не требует отдельного сервера БД: это один файл на диске.
-  
-  Практический плюс: удобно переносить и архивировать (достаточно скопировать один файл).
-
-- `logs/snapshots/`  
-  Папка со снимками (JPEG), которые сохраняются в момент тревоги.
-  - Нужна для быстрого визуального подтверждения, что произошло.
-  - Полезна при проверке ложных и истинных срабатываний.
-  
-  Часто используется вместе с журналом `events.db`: запись в БД + картинка в snapshots.
-
-- `models/`  
-  Каталог для локальных весов нейросети.
-  - Здесь могут лежать `.pt` (PyTorch) или `.engine` (TensorRT), если вы храните модели в проекте.
-  - Путь к нужному файлу задается в `config.json`.
-  
-  Если модель хранится в другом месте, папка может быть пустой — это нормально.
-
----
-
-## 5) REST/WS API (кратко)
-
-- `GET /api/info` — текущий статус пайплайна, метрики, треки.
-- `GET /api/metrics` — расширенные runtime-метрики (process + pipeline queues/stats).
-- `GET /api/files` — список видео в `data/`.
-- `POST /api/open` — открыть видео.
-- `POST /api/play` / `POST /api/pause` — управление проигрыванием.
-- `POST /api/seek` — переход к кадру.
-- `GET /api/settings` / `PUT /api/settings` — чтение/обновление конфигурации.
-- `GET /api/events` / `DELETE /api/events` — журнал событий.
-- `GET /video_feed` — MJPEG поток видео.
-- `WS /ws` — realtime статус и события.
-
----
-
-## 6) Важные параметры `config.json`
-
-### `model`
-- `weights` — путь к весам модели.
-- `imgsz` — размер входа сети.
-- `device` — `cuda:0` или `cpu`.
-- `half` — FP16 на GPU.
-- `conf`, `iou` — пороги детекции.
-- `object_classes` — whitelist классов (пусто = все).
-- `excluded_class_names` — blacklist имен классов.
-
-### `pipeline`
-- `decode_queue` — размер очереди кадров.
-- `detect_every_n_frames` — частота инференса.
-- `target_fps` — ограничение частоты декодирования.
-- `render_overlay` — рисовать оверлей на кадре.
-
-### `analyzer`
-- `static_window_sec`, `static_displacement_px` — критерий неподвижности.
-- `owner_proximity_px`, `owner_left_sec` — логика "владелец рядом/ушел".
-- `abandon_time_sec` — время до тревоги "обнаружен предмет".
-- `disappear_grace_sec` — задержка перед "предмет пропал".
-- `min_object_area_px` — отсев мелких объектов.
-
-### `ui`
-- `alarm_sound`, `show_persons`, `show_track_ids` — параметры отображения.
-
----
-
-## 7) Производительность и GPU
-
-Чтобы максимально грузить видеокарту:
-- `device = "cuda:0"`
-- `half = true`
-- модель под вашу VRAM (`yolo11x` точнее, `yolo11n/s/m` быстрее)
-- при необходимости увеличить `detect_every_n_frames` до `2`.
-
-Что остается на CPU:
-- декод видео (`cv2.VideoCapture`),
-- JPEG-кодирование для MJPEG,
-- часть web/SQLite операций.
-
-### Варианты инференс-режима
-
-Сейчас поддерживаются 3 режима model-serving:
-
-- локально в процессе (`use_inference_worker=false`);
-- отдельный Python worker-процесс (`use_inference_worker=true`);
-- внешний inference service (`inference_rpc_addr="127.0.0.1:7788"`).
-
-Рекомендуемый migration-path:
-
-1) сначала `use_inference_worker=true` + `worker_use_shared_memory=true`;  
-2) затем вынос в отдельный сервис `python run_inference_service.py --host 127.0.0.1 --port 7788`;  
-3) после этого в `config.json` задать `inference_rpc_addr`.
-
-Для автоматического применения пресетов используйте:
-
-```bash
-python run_stack.py --profile legacy
-python run_stack.py --profile hybrid
-python run_stack.py --profile external
-```
-
-### Переменные окружения для runtime-портов
-
-Можно централизованно переопределить адреса без правки кода:
-
-- `RUNTIME_INGEST_ADDR` (default `127.0.0.1:7878`)
-- `RUNTIME_CONTROL_ADDR` (default `127.0.0.1:7879`)
-- `INFERENCE_RPC_ADDR` (default `127.0.0.1:7788`)
-- `APP_HOST` / `APP_PORT` (defaults `127.0.0.1` / `8000`)
-
-Для централизованного scheduling из Rust runtime:
-
-- поднять `runtime-core` с `RUNTIME_CONTROL_ADDR=127.0.0.1:7879`;
-- в `config.json` указать `pipeline.runtime_control_addr = "127.0.0.1:7879"`.
-
-После этого решение `should_infer` запрашивается у runtime-core, а не только локально по `detect_every_n_frames`.
-Статус виден в `GET /api/info -> stats`:
-
-- `scheduler_mode`: `local` / `runtime-core` / `local-fallback`
-- `runtime_control_enabled`
-- `runtime_control_decisions`
-- `runtime_control_fallbacks`
-- `scheduler_target_interval`
-- `scheduler_priority`
-- `scheduler_overload_level`
-- `scheduler_latency_ema_ms`
-- `scheduler_max_roi_count`
-
-Hints теперь реально применяются в инференсе:
-
-- `scheduler_priority=low` отключает тяжелую floor ROI верификацию;
-- `scheduler_max_roi_count` ограничивает число floor ROI-кандидатов на дополнительный проход.
-
----
-
-## 8) Типичные проблемы
-
-- **Изменения UI не видны**  
-  Сделайте `Ctrl+F5` (кэш браузера).
-
-- **Много ложных объектов**  
-  Расширьте `excluded_class_names`.
-
-- **Нужные объекты пропадают**  
-  Уменьшите `conf`, уменьшите `min_object_area_px`, увеличьте `imgsz`.
-
----
-
-
+`gateway` мёрджит `PUT /api/settings` deep-merge'ом и атомарно записывает
+файл (`config.json.tmp` → rename).
+
+## 7. Подмодули — отдельные README
+
+- [`native/README.md`](native/README.md) — C++ ядро, разбиение по бинарям, расширение.
+- [`runtime-core/README.md`](runtime-core/README.md) — Rust workspace member, FFI обёртки.
+
+## 8. Состояние шагов рефакторинга
+
+| # | Шаг                                                                   | Статус |
+|---|-----------------------------------------------------------------------|:------:|
+| 1 | Shared TRT engine + per-stream IExecutionContext                      | done   |
+| 2 | Модуль `frame_filter` (антишум, общий для analyticsd и FFI)           | done   |
+| 3 | `integra_ffi.h/.cpp` + Rust bindings (`runtime-core::integra::*`)     | done   |
+| 4 | `backend_gateway` поверх FFI + video-bridge (UI / WS / MJPEG)         | done   |
+| 5 | Snapshot writer + удаление Python `app/`/`services/`                  | done   |
+| 6 | Seek / pause / play через video-bridge (расширение протокола)         | done   |
+| 7 | TensorRT: `integra_trt_bake` + кеш `trt_bake_cached.sh` (ONNX→FP16 engine)  | done   |
+| 8 | Бенчмарки + parity-тесты C++↔ожидаемый поведение                      | todo   |
+| 9 | CI (Windows/Linux) + docker compose                                   | todo   |
