@@ -11,6 +11,7 @@
 #include "integra/iou_tracker.hpp"
 #include "integra/pipeline.hpp"
 #include "integra/scene_analyzer.hpp"
+#include "integra/yolo_letterbox.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -322,6 +323,9 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
   }
   ServerConfig session_cfg = cfg;
   FrameFilterConfig ff;
+  float trk_iou = 0.35f;
+  int trk_miss = 10;
+  bool trk_soft = true;
   // Применяем runtime-настройки из hello (протокол Python bridge):
   // postprocess/analyzer и whitelist классов для строгого anti-noise режима.
   {
@@ -330,6 +334,9 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
     if (parse_f64_field(line, "conf", v)) session_cfg.pp.conf_threshold = static_cast<float>(v);
     if (parse_f64_field(line, "iou", v)) session_cfg.pp.nms_iou_threshold = static_cast<float>(v);
     if (parse_f64_field(line, "nms_iou", v)) session_cfg.pp.nms_iou_threshold = static_cast<float>(v);
+    if (parse_f64_field(line, "tracker_iou", v)) trk_iou = static_cast<float>(v);
+    if (parse_i32_field(line, "tracker_max_missed", iv)) trk_miss = std::max(1, iv);
+    if (parse_i32_field(line, "tracker_soft_centroid", iv)) trk_soft = (iv != 0);
     if (parse_i32_field(line, "person_class_id", iv)) session_cfg.ap.person_class_id = iv;
     if (parse_i32_field(line, "min_box_size_px", iv)) ff.min_box_px = std::max(8, iv);
     ff.tune_from_postprocess(session_cfg.pp.conf_threshold);
@@ -354,7 +361,7 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
   }
 
   integra::GpuLetterboxPrep prep;
-  integra::IouTracker tracker;
+  integra::IouTracker tracker(trk_iou, trk_miss, trk_soft);
   integra::SceneAnalyzer analyzer(session_cfg.ap);
   std::vector<int> object_classes;
   parse_i32_array_field(line, "object_classes", object_classes);
@@ -407,11 +414,17 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
     if (!recv_exact(c, payload.data(), ln)) break;
 
     cv::Mat bgr(h, w, CV_8UC3, payload.data());
+    integra::LetterboxMeta lb{};
     cv::Mat feed;
     if (cfg.input_size > 0) {
-      cv::resize(bgr, feed, cv::Size(cfg.input_size, cfg.input_size), 0, 0, cv::INTER_LINEAR);
+      if (!integra::yolo_letterbox_bgr(bgr, cfg.input_size, feed, &lb)) {
+        send_all(c, error_msg("letterbox failed"));
+        break;
+      }
     } else {
       feed = bgr;
+      lb.r = 1.f;
+      lb.pad_left = lb.pad_top = 0;
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -449,13 +462,8 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
     }
     auto t2 = std::chrono::steady_clock::now();
 
-    const float sx = static_cast<float>(bgr.cols) / static_cast<float>(std::max(1, feed.cols));
-    const float sy = static_cast<float>(bgr.rows) / static_cast<float>(std::max(1, feed.rows));
-    for (auto& d : batch.items) {
-      d.bbox.x1 *= sx;
-      d.bbox.x2 *= sx;
-      d.bbox.y1 *= sy;
-      d.bbox.y2 *= sy;
+    if (cfg.input_size > 0) {
+      integra::yolo_unletterbox_dets(batch.items, lb, bgr.cols, bgr.rows);
     }
     // Отсекаем нерелевантные классы до трекера/FSM:
     // это резко снижает ложные треки и RAM на сцене без деградации целевого кейса.
@@ -467,9 +475,12 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
       }
     }
     batch.items = apply_frame_filter(filtered, bgr.cols, bgr.rows, session_cfg.ap.person_class_id, ff);
+    integra::merge_same_class_objects_only(batch.items, session_cfg.ap.person_class_id, 0.48f);
+    integra::merge_luggage_cross_class_by_iou(batch.items, session_cfg.ap.person_class_id, 0.38f);
+    integra::suppress_duplicate_bottles_by_iou(batch.items, session_cfg.ap.person_class_id, 0.40f);
 
     auto t3 = std::chrono::steady_clock::now();
-    tracker.update(batch.items);
+    tracker.update(batch.items, bgr.cols, bgr.rows);
     auto t4 = std::chrono::steady_clock::now();
 
     std::vector<integra::Detection> persons;
@@ -483,7 +494,8 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
 
     const double ts = now_wall_sec();
     auto t5 = std::chrono::steady_clock::now();
-    std::vector<integra::AlarmEvent> evs = analyzer.ingest(ts, pos_ms, "main", objects, persons);
+    std::vector<integra::AlarmEvent> evs =
+        analyzer.ingest(ts, pos_ms, "main", objects, persons, bgr.cols, bgr.rows);
     auto t6 = std::chrono::steady_clock::now();
     std::vector<integra::TrackSnapshot> tracks = analyzer.tracks_snapshot(ts);
 

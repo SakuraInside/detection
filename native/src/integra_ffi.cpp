@@ -96,9 +96,8 @@ struct IntegraPipeline {
   // (одновременный push_frame на один pipeline из двух потоков).
   std::atomic<int> in_flight{0};
 
-  // Ниже порог IoU — проще «склеить» джиттер bbox одного объекта между кадрами,
-  // меньше смен track_id на шумной детекции.
-  IntegraPipeline() : tracker(0.20f) {}
+  // IoU + центроид + max_age: параметры из IntegraConfig (дефолты безопаснее для CCTV).
+  IntegraPipeline() = default;
 };
 
 namespace {
@@ -225,11 +224,48 @@ void apply_defaults(integra::InferenceEngineConfig& ec,
   }
 
   // frame filter
-  ff.min_box_px = cfg.min_box_size_px > 0 ? cfg.min_box_size_px : 20;
+  ff.min_box_px = std::max(20, cfg.min_box_size_px > 0 ? cfg.min_box_size_px : 20);
+  ff.use_regional_class_conf = (cfg.use_regional_class_conf != 0);
+  if (ff.use_regional_class_conf) {
+    ff.upper_region_y_ratio =
+        cfg.upper_region_y_ratio > 1e-6f ? cfg.upper_region_y_ratio : 0.62f;
+    ff.min_conf_upper = cfg.min_conf_upper > 1e-6f ? cfg.min_conf_upper : 0.22f;
+    ff.min_conf_lower = cfg.min_conf_lower > 1e-6f ? cfg.min_conf_lower : 0.30f;
+    ff.bottom_region_y_ratio =
+        cfg.bottom_region_y_ratio > 1e-6f ? cfg.bottom_region_y_ratio : 0.88f;
+    ff.min_conf_bottom = cfg.min_conf_bottom > 1e-6f ? cfg.min_conf_bottom : 0.26f;
+    ff.conf_border_relax_px = std::max(0, cfg.border_relax_px);
+    ff.min_conf_border = cfg.min_conf_border > 1e-6f ? cfg.min_conf_border : 0.20f;
+    ff.person_min_conf_border =
+        cfg.person_min_conf_border > 1e-6f ? cfg.person_min_conf_border : 0.18f;
+  }
   ff.tune_from_postprocess(ec.postprocess.conf_threshold);
+  // 0: иначе на широком угле CCTV почти всё у края — детекции исчезают с превью/трекера.
+  ff.border_px = 0;
   // Чуть выше дефолта — режет совсем мелкие пятна; не душит узкие бутылки/кружки.
   ff.min_area_ratio = 0.00055f;
-  ff.max_detections = 40;
+  ff.max_detections = 34;
+  ff.ignore_det_norm_x1 = static_cast<float>(cfg.ignore_det_norm_x1);
+  ff.ignore_det_norm_y1 = static_cast<float>(cfg.ignore_det_norm_y1);
+  ff.ignore_det_norm_x2 = static_cast<float>(cfg.ignore_det_norm_x2);
+  ff.ignore_det_norm_y2 = static_cast<float>(cfg.ignore_det_norm_y2);
+  if (ff.ignore_det_norm_x2 <= ff.ignore_det_norm_x1 ||
+      ff.ignore_det_norm_y2 <= ff.ignore_det_norm_y1) {
+    ff.ignore_det_norm_x1 = 0.f;
+    ff.ignore_det_norm_y1 = 0.f;
+    ff.ignore_det_norm_x2 = 0.f;
+    ff.ignore_det_norm_y2 = 0.f;
+  }
+
+  ff.class_min_conf_count = 0;
+  if (cfg.class_min_conf_count > 0) {
+    const int n = std::min(cfg.class_min_conf_count, INTEGRA_CLASS_MIN_CONF_MAX);
+    ff.class_min_conf_count = n;
+    for (int i = 0; i < n; ++i) {
+      ff.class_min_conf_ids[i] = cfg.class_min_conf_class_ids[i];
+      ff.class_min_conf_thresholds[i] = cfg.class_min_conf_thresholds[i];
+    }
+  }
 
   // analyzer
   ap.static_displacement_px =
@@ -240,7 +276,7 @@ void apply_defaults(integra::InferenceEngineConfig& ec,
       cfg.owner_proximity_px > 0.0 ? cfg.owner_proximity_px : 180.0;
   ap.owner_left_sec = cfg.owner_left_sec > 0.0 ? cfg.owner_left_sec : 5.0;
   ap.disappear_grace_sec =
-      cfg.disappear_grace_sec > 0.0 ? cfg.disappear_grace_sec : 4.0;
+      cfg.disappear_grace_sec > 0.0 ? cfg.disappear_grace_sec : 9.0;
   ap.min_object_area_px =
       cfg.min_object_area_px > 0.0 ? cfg.min_object_area_px : 100.0;
   ap.centroid_history_maxlen =
@@ -280,6 +316,13 @@ INTEGRA_API IntegraPipeline* integra_pipeline_create(int abi_version,
   std::string kind;
   apply_defaults(ec, ap, p->ff, p->object_classes, kind, p->camera_id,
                  p->person_class_id, *cfg);
+
+  const float trk_iou =
+      cfg->tracker_iou_match_threshold > 1e-6f ? cfg->tracker_iou_match_threshold : 0.35f;
+  const int trk_miss =
+      cfg->tracker_max_missed_frames > 0 ? cfg->tracker_max_missed_frames : 10;
+  const bool trk_soft = cfg->tracker_soft_centroid_match != 0;
+  p->tracker = integra::IouTracker(trk_iou, trk_miss, trk_soft);
 
   // Создаём (или достаём из кэша) shared engine.
   p->shared = integra::make_shared_engine(kind, ec);
@@ -350,11 +393,16 @@ INTEGRA_API int integra_pipeline_push_frame(IntegraPipeline* p,
   }
   filtered = integra::apply_frame_filter(filtered, width, height,
                                           p->person_class_id, p->ff);
+  // IoU-дедуп: высокий порог — не склеивать две соседние канистры; затем NMS по bottle (39)
+  // только при сильном перекрытии (дубли модели на одной ёмкости).
+  integra::merge_same_class_objects_only(filtered, p->person_class_id, 0.48f);
+  integra::merge_luggage_cross_class_by_iou(filtered, p->person_class_id, 0.38f);
+  integra::suppress_duplicate_bottles_by_iou(filtered, p->person_class_id, 0.40f);
 
   const auto t_post = std::chrono::steady_clock::now();
 
   // Tracker.
-  p->tracker.update(filtered);
+  p->tracker.update(filtered, width, height);
   const auto t_track = std::chrono::steady_clock::now();
 
   // Split persons / objects.
@@ -375,7 +423,7 @@ INTEGRA_API int integra_pipeline_push_frame(IntegraPipeline* p,
   const double pts_sec = static_cast<double>(pts_ms);  // pts_ms keeps ms; analyzer wants ms-context
   const auto t_anal0 = std::chrono::steady_clock::now();
   std::vector<integra::AlarmEvent> events = p->analyzer->ingest(
-      ts, pts_sec, p->camera_id, objects, persons);
+      ts, pts_sec, p->camera_id, objects, persons, width, height);
   const auto t_anal1 = std::chrono::steady_clock::now();
   std::vector<integra::TrackSnapshot> tracks = p->analyzer->tracks_snapshot(ts);
 

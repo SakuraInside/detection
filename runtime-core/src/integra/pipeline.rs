@@ -45,6 +45,29 @@ pub struct PipelineConfig {
     pub centroid_history_maxlen: i32,
     pub max_active_tracks: i32,
 
+    /// Нормализованный прямоугольник 0..1: `x2>x1`, `y2>y1` или все нули — выключено.
+    pub ignore_det_norm_x1: f64,
+    pub ignore_det_norm_y1: f64,
+    pub ignore_det_norm_x2: f64,
+    pub ignore_det_norm_y2: f64,
+
+    /// Вертикальные пороги conf + border relax (порт `VisionOCR/detection/app/detector.py`).
+    pub use_regional_class_conf: bool,
+    pub upper_region_y_ratio: f32,
+    pub min_conf_upper: f32,
+    pub min_conf_lower: f32,
+    pub bottom_region_y_ratio: f32,
+    pub min_conf_bottom: f32,
+    pub border_relax_px: i32,
+    pub min_conf_border: f32,
+    pub person_min_conf_border: f32,
+
+    pub tracker_iou_match_threshold: f32,
+    pub tracker_max_missed_frames: i32,
+    pub tracker_soft_centroid_match: bool,
+    /// До 16 пар (COCO class_id, min confidence) из `model.class_min_conf`.
+    pub class_min_conf: Vec<(i32, f32)>,
+
     pub camera_id: String,
 }
 
@@ -64,12 +87,29 @@ impl Default for PipelineConfig {
             static_displacement_px: 7.0,
             static_window_sec: 3.0,
             abandon_time_sec: 15.0,
-            owner_proximity_px: 180.0,
+            owner_proximity_px: 115.0,
             owner_left_sec: 5.0,
-            disappear_grace_sec: 4.0,
+            disappear_grace_sec: 9.0,
             min_object_area_px: 100.0,
             centroid_history_maxlen: 72,
             max_active_tracks: 256,
+            ignore_det_norm_x1: 0.0,
+            ignore_det_norm_y1: 0.0,
+            ignore_det_norm_x2: 0.0,
+            ignore_det_norm_y2: 0.0,
+            use_regional_class_conf: false,
+            upper_region_y_ratio: 0.62,
+            min_conf_upper: 0.22,
+            min_conf_lower: 0.30,
+            bottom_region_y_ratio: 0.88,
+            min_conf_bottom: 0.26,
+            border_relax_px: 24,
+            min_conf_border: 0.20,
+            person_min_conf_border: 0.18,
+            tracker_iou_match_threshold: 0.35,
+            tracker_max_missed_frames: 10,
+            tracker_soft_centroid_match: true,
+            class_min_conf: Vec::new(),
             camera_id: "main".into(),
         }
     }
@@ -113,6 +153,13 @@ unsafe impl Send for Pipeline {}
 impl Pipeline {
     pub fn new(cfg: &PipelineConfig, lib: Arc<IntegraLib>) -> Result<Self, IntegraError> {
         let cstrs = CStrings::from_cfg(cfg)?;
+        let mut class_ids = [0i32; 16];
+        let mut class_thresholds = [0f32; 16];
+        let n = cfg.class_min_conf.len().min(16);
+        for (i, &(id, th)) in cfg.class_min_conf.iter().enumerate().take(16) {
+            class_ids[i] = id;
+            class_thresholds[i] = th;
+        }
         let c_cfg = IntegraConfig {
             engine_kind: cstrs.engine_kind.as_ptr(),
             model_path: cstrs.model_path.as_ptr(),
@@ -138,7 +185,30 @@ impl Pipeline {
             min_object_area_px: cfg.min_object_area_px,
             centroid_history_maxlen: cfg.centroid_history_maxlen,
             max_active_tracks: cfg.max_active_tracks,
+            ignore_det_norm_x1: cfg.ignore_det_norm_x1,
+            ignore_det_norm_y1: cfg.ignore_det_norm_y1,
+            ignore_det_norm_x2: cfg.ignore_det_norm_x2,
+            ignore_det_norm_y2: cfg.ignore_det_norm_y2,
             camera_id: cstrs.camera_id.as_ptr(),
+            use_regional_class_conf: if cfg.use_regional_class_conf { 1 } else { 0 },
+            upper_region_y_ratio: cfg.upper_region_y_ratio,
+            min_conf_upper: cfg.min_conf_upper,
+            min_conf_lower: cfg.min_conf_lower,
+            bottom_region_y_ratio: cfg.bottom_region_y_ratio,
+            min_conf_bottom: cfg.min_conf_bottom,
+            border_relax_px: cfg.border_relax_px,
+            min_conf_border: cfg.min_conf_border,
+            person_min_conf_border: cfg.person_min_conf_border,
+            tracker_iou_match_threshold: cfg.tracker_iou_match_threshold,
+            tracker_max_missed_frames: cfg.tracker_max_missed_frames as std::os::raw::c_int,
+            tracker_soft_centroid_match: if cfg.tracker_soft_centroid_match {
+                1
+            } else {
+                0
+            },
+            class_min_conf_count: n as std::os::raw::c_int,
+            class_min_conf_class_ids: class_ids,
+            class_min_conf_thresholds: class_thresholds,
         };
 
         let handle = unsafe { (lib.create)(INTEGRA_FFI_ABI_VERSION, &c_cfg as *const _) };

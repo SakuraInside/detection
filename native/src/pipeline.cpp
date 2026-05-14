@@ -1,12 +1,12 @@
 #include "integra/pipeline.hpp"
 
 #include "integra/alarm_sink.hpp"
-#include "integra/geom.hpp"
 #include "integra/gpu_preprocess.hpp"
 #include "integra/inference_engine.hpp"
 #include "integra/iou_tracker.hpp"
 #include "integra/scene_analyzer.hpp"
 #include "integra/video_source.hpp"
+#include "integra/yolo_letterbox.hpp"
 
 #include <opencv2/core/mat.hpp>
 #include <opencv2/imgproc.hpp>
@@ -84,7 +84,7 @@ int run_pipeline(const PipelineConfig& cfg) {
     return 3;
   }
 
-  IouTracker tracker;
+  IouTracker tracker(0.35f, 10, true);
   SceneAnalyzer analyzer(cfg.analyzer);
 
 #if INTEGRA_HAS_CUDA
@@ -109,11 +109,17 @@ int run_pipeline(const PipelineConfig& cfg) {
       break;
     }
 
+    LetterboxMeta letter{};
     if (cfg.inference_input_size > 0) {
       const int s = cfg.inference_input_size;
-      cv::resize(bgr, feed, cv::Size(s, s), 0, 0, cv::INTER_LINEAR);
+      if (!yolo_letterbox_bgr(bgr, s, feed, &letter)) {
+        std::cerr << "integra: yolo_letterbox_bgr failed\n";
+        break;
+      }
     } else {
       feed = bgr;
+      letter.r = 1.f;
+      letter.pad_left = letter.pad_top = 0;
     }
 
 #if INTEGRA_HAS_CUDA
@@ -155,13 +161,11 @@ int run_pipeline(const PipelineConfig& cfg) {
       apply_synth_bbox(feed.cols, feed.rows, dets);
     }
 
-    const float sx = static_cast<float>(bgr.cols) / static_cast<float>(std::max(1, feed.cols));
-    const float sy = static_cast<float>(bgr.rows) / static_cast<float>(std::max(1, feed.rows));
-    for (auto& d : dets.items) {
-      d.bbox = scale_bbox_xyxy(d.bbox, sx, sy);
+    if (cfg.inference_input_size > 0) {
+      yolo_unletterbox_dets(dets.items, letter, bgr.cols, bgr.rows);
     }
 
-    tracker.update(dets.items);
+    tracker.update(dets.items, bgr.cols, bgr.rows);
 
     std::vector<Detection> persons;
     std::vector<Detection> objects;
@@ -179,7 +183,7 @@ int run_pipeline(const PipelineConfig& cfg) {
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 
     std::vector<AlarmEvent> alarm_evts =
-        analyzer.ingest(ts, meta.pos_ms, cfg.camera_id, objects, persons);
+        analyzer.ingest(ts, meta.pos_ms, cfg.camera_id, objects, persons, bgr.cols, bgr.rows);
     if (alarms.is_configured()) {
       for (const auto& ev : alarm_evts) {
         alarms.send(ev);

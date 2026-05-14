@@ -20,7 +20,8 @@ native/
 │                               #        INTEGRA_ORT_CUDA, INTEGRA_WITH_TENSORRT
 ├── build_integra.sh            # Linux helper: auto-detect TensorRT/ONNXRT + cmake + build
 ├── scripts/
-│   └── trt_bake_cached.sh      # Кеш .engine: sha256 (16 hex) + compute capability + FP16
+│   ├── trt_bake_cached.sh      # Кеш .engine: sha256 (16 hex) + compute capability + FP16 (Linux)
+│   └── build_engine_msvc.ps1   # Windows: cmake + integra_trt_bake (пути OpenCV/TRT внутри скрипта)
 ├── README.md                   # этот файл
 │
 ├── include/integra/            # Публичный C++ API (используется analyticsd и pipeline)
@@ -105,9 +106,43 @@ cmake -B build-msvc -G "Visual Studio 17 2022" -A x64
 cmake --build build-msvc --config RelWithDebInfo --target integra-analyticsd
 ```
 
+### Windows + CUDA + TensorRT: `integra_trt_bake` и `integra_ffi` (C++), Rust без Python
+
+Цепочка production: **офлайн** утилита **`integra_trt_bake`** (C++, `src/trt_bake_main.cpp`) → файл **`.engine`** → рантайм **`integra_ffi.dll`** с **`INTEGRA_HAS_TENSORRT`** → **`backend_gateway`** (Rust) грузит DLL и передаёт `engine_kind=tensorrt` + путь к `.engine` через существующий FFI (`IntegraConfig`).
+
+1. Нужны **OpenCV** (с `dnn`) и **TensorRT SDK** (каталог с `include/NvInfer.h` и `lib`).
+2. CMake **обязан** видеть OpenCV: `-DOpenCV_DIR=...` (каталог, где лежит `OpenCVConfig.cmake`).
+3. Сборка с флагами:
+
+```powershell
+cd native
+$OpenCVDir = "C:\build\opencv"          # замените на свой
+$TrtRoot   = "C:\path\TensorRT-10.x"    # замените на свой
+
+cmake -B build-msvc-trt -G "Visual Studio 17 2022" -A x64 `
+  "-DOpenCV_DIR=$OpenCVDir" `
+  -DINTEGRA_ENABLE_CUDA=ON `
+  -DINTEGRA_WITH_TENSORRT=ON `
+  "-DTENSORRT_ROOT=$TrtRoot"
+
+cmake --build build-msvc-trt --config Release --target integra_trt_bake --target integra_ffi
+```
+
+4. Перед запуском **`integra_trt_bake.exe`** на Windows добавьте в **`PATH`** каталог **`%TENSORRT_ROOT%\bin`** (там `nvinfer_10.dll`, `nvonnxparser_10.dll`). Каталог **`lib`** нужен линкеру при сборке. При необходимости — также **`CUDA\v13.x\bin`**.
+
+5. Сборка `.engine` из корня репозитория (`models/yolo11n.onnx` → тот же путь, что в `config.json`):
+
+```powershell
+cd ..
+.\native\build-msvc-trt\Release\integra_trt_bake.exe `
+  --onnx models\yolo11n.onnx --out models\yolo11n_fp16.engine --fp16 --workspace-mb 4096
+```
+
+Готовый скрипт-обёртка (пути вверху файла): `native/scripts/build_engine_msvc.ps1`.
+
 ## TensorRT: ONNX → `.engine` (production)
 
-Рантайм (`integra_ffi`, `--engine tensorrt`) загружает **сериализованный** engine. ONNX → plan собирайте **офлайн** на машине с TensorRT и GPU.
+Рантайм (`integra_ffi`, `--engine tensorrt`) загружает **сериализованный** engine. ONNX → plan собирайте **офлайн** на машине с TensorRT и GPU — **только через `integra_trt_bake`** (C++); Python в этом репозитории для bake не используется.
 
 **Прямой вызов:**
 

@@ -4,7 +4,11 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{ImageBuffer, Rgb};
 
-use super::events::TrackSnapshot;
+use super::events::{PersonDet, TrackSnapshot};
+
+/// Длинная сторона превью перед JPEG (выше — лучше качество, больше CPU/память на кадр).
+const PREVIEW_ENCODE_MAX_EDGE: u32 = 1600;
+const PREVIEW_JPEG_QUALITY: u8 = 86;
 
 /// JPEG вырезки по bbox события (с отступом), без overlay — для снапшота тревоги.
 pub fn encode_alarm_crop_jpeg(
@@ -67,49 +71,95 @@ pub fn encode_alarm_crop_jpeg(
     Some(jpeg)
 }
 
-pub fn encode_preview_jpeg(bgr: &[u8], w: u32, h: u32, tracks: &[TrackSnapshot]) -> Option<Vec<u8>> {
-    let mut rgb = Vec::with_capacity(bgr.len());
-    rgb.resize(bgr.len(), 0);
-    for (i, px) in bgr.chunks_exact(3).enumerate() {
-        let j = i * 3;
-        rgb[j] = px[2];
-        rgb[j + 1] = px[1];
-        rgb[j + 2] = px[0];
+/// BGR → RGB, даунскейл, bbox, JPEG.
+///
+/// **Треки объектов** на MJPEG: **оранжевый** (`unattended`) и **тревоги** (`alarm_*`).
+/// `static` и `candidate` не рисуем — меньше шума на превью (см. `tracks_snapshot` в native).
+///
+/// **Люди** (`persons`): пурпурная рамка только при `draw_person_boxes == true` (`config.json` → `ui.show_persons`).
+pub fn encode_preview_jpeg(
+    bgr: &[u8],
+    w: u32,
+    h: u32,
+    tracks: &[TrackSnapshot],
+    persons: &[PersonDet],
+    draw_person_boxes: bool,
+) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || bgr.len() < (w as usize) * (h as usize) * 3 {
+        return None;
     }
-    for t in tracks {
-        let color = color_for_state(&t.state);
-        draw_rect(
-            &mut rgb,
-            w as i32,
-            h as i32,
-            t.bbox[0] as i32,
-            t.bbox[1] as i32,
-            t.bbox[2] as i32,
-            t.bbox[3] as i32,
-            color,
-            2,
-        );
-    }
-    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(w, h, rgb)?;
-    const MAX_EDGE: u32 = 1280;
-    let img_scaled = if w.max(h) > MAX_EDGE {
-        let scale = MAX_EDGE as f32 / w.max(h) as f32;
-        let nw = (w as f32 * scale).max(1.0) as u32;
-        let nh = (h as f32 * scale).max(1.0) as u32;
-        image::imageops::resize(&img, nw, nh, FilterType::Triangle)
+
+    let scale = if w.max(h) > PREVIEW_ENCODE_MAX_EDGE {
+        PREVIEW_ENCODE_MAX_EDGE as f32 / w.max(h) as f32
     } else {
-        img
+        1.0f32
     };
+    let ow = (w as f32 * scale).max(1.0).round() as u32;
+    let oh = (h as f32 * scale).max(1.0).round() as u32;
+    let inv = 1.0f32 / scale;
+
+    let mut rgb = vec![0u8; (ow * oh * 3) as usize];
+    for ty in 0..oh {
+        let src_y_f = (ty as f32 + 0.5) * inv - 0.5;
+        let src_y = src_y_f.clamp(0.0, h as f32 - 1.0).round() as u32;
+        for tx in 0..ow {
+            let src_x_f = (tx as f32 + 0.5) * inv - 0.5;
+            let src_x = src_x_f.clamp(0.0, w as f32 - 1.0).round() as u32;
+            let si = ((src_y * w + src_x) * 3) as usize;
+            let di = ((ty * ow + tx) * 3) as usize;
+            if si + 2 < bgr.len() && di + 2 < rgb.len() {
+                rgb[di] = bgr[si + 2];
+                rgb[di + 1] = bgr[si + 1];
+                rgb[di + 2] = bgr[si];
+            }
+        }
+    }
+
+    let iw = ow as i32;
+    let ih = oh as i32;
+    for t in tracks {
+        if !track_visible_on_mjpeg_preview(t.state.as_str()) {
+            continue;
+        }
+        let color = color_for_state(&t.state);
+        let thickness = 2;
+        let x1 = (t.bbox[0].min(t.bbox[2]) * scale) as i32;
+        let y1 = (t.bbox[1].min(t.bbox[3]) * scale) as i32;
+        let x2 = (t.bbox[0].max(t.bbox[2]) * scale) as i32;
+        let y2 = (t.bbox[1].max(t.bbox[3]) * scale) as i32;
+        draw_rect(&mut rgb, iw, ih, x1, y1, x2, y2, color, thickness);
+    }
+    // Люди поверх объектов (пурпурный — не путать с бирюзовым static и не «сигналить» зелёным).
+    if draw_person_boxes {
+        let person_color = [230, 60, 255];
+        for p in persons {
+            let x1 = (p.bbox[0].min(p.bbox[2]) * scale) as i32;
+            let y1 = (p.bbox[1].min(p.bbox[3]) * scale) as i32;
+            let x2 = (p.bbox[0].max(p.bbox[2]) * scale) as i32;
+            let y2 = (p.bbox[1].max(p.bbox[3]) * scale) as i32;
+            draw_rect(&mut rgb, iw, ih, x1, y1, x2, y2, person_color, 3);
+        }
+    }
+
+    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(ow, oh, rgb)?;
     let mut jpeg = Vec::new();
-    let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 78);
-    enc.encode_image(&img_scaled).ok()?;
+    let mut enc = JpegEncoder::new_with_quality(&mut jpeg, PREVIEW_JPEG_QUALITY);
+    enc.encode_image(&img).ok()?;
     Some(jpeg)
+}
+
+/// На превью не показываем «тихие» состояния (`static` / `candidate`).
+fn track_visible_on_mjpeg_preview(state: &str) -> bool {
+    matches!(
+        state,
+        "unattended" | "alarm_abandoned" | "alarm_disappeared"
+    )
 }
 
 fn color_for_state(state: &str) -> [u8; 3] {
     match state {
         "candidate" => [255, 200, 0],
-        "static" => [0, 220, 220],
+        "static" => [95, 130, 140],
         "unattended" => [255, 140, 0],
         "alarm_abandoned" => [255, 0, 0],
         "alarm_disappeared" => [255, 0, 200],

@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::Command;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use runtime_core::integra::{
-    self, encode_preview_jpeg, FrameResult, IntegraLib, StreamMessage, TrackSnapshot,
+    self, encode_preview_jpeg, FrameResult, IntegraLib, PersonDet, StreamMessage, TrackSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +96,7 @@ struct GatewayInfo {
     height: i32,
     latest_jpeg: Option<Vec<u8>>,
     tracks: Vec<TrackSnapshot>,
+    persons: Vec<PersonDet>,
     stats: PipelineStats,
 }
 
@@ -113,13 +114,16 @@ struct AppState {
     playback_gen: Arc<AtomicU64>,
     session: Arc<Mutex<Option<SessionHandle>>>,
     ws_tx: broadcast::Sender<String>,
-    lib: Arc<IntegraLib>,
+    lib: Option<Arc<IntegraLib>>,
+    infer_worker_addr: Option<String>,
     started_at: Instant,
     snapshots_dir: PathBuf,
     /// Sender команд в активный bridge_worker (seek/pause/play/close).
     /// При новом /api/open перетирается на свежий sender; старая bridge_worker-сессия
     /// сама завершится (playback_gen) и её mpsc::Receiver уйдёт в drop.
     bridge_cmd_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<serde_json::Value>>>>,
+    /// `config.json` → `ui.show_persons`: рисовать ли bbox людей на MJPEG (ложные person на фоне иначе мешают).
+    preview_draw_person_boxes: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,22 +172,39 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
 
-    // Загружаем integra_ffi.dll/.so. Без неё gateway бесполезен — выходим.
-    let lib = match integra::ffi::global_lib() {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, "failed to load integra_ffi; build native/integra_ffi or set INTEGRA_FFI_PATH");
-            return Err(anyhow::anyhow!("integra_ffi not loaded: {e}"));
+    let infer_worker_addr = std::env::var("INTEGRA_INFER_WORKER_ADDR").ok();
+
+    // Загружаем integra_ffi.dll/.so. Если задан infer_worker — FFI в нём, gateway без FFI.
+    let lib: Option<Arc<IntegraLib>> = if infer_worker_addr.is_some() {
+        info!("infer_worker mode: FFI not loaded in gateway");
+        None
+    } else {
+        match integra::ffi::global_lib() {
+            Ok(l) => {
+                info!(version = %l.version(), "integra_ffi loaded");
+                Some(l)
+            }
+            Err(e) => {
+                error!(error = %e, "failed to load integra_ffi; build native/integra_ffi or set INTEGRA_FFI_PATH");
+                return Err(anyhow::anyhow!("integra_ffi not loaded: {e}"));
+            }
         }
     };
-    info!(version = %lib.version(), "integra_ffi loaded");
 
-    let (ws_tx, _) = broadcast::channel::<String>(256);
+    let (ws_tx, _) = broadcast::channel::<String>(128);
 
     let snapshots_dir = root.join("logs").join("snapshots").join("main");
     if let Err(e) = fs::create_dir_all(&snapshots_dir) {
         warn!(error = %e, dir = %snapshots_dir.display(), "failed to create snapshots dir");
     }
+
+    let cfg0 = read_config_json(&root).unwrap_or_else(|| serde_json::json!({}));
+    let preview_draw_person_boxes = Arc::new(AtomicBool::new(
+        cfg0.get("ui")
+            .and_then(|u| u.get("show_persons"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    ));
 
     let state = AppState {
         info: Arc::new(RwLock::new(GatewayInfo::default())),
@@ -195,9 +216,11 @@ async fn main() -> anyhow::Result<()> {
         session: Arc::new(Mutex::new(None)),
         ws_tx,
         lib,
+        infer_worker_addr,
         started_at: Instant::now(),
         snapshots_dir,
         bridge_cmd_tx: Arc::new(Mutex::new(None)),
+        preview_draw_person_boxes,
     };
 
     // Периодическая рассылка `status` через WS (как Python делал по таймеру).
@@ -348,7 +371,23 @@ fn info_payload(info: &GatewayInfo) -> serde_json::Value {
         "height": info.height,
         "stats": stats_payload(&info.stats),
         "tracks": tracks_payload(&info.tracks),
+        "persons": persons_payload(&info.persons),
     })
+}
+
+fn persons_payload(persons: &[PersonDet]) -> serde_json::Value {
+    serde_json::Value::Array(
+        persons
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "track_id": p.track_id,
+                    "confidence": p.confidence,
+                    "bbox": p.bbox,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn stats_payload(s: &PipelineStats) -> serde_json::Value {
@@ -578,6 +617,13 @@ async fn api_put_settings(
         )
             .into_response();
     }
+    state.preview_draw_person_boxes.store(
+        cur.get("ui")
+            .and_then(|u| u.get("show_persons"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        Ordering::Relaxed,
+    );
     Json(cur).into_response()
 }
 
@@ -648,6 +694,7 @@ async fn api_open(State(state): State<AppState>, Json(req): Json<OpenRequest>) -
         info.playing = true;
         info.video_path = Some(path_for_workers.clone());
         info.tracks.clear();
+        info.persons.clear();
         info.stats = PipelineStats::default();
     }
 
@@ -833,7 +880,14 @@ async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::
 
     info!(engine = %pcfg.engine_kind, model = %pcfg.model_path, "creating integra pipeline");
 
-    let stream_handle = integra::spawn_stream(pcfg, state.lib.clone())?;
+    let stream_handle = if let Some(ref addr) = state.infer_worker_addr {
+        info!(addr = %addr, "connecting to infer_worker via TCP");
+        integra::spawn_tcp_stream(addr.clone())
+            .map_err(|e| anyhow::anyhow!("tcp_stream connect failed: {e}"))?
+    } else {
+        let lib = state.lib.clone().ok_or_else(|| anyhow::anyhow!("integra_ffi not loaded"))?;
+        integra::spawn_stream(pcfg, lib)?
+    };
     let integra::StreamHandle {
         frame_tx,
         mut events_rx,
@@ -917,6 +971,7 @@ async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::
 async fn update_info_from_frame(info_arc: &Arc<RwLock<GatewayInfo>>, fr: &FrameResult) {
     let mut info = info_arc.write().await;
     info.tracks = fr.tracks.clone();
+    info.persons = fr.persons.clone();
     info.stats.last_frame_id = fr.frame_id;
     info.stats.frames_processed = info.stats.frames_processed.saturating_add(1);
 
@@ -940,18 +995,124 @@ async fn update_info_from_frame(info_arc: &Arc<RwLock<GatewayInfo>>, fr: &FrameR
     info.stats.analyzer_ms = a * fr.stats.analyzer_ms + (1.0 - a) * info.stats.analyzer_ms;
 }
 
+/// COCO-80 (Ultralytics / YOLO): имя класса из `model.class_min_conf` → id для нативного FFI.
+fn coco_class_id_from_label(name: &str) -> Option<i32> {
+    const LABELS: &[(&str, i32)] = &[
+        ("person", 0),
+        ("bicycle", 1),
+        ("car", 2),
+        ("motorcycle", 3),
+        ("airplane", 4),
+        ("bus", 5),
+        ("train", 6),
+        ("truck", 7),
+        ("boat", 8),
+        ("traffic light", 9),
+        ("fire hydrant", 10),
+        ("stop sign", 11),
+        ("parking meter", 12),
+        ("bench", 13),
+        ("bird", 14),
+        ("cat", 15),
+        ("dog", 16),
+        ("horse", 17),
+        ("sheep", 18),
+        ("cow", 19),
+        ("elephant", 20),
+        ("bear", 21),
+        ("zebra", 22),
+        ("giraffe", 23),
+        ("backpack", 24),
+        ("umbrella", 25),
+        ("handbag", 26),
+        ("tie", 27),
+        ("suitcase", 28),
+        ("frisbee", 29),
+        ("skis", 30),
+        ("snowboard", 31),
+        ("sports ball", 32),
+        ("kite", 33),
+        ("baseball bat", 34),
+        ("baseball glove", 35),
+        ("skateboard", 36),
+        ("surfboard", 37),
+        ("tennis racket", 38),
+        ("bottle", 39),
+        ("wine glass", 40),
+        ("cup", 41),
+        ("fork", 42),
+        ("knife", 43),
+        ("spoon", 44),
+        ("bowl", 45),
+        ("banana", 46),
+        ("apple", 47),
+        ("sandwich", 48),
+        ("orange", 49),
+        ("broccoli", 50),
+        ("carrot", 51),
+        ("hot dog", 52),
+        ("pizza", 53),
+        ("donut", 54),
+        ("cake", 55),
+        ("chair", 56),
+        ("couch", 57),
+        ("potted plant", 58),
+        ("bed", 59),
+        ("dining table", 60),
+        ("toilet", 61),
+        ("tv", 62),
+        ("laptop", 63),
+        ("mouse", 64),
+        ("remote", 65),
+        ("keyboard", 66),
+        ("cell phone", 67),
+        ("microwave", 68),
+        ("oven", 69),
+        ("toaster", 70),
+        ("sink", 71),
+        ("refrigerator", 72),
+        ("book", 73),
+        ("clock", 74),
+        ("vase", 75),
+        ("scissors", 76),
+        ("teddy bear", 77),
+        ("hair drier", 78),
+        ("toothbrush", 79),
+    ];
+    LABELS
+        .iter()
+        .find(|(label, _)| *label == name)
+        .map(|(_, id)| *id)
+}
+
+fn parse_native_class_min_conf(model: &serde_json::Value) -> Vec<(i32, f32)> {
+    let mut out = Vec::new();
+    let Some(obj) = model.get("class_min_conf").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (name, val) in obj {
+        let Some(id) = coco_class_id_from_label(name.as_str()) else {
+            continue;
+        };
+        let Some(th) = val.as_f64() else {
+            continue;
+        };
+        if out.len() >= 16 {
+            break;
+        }
+        out.push((id, th as f32));
+    }
+    out
+}
+
 fn build_pipeline_config(root: &FsPath, cfg: &serde_json::Value) -> integra::PipelineConfig {
     let mut p = integra::PipelineConfig::default();
 
-    // engine: для Windows-build (без TRT) используем opencv DNN; для Linux —
-    // tensorrt из config.json. Caller может переопределить env'ом.
+    // engine: по умолчанию tensorrt; переопределение — `native_analytics.engine` в config.json
+    // или переменная окружения INTEGRA_ENGINE_KIND (например `opencv` для отладки без .engine).
     let native = cfg.get("native_analytics");
     let env_engine = std::env::var("INTEGRA_ENGINE_KIND").ok();
-    let engine_default = if cfg!(target_os = "windows") {
-        "opencv"
-    } else {
-        "tensorrt"
-    };
+    let engine_default = "tensorrt";
     let engine = env_engine
         .or_else(|| {
             native
@@ -966,7 +1127,7 @@ fn build_pipeline_config(root: &FsPath, cfg: &serde_json::Value) -> integra::Pip
     let model_rel = native
         .and_then(|n| n.get("model_path"))
         .and_then(|v| v.as_str())
-        .unwrap_or("models/yolo11n.onnx");
+        .unwrap_or("models/yolo11n_fp16.engine");
     let model_abs = root.join(model_rel);
     p.model_path = model_abs.to_string_lossy().into_owned();
 
@@ -999,6 +1160,45 @@ fn build_pipeline_config(root: &FsPath, cfg: &serde_json::Value) -> integra::Pip
                 .filter_map(|v| v.as_i64().map(|x| x as i32))
                 .collect();
         }
+
+        // Порт `VisionOCR/.../detector.py`: вертикальные min_conf — только по явному флагу
+        // (иначе поля вроде upper_region_y_ratio в JSON сами по себе меняют поведение).
+        if model.get("use_native_regional_conf").and_then(|v| v.as_bool()) == Some(true) {
+            p.use_regional_class_conf = true;
+            p.upper_region_y_ratio = model
+                .get("upper_region_y_ratio")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.62) as f32;
+            p.min_conf_upper = model
+                .get("min_conf_upper")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.22) as f32;
+            p.min_conf_lower = model
+                .get("min_conf_lower")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.30) as f32;
+            p.bottom_region_y_ratio = model
+                .get("bottom_region_y_ratio")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.88) as f32;
+            p.min_conf_bottom = model
+                .get("min_conf_bottom")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.26) as f32;
+            p.border_relax_px = model
+                .get("border_relax_px")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(24) as i32;
+            p.min_conf_border = model
+                .get("min_conf_border")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.20) as f32;
+            p.person_min_conf_border = model
+                .get("person_min_conf_border")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.18) as f32;
+        }
+        p.class_min_conf = parse_native_class_min_conf(model);
     }
 
     // analyzer — из analyzer.*
@@ -1024,9 +1224,36 @@ fn build_pipeline_config(root: &FsPath, cfg: &serde_json::Value) -> integra::Pip
         if let Some(v) = a.get("min_object_area_px").and_then(|v| v.as_f64()) {
             p.min_object_area_px = v;
         }
+        if let Some(arr) = a.get("ignore_detection_norm_rect").and_then(|v| v.as_array()) {
+            if arr.len() == 4 {
+                let mut nums = [0.0f64; 4];
+                let mut ok = true;
+                for (i, item) in arr.iter().enumerate() {
+                    if let Some(x) = item.as_f64() {
+                        nums[i] = x;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && nums[2] > nums[0] && nums[3] > nums[1] {
+                    p.ignore_det_norm_x1 = nums[0];
+                    p.ignore_det_norm_y1 = nums[1];
+                    p.ignore_det_norm_x2 = nums[2];
+                    p.ignore_det_norm_y2 = nums[3];
+                }
+            }
+        }
+        if let Some(v) = a.get("tracker_iou_match_threshold").and_then(|v| v.as_f64()) {
+            p.tracker_iou_match_threshold = v as f32;
+        }
+        if let Some(v) = a.get("tracker_max_missed_frames").and_then(|v| v.as_i64()) {
+            p.tracker_max_missed_frames = v as i32;
+        }
+        if let Some(v) = a.get("tracker_soft_centroid_match").and_then(|v| v.as_bool()) {
+            p.tracker_soft_centroid_match = v;
+        }
     }
-
-    p.camera_id = "main".to_string();
     p
 }
 
@@ -1139,7 +1366,7 @@ fn start_bridge_stream(state: AppState, video_path: String) {
             };
             let w = mv.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let h = mv.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let pts_ms = mv.get("pts_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let pts_ms = mv.get("pos_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let frame_id = mv.get("frame_id").and_then(|v| v.as_i64()).unwrap_or(0);
             if w == 0 || h == 0 {
                 continue;
@@ -1173,19 +1400,33 @@ fn start_bridge_stream(state: AppState, video_path: String) {
                 });
             });
 
-            // 1. Передаём в pipeline (отдельная копия — может быть большой, но нужно)
-            //    Pipeline-worker сериализован spawn_blocking, синхронный.
-            push_frame_to_pipeline(&state, bgr.clone(), w as u32, h as u32, pts_ms as i64);
+            let bgr_shared = Arc::new(bgr);
+            push_frame_to_pipeline(
+                &state,
+                bgr_shared.clone(),
+                w as u32,
+                h as u32,
+                pts_ms as i64,
+            );
 
-            // 2. Снимок треков (для overlay).
-            let tracks_snapshot: Vec<TrackSnapshot> = tokio::task::block_in_place(|| {
+            // 2. Снимок треков и людей (для overlay).
+            let (tracks_snapshot, persons_snapshot) = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    state.info.read().await.tracks.clone()
+                    let g = state.info.read().await;
+                    (g.tracks.clone(), g.persons.clone())
                 })
             });
 
-            // 3. BGR → RGB, рисуем bbox, scaling, JPEG.
-            let jpeg = encode_preview_jpeg(&bgr, w as u32, h as u32, &tracks_snapshot);
+            // 3. BGR → RGB, даунскейл, bbox, JPEG.
+            let draw_person_boxes = state.preview_draw_person_boxes.load(Ordering::Relaxed);
+            let jpeg = encode_preview_jpeg(
+                &*bgr_shared,
+                w as u32,
+                h as u32,
+                &tracks_snapshot,
+                &persons_snapshot,
+                draw_person_boxes,
+            );
 
             if let Some(jpeg) = jpeg {
                 let info = state.info.clone();
@@ -1199,7 +1440,7 @@ fn start_bridge_stream(state: AppState, video_path: String) {
     });
 }
 
-fn push_frame_to_pipeline(state: &AppState, bgr: Vec<u8>, width: u32, height: u32, pts_ms: i64) {
+fn push_frame_to_pipeline(state: &AppState, bgr: Arc<Vec<u8>>, width: u32, height: u32, pts_ms: i64) {
     let session_arc = state.session.clone();
     // try_send из блокирующего контекста — берём lock в block_on'ом.
     let _ = tokio::task::block_in_place(|| {

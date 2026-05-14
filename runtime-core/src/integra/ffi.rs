@@ -1,6 +1,6 @@
 //! Низкоуровневый FFI-слой: `extern "C"` сигнатуры + `IntegraLib`.
 //!
-//! Сигнатуры зеркалят `native/include/integra/integra_ffi.h` (ABI v1).
+//! Сигнатуры зеркалят `native/include/integra/integra_ffi.h` (ABI v4).
 //! `IntegraLib` — handle на загруженную DLL/so; экземпляр один на процесс
 //! (через `OnceCell`), чтобы C++ синглтоны (`SharedTRTEngine` кэш и т.п.)
 //! не дублировались.
@@ -17,7 +17,7 @@ use once_cell::sync::OnceCell;
 // ABI constants — должны точно соответствовать integra_ffi.h.
 // ---------------------------------------------------------------------------
 
-pub const INTEGRA_FFI_ABI_VERSION: c_int = 1;
+pub const INTEGRA_FFI_ABI_VERSION: c_int = 4;
 
 // ---------------------------------------------------------------------------
 // IntegraConfig — repr(C), один-в-один с C struct.
@@ -53,8 +53,26 @@ pub struct IntegraConfig {
     pub min_object_area_px: c_double,
     pub centroid_history_maxlen: c_int,
     pub max_active_tracks: c_int,
-    // identity
+    pub ignore_det_norm_x1: c_double,
+    pub ignore_det_norm_y1: c_double,
+    pub ignore_det_norm_x2: c_double,
+    pub ignore_det_norm_y2: c_double,
     pub camera_id: *const c_char,
+    pub use_regional_class_conf: c_int,
+    pub upper_region_y_ratio: f32,
+    pub min_conf_upper: f32,
+    pub min_conf_lower: f32,
+    pub bottom_region_y_ratio: f32,
+    pub min_conf_bottom: f32,
+    pub border_relax_px: c_int,
+    pub min_conf_border: f32,
+    pub person_min_conf_border: f32,
+    pub tracker_iou_match_threshold: f32,
+    pub tracker_max_missed_frames: c_int,
+    pub tracker_soft_centroid_match: c_int,
+    pub class_min_conf_count: c_int,
+    pub class_min_conf_class_ids: [c_int; 16],
+    pub class_min_conf_thresholds: [f32; 16],
 }
 
 // Pipeline в C — opaque struct; в Rust представляем как enum без вариантов.
@@ -172,11 +190,15 @@ fn candidate_paths() -> Vec<PathBuf> {
     }
     // dev-сборка из workspace root.
     for rel in &[
+        "native/build-msvc-trt-user/Release",
+        "native/build-msvc-trt-user/RelWithDebInfo",
         "native/build-msvc/RelWithDebInfo",
         "native/build-msvc/Release",
         "native/build/RelWithDebInfo",
         "native/build/Release",
         "native/build",
+        "../native/build-msvc-trt-user/Release",
+        "../native/build-msvc-trt-user/RelWithDebInfo",
         "../native/build-msvc/RelWithDebInfo",
         "../native/build-msvc/Release",
         "../native/build/RelWithDebInfo",

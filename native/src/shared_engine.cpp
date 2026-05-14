@@ -15,6 +15,7 @@
 #include "integra/gpu_preprocess.hpp"
 #include "integra/inference_engine.hpp"
 #include "integra/yolo_postprocess.hpp"
+#include "integra/yolo_letterbox.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -95,10 +96,14 @@ class LegacyStreamContext final : public IStreamContext {
     if (resize_buf_.cols != trg || resize_buf_.rows != trg) {
       resize_buf_ = cv::Mat(trg, trg, CV_8UC3);
     }
+    LetterboxMeta letter{};
     if (in.width == trg && in.height == trg) {
       src_view.copyTo(resize_buf_);
-    } else {
-      cv::resize(src_view, resize_buf_, cv::Size(trg, trg), 0, 0, cv::INTER_LINEAR);
+      letter.r = 1.f;
+      letter.pad_left = letter.pad_top = 0;
+    } else if (!yolo_letterbox_bgr(src_view, trg, resize_buf_, &letter)) {
+      std::cerr << "integra: yolo_letterbox_bgr (legacy) failed\n";
+      return false;
     }
 
     InferenceInput vin;
@@ -129,15 +134,7 @@ class LegacyStreamContext final : public IStreamContext {
       return false;
     }
 
-    // Маппинг bbox обратно в координаты исходного кадра.
-    const float sx = static_cast<float>(in.width) / static_cast<float>(trg);
-    const float sy = static_cast<float>(in.height) / static_cast<float>(trg);
-    for (auto& d : out.items) {
-      d.bbox.x1 *= sx;
-      d.bbox.x2 *= sx;
-      d.bbox.y1 *= sy;
-      d.bbox.y2 *= sy;
-    }
+    yolo_unletterbox_dets(out.items, letter, in.width, in.height);
     return true;
   }
 

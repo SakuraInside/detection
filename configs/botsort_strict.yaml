@@ -1,0 +1,18 @@
+# Stricter BoT-SORT than botsort_loose.yaml — fewer false tracks on static CCTV.
+# Aligns with Ultralytics guidance: higher association thresholds, shorter lost-track buffer.
+
+tracker_type: botsort
+
+track_high_thresh: 0.35
+track_low_thresh: 0.08
+new_track_thresh: 0.28
+
+match_thresh: 0.78
+track_buffer: 55
+fuse_score: true
+
+gmc_method: none
+
+proximity_thresh: 0.45
+appearance_thresh: 0.25
+with_reid: false

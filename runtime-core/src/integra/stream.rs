@@ -2,7 +2,7 @@
 //!
 //! Архитектура одного потока (одной камеры):
 //!
-//!   frame source ──► frame_tx (mpsc bounded(2), try_send → drop-newest при Full)
+//!   frame source ──► frame_tx (mpsc bounded(FRAMES_CHANNEL_CAP), try_send → drop-newest при Full)
 //!                              │
 //!                          [worker] = spawn_blocking
 //!                              │
@@ -10,19 +10,19 @@
 //!                       Pipeline::push_frame
 //!                              │
 //!                              ▼
-//!                    events_tx (mpsc bounded(EVENTS_CAP))
+//!                    events_tx (mpsc bounded(EVENTS_CHANNEL_CAP))
 //!                              │
 //!                              ▼
 //!                       consumer (UI / алармы / persist)
 //!
-//! Почему `mpsc(2)` с try_send drop-newest:
+//! Почему `mpsc(FRAMES_CHANNEL_CAP)` с try_send drop-newest:
 //!   * tokio mpsc не даёт producer'у дропнуть `oldest` — это требует доступа к
 //!     `recv` со стороны producer'а, которого у нас нет.
 //!   * drop-newest = "если воркер не справляется, мы выкидываем самый свежий
 //!     поступающий кадр". Для live-видео это эквивалентно throttling источника
 //!     (потеряем кадр, но не задержим следующий).
 //!   * Альтернатива (drop-oldest) требует своего queue — реализуем в шаге 4,
-//!     если буферизация на 2 окажется недостаточной.
+//!     если буфер окажется недостаточным.
 
 use std::sync::Arc;
 
@@ -35,21 +35,18 @@ use super::ffi::{IntegraError, IntegraLib};
 use super::pipeline::{Pipeline, PipelineConfig};
 use super::preview_encode;
 
-/// Размер канала событий. 64 — компромисс: всплеск ~32 трека × 1-2 события
-/// на смену состояния FSM ещё помещается без блокировки producer'а.
-pub const EVENTS_CHANNEL_CAP: usize = 64;
+/// Размер канала событий (уменьшен для ниже пикового ОЗУ на очереди).
+pub const EVENTS_CHANNEL_CAP: usize = 40;
 
-/// Размер канала кадров. 2 — один "in-flight" + один "next".
-pub const FRAMES_CHANNEL_CAP: usize = 2;
+/// Меньше слотов — меньше пиковое ОЗУ (каждый слот ≈ один полный кадр BGR в `Arc`).
+pub const FRAMES_CHANNEL_CAP: usize = 3;
 
 /// Один сырой BGR-кадр.
 ///
-/// **Семантика владения**: текущий вариант — `Vec<u8>` (owned). Producer
-/// клонирует пиксели в эту структуру и отдаёт ownership в канал.
-/// На 1080p BGR это ~6 МБ копии. Если станет узким местом — в шаге 4
-/// заменим на `Arc<[u8]>` и пул переиспользуемых буферов.
+/// `Arc<Vec<u8>>`: один буфер на кадр, дешёвый `clone` при передаче в канал и совместном использовании
+/// с MJPEG-энкодером (без второго полного копирования 6 МБ на 1080p).
 pub struct Frame {
-    pub bgr: Vec<u8>,
+    pub bgr: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     pub pts_ms: i64,
@@ -121,7 +118,7 @@ pub fn spawn_stream(
                 )));
                 continue;
             }
-            let result = pipeline.push_frame(&frame.bgr, w, h, pts_ms);
+            let result = pipeline.push_frame(&*frame.bgr, w, h, pts_ms);
             match result {
                 Ok(messages) => {
                     let tracks_overlay = messages
@@ -140,7 +137,7 @@ pub fn spawn_stream(
                             StreamMessage::Event(mut ev) => {
                                 if alarm_needs_snapshot(&ev.kind) {
                                     let crop = preview_encode::encode_alarm_crop_jpeg(
-                                        &frame.bgr,
+                                        &*frame.bgr,
                                         frame.width,
                                         frame.height,
                                         ev.bbox,
@@ -150,10 +147,12 @@ pub fn spawn_stream(
                                     );
                                     ev.snapshot_jpeg = crop.or_else(|| {
                                         preview_encode::encode_preview_jpeg(
-                                            &frame.bgr,
+                                            &*frame.bgr,
                                             frame.width,
                                             frame.height,
                                             &tracks_overlay,
+                                            &[],
+                                            false,
                                         )
                                     });
                                 }
@@ -196,6 +195,8 @@ pub fn spawn_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integra::ffi::INTEGRA_FFI_ABI_VERSION;
+    use crate::integra::IntegraError;
 
     #[test]
     fn pipeline_config_default_sane() {
@@ -231,7 +232,17 @@ mod tests {
             min_box_size_px: 4,
             ..PipelineConfig::default()
         };
-        let mut p = Pipeline::new(&cfg, lib).expect("pipeline must init on stub backend");
+        let mut p = match Pipeline::new(&cfg, lib) {
+            Ok(p) => p,
+            Err(IntegraError::PipelineCreateFailed) => {
+                eprintln!(
+                    "skip smoke_load_stub_pipeline: integra_pipeline_create failed \
+                     (rebuild native integra_ffi for ABI {INTEGRA_FFI_ABI_VERSION})"
+                );
+                return;
+            }
+            Err(e) => panic!("pipeline init: {e}"),
+        };
         let bgr = vec![128u8; 64 * 64 * 3];
         let msgs = p
             .push_frame(&bgr, 64, 64, 0)

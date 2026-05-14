@@ -39,7 +39,10 @@ extern "C" {
 #endif
 
 // При несовпадении ABI integra_pipeline_create вернёт NULL.
-#define INTEGRA_FFI_ABI_VERSION 1
+#define INTEGRA_FFI_ABI_VERSION 4
+
+/// Максимум пар (class_id → min confidence) из `model.class_min_conf` для нативного фильтра.
+#define INTEGRA_CLASS_MIN_CONF_MAX 16
 
 // ---------------------------------------------------------------------------
 // Pipeline handle (opaque).
@@ -91,8 +94,38 @@ typedef struct {
   int         centroid_history_maxlen;
   int         max_active_tracks;
 
+  // ---- optional spatial mask (нормализованные 0..1 координаты кадра) ----
+  // Если ignore_det_norm_x2 <= ignore_det_norm_x1 или y2 <= y1 — маска выключена.
+  // Иначе детекции с class_id != person_class_id и центроидом bbox внутри прямоугольника
+  // отбрасываются (типично: зона приёмной, где модель даёт хаос; люди не режутся).
+  double      ignore_det_norm_x1;
+  double      ignore_det_norm_y1;
+  double      ignore_det_norm_x2;
+  double      ignore_det_norm_y2;
+
   // ---- identity ----
   const char* camera_id;        // включается в event JSON. NULL => "main".
+
+  // ---- frame filter: вертикальные пороги conf как в Python detector.py (0 = выкл., старая эвристика) ----
+  int         use_regional_class_conf;
+  float       upper_region_y_ratio;
+  float       min_conf_upper;
+  float       min_conf_lower;
+  float       bottom_region_y_ratio;
+  float       min_conf_bottom;
+  int         border_relax_px;
+  float       min_conf_border;
+  float       person_min_conf_border;
+
+  // ---- IouTracker (нативный путь; не путать с Ultralytics YAML) ----
+  float       tracker_iou_match_threshold;  /* <=0 => 0.35 */
+  int         tracker_max_missed_frames;    /* <=0 => 10 */
+  int         tracker_soft_centroid_match;  /* 0 = только жёсткий IoU, 1 = + мягкий центроид */
+
+  // ---- per-class min confidence (COCO class_id), до INTEGRA_CLASS_MIN_CONF_MAX пар ----
+  int         class_min_conf_count;
+  int         class_min_conf_class_ids[INTEGRA_CLASS_MIN_CONF_MAX];
+  float       class_min_conf_thresholds[INTEGRA_CLASS_MIN_CONF_MAX];
 } IntegraConfig;
 
 // ---------------------------------------------------------------------------

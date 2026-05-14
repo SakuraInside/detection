@@ -14,10 +14,9 @@ namespace integra {
 
 namespace {
 
-// Не отдаём в UI/оверлей «кандидатов», пока объект не продержался N кадров подряд —
-// срезает одноразовые ложные срабатывания модели при умеренном model.conf.
-// Баланс: меньше мусора в оверлее, чем 5 кадров, но не «глушим» появление треков как при 12+.
-constexpr int kMinCandidateFramesForSnapshot = 8;
+// Кандидаты не попадают в tracks_snapshot (оверлей): только подтверждённо статичные и далее.
+// FSM по-прежнему ведёт кандидатов внутри ingest.
+constexpr double kCandidateDropSilentSec = 2.0;
 
 enum class St {
   kNone = 0,
@@ -49,6 +48,7 @@ struct TH {
   double unattended_since_ts = 0;
   double abandoned_at_ts = 0;
   double last_owner_near_ts = 0;
+  bool ever_owner_near = false;
   std::vector<CentroidEntry> centroid_history;
   int presence_count = 0;
   int frames_seen = 0;
@@ -73,21 +73,99 @@ struct TH {
   }
 };
 
-bool is_person_near(const Detection& obj, const std::vector<Detection>& persons, double prox_px) {
+/// Человек перекрывает bbox объекта (окклюзия): не копим silent / не спешим с disappeared.
+bool person_overlaps_bbox(const BBoxXYXY& obj_bbox, const std::vector<Detection>& persons,
+                          int frame_w, int frame_h) {
+  if (persons.empty()) {
+    return false;
+  }
+  const float frame_area =
+      (frame_w > 0 && frame_h > 0)
+          ? static_cast<float>(std::max(1, frame_w) * std::max(1, frame_h))
+          : 0.f;
+  for (const auto& person : persons) {
+    if (person.confidence < 0.30f) {
+      continue;
+    }
+    if (frame_area > 1.f) {
+      const float pa = bbox_area(person.bbox);
+      if (pa / frame_area > 0.14f) {
+        continue;
+      }
+    }
+    if (iou_xyxy(person.bbox, obj_bbox) >= 0.052f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool is_person_near(const Detection& obj, const std::vector<Detection>& persons, double prox_px,
+                     int frame_w, int frame_h) {
   if (persons.empty()) {
     return false;
   }
   float ox, oy;
   centroid_xyxy(obj.bbox, &ox, &oy);
   const float ox1 = obj.bbox.x1, oy1 = obj.bbox.y1, ox2 = obj.bbox.x2, oy2 = obj.bbox.y2;
+
+  const float frame_area =
+      (frame_w > 0 && frame_h > 0)
+          ? static_cast<float>(std::max(1, frame_w) * std::max(1, frame_h))
+          : 0.f;
+
+  constexpr float kOwnerPersonMinConf = 0.44f;
+  // Не считать «владельцем» гигантские FP (стол/стена как person) — иначе цепляются все
+  // объекты в радиусе и потом уходят в unattended по всему кадру.
+  constexpr float kOwnerPersonMaxAreaRatio = 0.09f;
+  // Силуэт человека для proximity: слишком широкий бокс ≈ мебель/FP.
+  constexpr float kOwnerPersonMaxAspect = 1.42f;
+  // Минимальное пересечение person–object: иначе «рядом по пикселям» цепляет бутылки
+  // на столе при проходе человека у лестницы / у стойки.
+  constexpr float kOwnerObjectMinIou = 0.055f;
+
+  double eff_prox = prox_px;
+  if (frame_w > 0 && frame_h > 0) {
+    const double diag =
+        std::hypot(static_cast<double>(frame_w), static_cast<double>(frame_h));
+    eff_prox = std::min(prox_px, std::max(48.0, 0.036 * diag));
+  }
+
   for (const auto& person : persons) {
+    if (person.confidence < kOwnerPersonMinConf) {
+      continue;
+    }
+    if (frame_area > 1.f) {
+      const float pa = bbox_area(person.bbox);
+      if (pa / frame_area > kOwnerPersonMaxAreaRatio) {
+        continue;
+      }
+      const float pw = person.bbox.x2 - person.bbox.x1;
+      const float ph = person.bbox.y2 - person.bbox.y1;
+      if (pw > 1.f && ph > 1.f) {
+        const float par = pw / ph;
+        if (par > kOwnerPersonMaxAspect) {
+          continue;
+        }
+      }
+    }
     float px, py;
     centroid_xyxy(person.bbox, &px, &py);
-    if (std::hypot(static_cast<double>(px - ox), static_cast<double>(py - oy)) <= prox_px) {
+    const double dist =
+        std::hypot(static_cast<double>(px - ox), static_cast<double>(py - oy));
+    if (dist > eff_prox) {
+      continue;
+    }
+    const float iou_po = iou_xyxy(person.bbox, obj.bbox);
+    if (iou_po >= kOwnerObjectMinIou) {
+      return true;
+    }
+    // Только явная близость по центроиду (не полный диск eff_prox при нулевом IoU).
+    if (dist <= 0.28 * eff_prox) {
       return true;
     }
     const float px1 = person.bbox.x1, py1 = person.bbox.y1, px2 = person.bbox.x2, py2 = person.bbox.y2;
-    if (px1 < ox2 && ox1 < px2 && py1 < oy2 && oy1 < py2) {
+    if (px1 < ox2 && ox1 < px2 && py1 < oy2 && oy1 < py2 && iou_po >= 0.028f) {
       return true;
     }
   }
@@ -133,7 +211,8 @@ void SceneAnalyzer::set_params(AnalyzerParams p) { impl_->p = p; }
 std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
                                                const std::string& camera_id,
                                                const std::vector<Detection>& objects,
-                                               const std::vector<Detection>& persons) {
+                                               const std::vector<Detection>& persons,
+                                               int frame_w, int frame_h) {
   auto& p = impl_->p;
   auto& tracks = impl_->tracks;
   std::vector<AlarmEvent> events;
@@ -182,8 +261,9 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
       continue;
     }
 
-    if (is_person_near(det, persons, p.owner_proximity_px)) {
+    if (is_person_near(det, persons, p.owner_proximity_px, frame_w, frame_h)) {
       tr.last_owner_near_ts = ts;
+      tr.ever_owner_near = true;
     }
 
     const double disp = tr.displacement_window(ts - p.static_window_sec);
@@ -201,6 +281,11 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
     }
 
     if (tr.state == St::kStatic || tr.state == St::kUnattended || tr.state == St::kAlarmAbandoned) {
+      // Без хотя бы одного «владелец рядом» постоянный фон (бутылки, турникет) уходит в
+      // unattended через несколько секунд — поэтому ждём реальную близость человека.
+      if (!tr.ever_owner_near) {
+        continue;
+      }
       const double without_owner_for =
           tr.last_owner_near_ts > 0 ? (ts - tr.last_owner_near_ts) : (ts - tr.first_seen_ts);
       if (without_owner_for >= p.owner_left_sec) {
@@ -237,6 +322,10 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
     if (seen) {
       continue;
     }
+    if (!persons.empty() && person_overlaps_bbox(tr.last_bbox, persons, frame_w, frame_h)) {
+      tr.last_seen_ts = ts;
+      continue;
+    }
     const double silent_for = ts - tr.last_seen_ts;
     if (tr.raised_abandoned && !tr.raised_disappeared) {
       if (silent_for >= p.disappear_grace_sec) {
@@ -247,10 +336,10 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
       }
     }
     // Кандидат без детекции долго — мигание/шум; интервал мягче 2 с, чтобы не рвать редкие детекции.
-    if (tr.state == St::kCandidate && silent_for >= 3.5) {
+    if (tr.state == St::kCandidate && silent_for >= kCandidateDropSilentSec) {
       to_drop.push_back(tid);
     } else if (!tr.raised_abandoned &&
-               silent_for > std::max(10.0, p.disappear_grace_sec * 2.0)) {
+               silent_for > std::max(22.0, p.disappear_grace_sec * 3.0)) {
       to_drop.push_back(tid);
     }
   }
@@ -291,7 +380,10 @@ std::vector<TrackSnapshot> SceneAnalyzer::tracks_snapshot(double now_ts) const {
   out.reserve(impl_->tracks.size());
   for (const auto& kv : impl_->tracks) {
     const TH& t = kv.second;
-    if (t.state == St::kCandidate && t.frames_seen < kMinCandidateFramesForSnapshot) {
+    if (t.state == St::kCandidate) {
+      continue;
+    }
+    if (t.state == St::kStatic) {
       continue;
     }
     if (t.state == St::kNone) {

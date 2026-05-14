@@ -179,14 +179,7 @@ int main(int argc, char** argv) {
 
   const std::size_t workspace_bytes = static_cast<std::size_t>(workspace_mb) * 1024 * 1024;
 #if NV_TENSORRT_MAJOR >= 10
-  if (!config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes)) {
-    std::cerr << "integra_trt_bake: setMemoryPoolLimit(WORKSPACE) failed\n";
-    destroy_config(config);
-    destroy_parser(parser);
-    destroy_network(network);
-    destroy_builder(builder);
-    return 1;
-  }
+  config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspace_bytes);
 #else
   if (!config->setMaxWorkspaceSize(workspace_bytes)) {
     std::cerr << "integra_trt_bake: setMaxWorkspaceSize failed\n";
@@ -200,11 +193,8 @@ int main(int argc, char** argv) {
 
   if (fp16) {
     if (builder->platformHasFastFp16()) {
-      if (!config->setFlag(nvinfer1::BuilderFlag::kFP16)) {
-        std::cerr << "integra_trt_bake: setFlag(kFP16) failed\n";
-      } else {
-        std::cerr << "integra_trt_bake: FP16 включён\n";
-      }
+      config->setFlag(nvinfer1::BuilderFlag::kFP16);
+      std::cerr << "integra_trt_bake: FP16 включён\n";
     } else {
       std::cerr << "integra_trt_bake: предупреждение: FP16 недоступен на этой платформе, остаёмся в FP32\n";
     }

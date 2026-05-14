@@ -79,10 +79,9 @@ cmake --build native\build-msvc --config RelWithDebInfo --target integra_ffi
 cmake -S native -B native/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build native/build --target integra_ffi -j
 ```
-Если на машине доступен TensorRT — он подхватится автоматически
-(`INTEGRA_HAS_TENSORRT=1`), и для движка `kind="tensorrt"` будет
-использоваться `SharedTRTEngine` + per-stream `IExecutionContext`.
-Иначе движок `opencv` / `onnx` через OpenCV DNN.
+Если **`integra_ffi`** собран с **`INTEGRA_WITH_TENSORRT=ON`**
+(`INTEGRA_HAS_TENSORRT=1`), то для движка `kind="tensorrt"` используется
+`SharedTRTEngine` + per-stream `IExecutionContext`. Иначе доступны `opencv` / `onnx` (OpenCV DNN и т.д.). См. **`native/scripts/build_engine_msvc.ps1`** для Windows.
 
 Детали — в [`native/README.md`](native/README.md).
 
@@ -97,17 +96,42 @@ bindgen):
 - Windows: `pip install libclang` → `LIBCLANG_PATH=.venv\Lib\site-packages\clang\native`;
 - Linux: `apt install libclang-dev`.
 
-### 3.3. TensorRT: сборка `.engine` из `.onnx` (Linux, production)
+### 3.3. TensorRT: сборка `.engine` из `.onnx` (C++ `integra_trt_bake`, без Python)
 
 Рантайм ожидает **уже собранный** serialized engine (см. `native_analytics.model_path`).
 
-- Утилита **`integra_trt_bake`** (входит в сборку при `INTEGRA_WITH_TENSORRT=ON`):  
-  `integra_trt_bake --onnx models/yolo11n.onnx --out models/yolo11n_fp16.engine --fp16`
-- Кеш с детерминированным именем: **`native/scripts/trt_bake_cached.sh`** (sha256 + compute capability).
+- Утилита **`integra_trt_bake`** (сборка натива с **`INTEGRA_WITH_TENSORRT=ON`**):  
+  `integra_trt_bake --onnx models/yolo11n.onnx --out models/yolo11n_fp16.engine --fp16 --workspace-mb 4096`
+- Кеш (Linux): **`native/scripts/trt_bake_cached.sh`** (sha256 + compute capability).
+- **Windows (MSVC):** **`native/scripts/build_engine_msvc.ps1`** — CMake + `integra_trt_bake` + `integra_ffi` (параметры `-OpenCvDir`, `-TensorRtRoot` или переменные `INTEGRA_OPENCV_DIR` / `TENSORRT_ROOT`).
 
-Подробности — [native/README.md](native/README.md) (раздел «TensorRT: ONNX → .engine»).
+Подробности — [native/README.md](native/README.md) (раздел «TensorRT» и «Windows + CUDA + TensorRT»).
 
 ## 4. Запуск
+
+**Сборка всего (native TRT DLL + Rust gateway + video-bridge), из корня:**
+
+```powershell
+.\scripts\build_all.ps1
+```
+
+Требуется уже сконфигурированный CMake-каталог `native\build-msvc-trt-user` (см. `native\README.md`). Скрипт копирует `integra_ffi.dll` в `runtime-core\target\release\`. Для `video-bridge` выставляются `OPENCV_LINK_*` под `C:\build\opencv\x64\vc17\lib` (имя `opencv_world*.lib` ищется автоматически).
+
+**Запуск gateway + bridge одним окном:**
+
+```powershell
+.\scripts\run_stack.ps1
+```
+
+**Windows (только gateway, TensorRT):** из корня репозитория:
+
+```powershell
+.\scripts\run_backend_gateway.ps1
+```
+
+Скрипт выставляет `INTEGRA_PROJECT_ROOT`, `INTEGRA_FFI_PATH`, дописывает в `PATH` каталоги **TensorRT `bin`**, **CUDA `bin`**, **OpenCV `bin`** (пути в начале `scripts/run_backend_gateway.ps1` при необходимости поправьте). Нужны собранные `integra_ffi.dll` и `models/yolo11n_fp16.engine` (см. §3).
+
+**Через Python-launcher (как раньше):**
 
 ```bash
 python run.py --release

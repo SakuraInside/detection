@@ -39,6 +39,7 @@ add_library(integra_core STATIC
   src/shared_engine.cpp
   src/opencv_dnn_engine.cpp
   src/yolo_postprocess.cpp
+  src/yolo_letterbox.cpp
   src/iou_tracker.cpp
   src/scene_analyzer.cpp
   src/alarm_sink.cpp

@@ -22,8 +22,16 @@ data/*.mov
 data/*.webm
 data/*.m4v
 
-# Local / MSVC CMake output
+# Local / MSVC CMake output — все варианты build-директорий
 native/build-msvc/
+native/build-msvc-*/
+native/build-trt/
+native/build-trt-*/
+native/build*/
+
+# Claude Code worktrees (локальные, не для репо)
+.claire/
+.claude/
 
 # OpenCV or other huge local build trees
 /build/

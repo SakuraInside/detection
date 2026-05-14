@@ -38,6 +38,7 @@ Binary payload framing is:
 
 Notes:
 - Unknown fields must be ignored.
+- Optional top-level numeric fields for `integra-analyticsd` IouTracker (defaults: iou 0.35, max_missed 10, soft centroid on): `tracker_iou`, `tracker_max_missed`, `tracker_soft_centroid` (0 or 1).
 
 ### hello_ok (server → client)
 

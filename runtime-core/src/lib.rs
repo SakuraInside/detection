@@ -8,4 +8,5 @@
 //!     Загрузка DLL/so в рантайме, типизированные события, `spawn_stream` с
 //!     bounded-каналами и drop-oldest семантикой для live-видео.
 
+pub mod config;
 pub mod integra;
