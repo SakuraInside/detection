@@ -53,6 +53,9 @@ target_include_directories(integra_core PUBLIC
 
 target_link_libraries(integra_core PUBLIC ${OpenCV_LIBS})
 
+# Статическая библиотека линкуется в SHARED libintegra_ffi.so — нужен PIC, иначе ld: recompile with -fPIC.
+set_target_properties(integra_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 if(INTEGRA_WITH_ONNXRUNTIME)
   find_path(INTEGRA_ONNX_INCLUDE NAMES onnxruntime_cxx_api.h
     HINTS "${INTEGRA_ONNXRUNTIME_ROOT}/include" "$ENV{ONNXRUNTIME_ROOT}/include"

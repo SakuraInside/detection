@@ -397,6 +397,7 @@ INTEGRA_API int integra_pipeline_push_frame(IntegraPipeline* p,
   // только при сильном перекрытии (дубли модели на одной ёмкости).
   integra::merge_same_class_objects_only(filtered, p->person_class_id, 0.48f);
   integra::merge_luggage_cross_class_by_iou(filtered, p->person_class_id, 0.38f);
+  integra::merge_tableware_cross_iou(filtered, p->person_class_id, 0.25f);
   integra::suppress_duplicate_bottles_by_iou(filtered, p->person_class_id, 0.40f);
 
   const auto t_post = std::chrono::steady_clock::now();

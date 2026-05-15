@@ -273,6 +273,17 @@ def _prepare_video_bridge_build_env(root: Path, env: dict[str, str]) -> bool:
         if not _ensure_clang_for_opencvrs(env):
             return False
         _normalize_opencv_msvc_crt(env)
+    else:
+        # opencv-rust bindgen ищет исполняемый `clang` в PATH (см. opencv-binding-generator).
+        if not shutil.which("clang"):
+            print(
+                "[run.py] Для сборки video-bridge нужен `clang` в PATH (opencv-rust).\n"
+                "         Linux: sudo apt install clang libclang-dev\n"
+                "         macOS: xcode-select --install (или пакет LLVM с clang в PATH)\n"
+                "         Запуск без видео-моста: python3 run.py --release --no-bridge",
+                file=sys.stderr,
+            )
+            return False
     return True
 
 
@@ -314,42 +325,131 @@ def _read_bridge_target_fps(root: Path) -> int:
 
 
 def _add_tensorrt_to_path(env: dict[str, str]) -> None:
-    """Добавить каталог с nvinfer_10.dll в PATH чтобы integra_ffi.dll загрузилась.
+    """Windows: nvinfer_*.dll на PATH. Linux: libnvinfer.so* в LD_LIBRARY_PATH (apt или TENSORRT_ROOT/lib)."""
 
-    Порядок поиска:
-      1. INTEGRA_TENSORRT_BIN (явный переопределяющий путь)
-      2. tensorrt_libs Python-пакет (pip install tensorrt-cu12)
-      3. C:\\TensorRT-*\\lib (Developer SDK)
-    """
-    if not sys.platform.startswith("win"):
+    if sys.platform.startswith("win"):
+        # nvinfer_10.dll: INTEGRA_TENSORRT_BIN, pip tensorrt_libs, C:\TensorRT-*\lib
+        manual = os.environ.get("INTEGRA_TENSORRT_BIN", "").strip()
+        candidates: list[Path] = []
+        if manual:
+            candidates.append(Path(manual))
+        # pip-пакет tensorrt_libs (nvinfer_10.dll лежит прямо в каталоге пакета)
+        try:
+            import importlib.util
+
+            spec = importlib.util.find_spec("tensorrt_libs")
+            if spec and spec.origin:
+                candidates.append(Path(spec.origin).parent)
+        except Exception:
+            pass
+        # C:\TensorRT-*\lib (Developer SDK с bin/ или lib/)
+        import glob
+
+        for pattern in [r"C:\TensorRT-*\bin", r"C:\TensorRT-*\lib", r"D:\TensorRT-*\bin", r"D:\TensorRT-*\lib"]:
+            candidates.extend(Path(p) for p in glob.glob(pattern))
+        for d in candidates:
+            if d.is_dir() and any(d.glob("nvinfer_10.dll")):
+                env["PATH"] = str(d.resolve()) + os.pathsep + env.get("PATH", "")
+                print(f"[run.py] TensorRT DLLs → {d}", flush=True)
+                return
+        print(
+            "[run.py] Предупреждение: nvinfer_10.dll не найдена.\n"
+            "         Установите: pip install tensorrt-cu12\n"
+            "         или задайте INTEGRA_TENSORRT_BIN=<папка с nvinfer_10.dll>",
+            file=sys.stderr,
+            flush=True,
+        )
         return
-    manual = os.environ.get("INTEGRA_TENSORRT_BIN", "").strip()
+
+    # Linux: apt → /usr/lib/x86_64-linux-gnu; тарбол → $TENSORRT_ROOT/lib; часто ~/var/TensorRT-*/lib
     candidates: list[Path] = []
+    manual = os.environ.get("INTEGRA_TENSORRT_BIN", "").strip()
     if manual:
         candidates.append(Path(manual))
-    # pip-пакет tensorrt_libs (nvinfer_10.dll лежит прямо в каталоге пакета)
+    tr = os.environ.get("TENSORRT_ROOT", "").strip()
+    if tr:
+        candidates.append(Path(tr) / "lib")
+    home = Path.home()
     try:
-        import importlib.util
-        spec = importlib.util.find_spec("tensorrt_libs")
-        if spec and spec.origin:
-            candidates.append(Path(spec.origin).parent)
-    except Exception:
+        for trt_dir in sorted(home.glob("var/TensorRT-*")):
+            candidates.append(trt_dir / "lib")
+        candidates.append(home / "var" / "lib")
+    except OSError:
         pass
-    # C:\TensorRT-*\lib (Developer SDK с bin/ или lib/)
-    import glob
-    for pattern in [r"C:\TensorRT-*\bin", r"C:\TensorRT-*\lib", r"D:\TensorRT-*\bin", r"D:\TensorRT-*\lib"]:
-        candidates.extend(Path(p) for p in glob.glob(pattern))
+    candidates.append(Path("/usr/lib/x86_64-linux-gnu"))
+
+    good: list[str] = []
+    seen: set[str] = set()
     for d in candidates:
-        if d.is_dir() and any(d.glob("nvinfer_10.dll")):
-            env["PATH"] = str(d.resolve()) + os.pathsep + env.get("PATH", "")
-            print(f"[run.py] TensorRT DLLs → {d}", flush=True)
-            return
-    print(
-        "[run.py] Предупреждение: nvinfer_10.dll не найдена.\n"
-        "         Установите: pip install tensorrt-cu12\n"
-        "         или задайте INTEGRA_TENSORRT_BIN=<папка с nvinfer_10.dll>",
-        file=sys.stderr, flush=True,
-    )
+        if not d.is_dir():
+            continue
+        try:
+            if not any(d.glob("libnvinfer.so*")):
+                continue
+        except OSError:
+            continue
+        resolved = str(d.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        good.append(resolved)
+
+    if not good:
+        print(
+            "[run.py] Предупреждение: libnvinfer.so не найден (TensorRT для integra_ffi).\n"
+            "         Linux apt: INTEGRA_TENSORRT_BIN=/usr/lib/x86_64-linux-gnu\n"
+            "         или export TENSORRT_ROOT=/path/to/TensorRT-… (каталог с lib/).",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    prefix = os.pathsep.join(good)
+    old = env.get("LD_LIBRARY_PATH", "").strip()
+    env["LD_LIBRARY_PATH"] = prefix + (os.pathsep + old if old else "")
+    print(f"[run.py] TensorRT libs → {' ; '.join(good)}", flush=True)
+
+
+def _add_onnxruntime_lib_path(env: dict[str, str]) -> None:
+    """Linux: libonnxruntime.so для integra_ffi, собранной с INTEGRA_WITH_ONNXRUNTIME."""
+    if sys.platform.startswith("win"):
+        return
+    candidates: list[Path] = []
+    manual = os.environ.get("INTEGRA_ONNXRUNTIME_ROOT", "").strip()
+    if manual:
+        candidates.append(Path(manual) / "lib")
+    home = Path.home()
+    try:
+        for d in sorted(home.glob("Downloads/onnxruntime-linux-*")):
+            candidates.append(d / "lib")
+        for d in sorted(home.glob("Desktop/onnxruntime-linux-*")):
+            candidates.append(d / "lib")
+        for d in sorted(home.glob("var/onnxruntime-linux-*")):
+            candidates.append(d / "lib")
+    except OSError:
+        pass
+
+    good: list[str] = []
+    seen: set[str] = set()
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        try:
+            if not any(d.glob("libonnxruntime.so*")):
+                continue
+        except OSError:
+            continue
+        r = str(d.resolve())
+        if r in seen:
+            continue
+        seen.add(r)
+        good.append(r)
+    if not good:
+        return
+    prefix = os.pathsep.join(good)
+    old = env.get("LD_LIBRARY_PATH", "").strip()
+    env["LD_LIBRARY_PATH"] = prefix + (os.pathsep + old if old else "")
+    print(f"[run.py] ONNX Runtime libs → {' ; '.join(good)}", flush=True)
 
 
 def _wait_tcp_listening(addr: str, timeout_sec: float = 20.0) -> bool:
@@ -455,6 +555,7 @@ def main() -> None:
 
     # TensorRT DLL: если INTEGRA_TENSORRT_BIN задан или C:\TensorRT-*/lib существует — добавляем в PATH.
     _add_tensorrt_to_path(env)
+    _add_onnxruntime_lib_path(env)
 
     _sync_opencv_dnn_cuda_env(root, env)
 
@@ -479,14 +580,13 @@ def main() -> None:
         if br.returncode != 0:
             print(
                 "[run.py] Сборка video-bridge не удалась — gateway не сможет открыть видео.\n"
-                "         Если «Can't find clang binary»: установите LLVM for Windows (clang.exe + libclang.dll)\n"
-                "           или компонент VS «C++ Clang tools», либо INTEGRA_LLVM_BIN=C:\\\\path\\\\to\\\\LLVM\\\\bin.\n"
-                "           • не задавайте LIBCLANG_PATH на MinGW; переоткройте shell без MSYS в PATH, или\n"
-                "           • установите LLVM for Windows / компонент «Clang» в Visual Studio — run.py подхватит сам, или\n"
-                "           • INTEGRA_KEEP_MSYS_IN_PATH=1 только если осознанно отлаживаете конфликт.\n"
-                "         Либо только пересобрать мост:  python run.py --release --bridge-build-only\n"
-                "         Если в логе build-script opencv — panic при генерации модулей (gapi и т.д.): обновите крейт opencv / привяжите OpenCV к поддерживаемой opencv-rust версии.\n"
-                "         Либо smoke без видео:  python run.py --no-bridge",
+                "         Если «Can't find clang binary»:\n"
+                "           • Linux: sudo apt install clang libclang-dev  (нужен `clang` в PATH)\n"
+                "           • Windows: LLVM / VS «C++ Clang tools», либо INTEGRA_LLVM_BIN=C:\\\\path\\\\to\\\\LLVM\\\\bin\n"
+                "             (не задавайте LIBCLANG_PATH на MinGW; без MSYS в PATH или INTEGRA_KEEP_MSYS_IN_PATH=1)\n"
+                "         Либо только пересобрать мост:  python3 run.py --release --bridge-build-only\n"
+                "         Если в логе opencv — panic при генерации модулей (gapi и т.д.): обновите крейт opencv.\n"
+                "         Smoke без видео:  python3 run.py --release --no-bridge",
                 file=sys.stderr,
             )
             raise SystemExit(br.returncode)

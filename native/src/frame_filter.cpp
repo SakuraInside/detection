@@ -343,6 +343,16 @@ std::vector<Detection> apply_frame_filter(const std::vector<Detection>& in,
       }
       const float nx = (x1 + x2) * 0.5f / fw;
       const float ny = (y1 + y2) * 0.5f / fh;
+      const float elong = mx / mn;
+      // Вертикальный блик на стекле у двери (центр кадра): не канистра.
+      if (elong >= 2.6f && elong <= 9.5f && nx > 0.34f && nx < 0.66f && ny < 0.62f &&
+          area_ratio < 0.028f && d.confidence < 0.62f) {
+        continue;
+      }
+      // Слабая «бутылка» у левого верха — симметрия правого правила (блик/камера).
+      if (nx < 0.37f && ny < 0.54f && area_ratio < 0.009f && d.confidence < 0.58f) {
+        continue;
+      }
       // Слабая «бутылка» у правого верха — часто монитор/блик стойки, не ёмкость.
       if (nx > 0.63f && ny < 0.54f && area_ratio < 0.009f && d.confidence < 0.58f) {
         continue;

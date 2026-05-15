@@ -202,6 +202,28 @@ fn run_session(
     let fps = cap.get(CAP_PROP_FPS).unwrap_or(30.0);
     let frames = cap.get(CAP_PROP_FRAME_COUNT)? as i64;
 
+    // Темп выдачи кадров: не быстрее реального FPS потока из контейнера.
+    // Иначе при FPS в метаданных ~6 и pipeline.target_fps=30 за 1 с стены читается 30 кадров
+    // файла → ~5× ускорение относительно «живого» времени ролика.
+    let stream_fps = if fps.is_finite() && fps > 0.5 && fps <= 240.0 {
+        fps
+    } else {
+        30.0
+    };
+    let pace_fps = if target_fps > 0 {
+        (target_fps as f64).min(stream_fps).max(1.0)
+    } else {
+        stream_fps
+    };
+    if target_fps > 0 && pace_fps + 0.001 < target_fps as f64 {
+        info!(
+            stream_fps,
+            pace_fps,
+            target_fps,
+            "playback pacing capped to stream FPS (avoid fast-forward)"
+        );
+    }
+
     let hs = Handshake {
         r#type: "handshake",
         ok: true,
@@ -262,8 +284,8 @@ fn run_session(
         }
     });
 
-    let period = if target_fps > 0 {
-        Some(Duration::from_secs_f64(1.0 / target_fps as f64))
+    let period = if pace_fps > 0.0 {
+        Some(Duration::from_secs_f64(1.0 / pace_fps))
     } else {
         None
     };

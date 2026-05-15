@@ -164,14 +164,46 @@ echo "engine: ${ENGINE}"
 
 **Альтернатива:** `trtexec --onnx=... --saveEngine=... --fp16`.
 
+### YOLO11s (или другой `.pt`): экспорт ONNX + bake одной командой
+
+На Debian/Ubuntu **PEP 668** запрещает `pip install` в системный Python — используйте **venv** и пересоберите натив после обновления CMake (PIC для `libintegra_ffi.so`):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -U pip
+.venv/bin/pip install -r tools/requirements-trt-export.txt
+rm -rf native/build
+./native/build_integra.sh
+export LD_LIBRARY_PATH="${TENSORRT_ROOT}/lib:${LD_LIBRARY_PATH}"
+chmod +x native/scripts/export_yolo_trt_engine.sh
+./native/scripts/export_yolo_trt_engine.sh models/yolo11s.pt 640 4096
+# если нет models/yolo11s.pt — Ultralytics скачает: ./native/scripts/export_yolo_trt_engine.sh yolo11s.pt 640 4096
+# → models/yolo11s_fp16.engine (как в config.json → native_analytics.model_path)
+```
+
+Аргументы: `[weights.pt] [imgsz] [workspace_mb]`. Переменная **`INTEGRA_EXPORT_PYTHON`** переопределяет интерпретатор (по умолчанию берётся `.venv/bin/python`, если есть).
+
+`imgsz` должен совпадать с `native_analytics.input_size` и желательно с `model.imgsz` в Python.
+
+### Ошибка `libnvinfer_builder_resource_smXX.so... cannot open shared object file`
+
+При **`buildSerializedNetwork`** TensorRT подгружает **`libnvinfer_builder_resource_sm<ваш_CC>.so`** из каталога **`${TENSORRT_ROOT}/lib`** (например **sm89** для RTX 40xx). Скрипты **`trt_bake_cached.sh`** / **`export_yolo_trt_engine.sh`** сами дописывают в **`LD_LIBRARY_PATH`** пути **`lib`** и **`lib/x86_64-linux-gnu`**.
+
+Если ошибка остаётся:
+
+1. Убедитесь, что переменная **`TENSORRT_ROOT`** указывает на **полный** распакованный Linux Tarball с **developer.nvidia.com** (не обрезанный каталог).
+2. Проверьте наличие файла:  
+   `ls "${TENSORRT_ROOT}/lib"/libnvinfer_builder_resource_sm*.so`
+3. Версия TensorRT должна совпадать с той, с которой собран **`integra_trt_bake`** (например **10.16.1**).
+
 ## Запуск
 
 `integra-analyticsd` (опционально, для отладки TCP-протокола; основной UI — Rust `backend_gateway`):
 
 ```bash
 ./build/integra-analyticsd --listen 127.0.0.1:9909 \
-  --engine opencv --model models/yolo11n.onnx --imgsz 640
-# или --engine tensorrt --model models/yolo11n_fp16.engine
+  --engine opencv --model models/yolo11s.onnx --imgsz 640
+# или --engine tensorrt --model models/yolo11s_fp16.engine
 ```
 
 `integra-alarmd` + `integra-pipeline` (автономная демонстрация без Python):

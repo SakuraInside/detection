@@ -27,6 +27,17 @@ const EVENT_UI = {
   disappeared: { title: "Предмет пропал", desc: "Ранее обнаруженный предмет исчез из кадра." },
 };
 
+/** Абсолютный URL API: meta integra-api-base или текущий origin (нужно для встроенных браузеров / другого порта). */
+function apiUrl(path) {
+  const meta = document.querySelector('meta[name="integra-api-base"]');
+  const raw = meta && meta.getAttribute("content");
+  if (raw && raw.trim()) {
+    const b = raw.trim();
+    return new URL(path, b.endsWith("/") ? b : `${b}/`).href;
+  }
+  return new URL(path, `${window.location.origin}/`).href;
+}
+
 // ----------------------------------------------------------- вспомогательные функции
 
 function fmtTime(sec) {
@@ -85,9 +96,11 @@ async function api(method, path, body) {
   if (body !== undefined) opts.body = JSON.stringify(body);
   let r;
   try {
-    r = await fetch(path, opts);
+    r = await fetch(apiUrl(path), opts);
   } catch (e) {
-    throw new Error("Сервер недоступен. Проверьте, что python run.py запущен.");
+    throw new Error(
+      "Сервер недоступен. Запустите python3 run.py --release; откройте http://127.0.0.1:8000 или задайте meta integra-api-base на URL gateway.",
+    );
   }
   if (!r.ok) {
     const text = await r.text();
@@ -557,13 +570,21 @@ async function openVideoFromSystemPicker(file) {
   if (!file) return;
   $("#picked-file-name").textContent = `Загрузка: ${file.name}`;
   const fd = new FormData();
-  fd.append("file", file, file.name);
+  // Без третьего аргумента: в части сборок Firefox ломает multipart при «кривом» имени в Content-Disposition.
+  fd.append("file", file);
   try {
     let r;
     try {
-      r = await fetch("/api/upload_video", { method: "POST", body: fd });
+      r = await fetch(apiUrl("/api/upload_video"), {
+        method: "POST",
+        body: fd,
+        cache: "no-store",
+      });
     } catch (e) {
-      throw new Error("Сервер недоступен. Проверьте, что python run.py запущен.");
+      const detail = e && e.message ? ` ${e.message}.` : "";
+      throw new Error(
+        `Сеть: запрос не дошёл до сервера.${detail} Откройте UI в обычном Chrome/Firefox по http://127.0.0.1:8000 (тот же адрес, что в run.py). Если страница с другого порта — в index.html задайте <meta name="integra-api-base" content="http://127.0.0.1:8000" />. Отключите блокировку localhost в расширениях (uBlock / Privacy Badger).`,
+      );
     }
     if (!r.ok) {
       const t = await r.text();

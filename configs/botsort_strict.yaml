@@ -8,7 +8,7 @@ track_low_thresh: 0.08
 new_track_thresh: 0.28
 
 match_thresh: 0.78
-track_buffer: 55
+track_buffer: 50
 fuse_score: true
 
 gmc_method: none

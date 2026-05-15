@@ -25,8 +25,8 @@ use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State};
+use axum::http::{header, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -35,6 +35,7 @@ use sysinfo::System;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time::{self, Duration};
 use tokio::task::JoinHandle;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 use runtime_core::integra::{
@@ -171,6 +172,20 @@ async fn main() -> anyhow::Result<()> {
     let root = std::env::var("INTEGRA_PROJECT_ROOT")
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
+    let root = match root.canonicalize() {
+        Ok(p) => {
+            info!(root = %p.display(), "project root (canonical)");
+            p
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %root.display(),
+                "project root could not be canonicalized; using path as given"
+            );
+            root
+        }
+    };
 
     let infer_worker_addr = std::env::var("INTEGRA_INFER_WORKER_ADDR").ok();
 
@@ -238,13 +253,28 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/seek", post(api_seek))
         .route("/api/metrics", get(api_metrics))
         .route("/api/files", get(api_files))
+        .route("/api/upload_video", post(api_upload_video))
         .route("/api/streams", get(api_streams))
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/events", get(api_events).delete(api_clear_events))
         .route("/video_snapshot", get(video_snapshot))
         .route("/video_feed", get(video_feed))
         .route("/ws", get(ws_handler))
-        .with_state(state);
+        .with_state(state)
+        // CORS: UI может открываться не с того origin (другой порт / file:// + meta redirect и т.д.).
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(Any),
+        )
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024));
 
     info!(%addr, "backend-gateway listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -576,15 +606,143 @@ async fn api_files(State(state): State<AppState>) -> impl IntoResponse {
                 continue;
             }
             if let Ok(md) = e.metadata() {
+                let fname = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
                 files.push(serde_json::json!({
-                    "name": p.file_name().and_then(|x| x.to_str()).unwrap_or(""),
-                    "path": p.to_string_lossy(),
+                    "name": fname,
+                    "path": format!("data/{fname}"),
                     "size_mb": ((md.len() as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0
                 }));
             }
         }
     }
     Json(serde_json::json!({"data_dir": data_dir.to_string_lossy(), "files": files}))
+}
+
+/// Имя файла из multipart + расширение из белого списка (как в `api_files`).
+fn sanitize_upload_filename(raw: &str) -> Option<String> {
+    let base = FsPath::new(raw).file_name()?.to_str()?;
+    if base.is_empty() || base.contains('\0') {
+        return None;
+    }
+    if base.len() > 240 {
+        return None;
+    }
+    let ext = FsPath::new(base)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    let allowed = ["mkv", "mp4", "avi", "mov", "webm", "m4v"];
+    if !allowed.contains(&ext.as_str()) {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+/// POST multipart, поле `file` — сохранение в `<project>/data/` (как ожидает `static/app.js`).
+async fn api_upload_video(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
+    let data_dir = state.root.join("data");
+    if let Err(e) = fs::create_dir_all(&data_dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("data/: {e}")).into_response();
+    }
+
+    while let Some(mut field) = match multipart.next_field().await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("multipart: {e}")).into_response(),
+    } {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let orig_name = field.file_name().map(|s| s.to_string()).unwrap_or_default();
+        let safe_name = if orig_name.trim().is_empty() {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            format!("upload_{ts}.mkv")
+        } else {
+            match sanitize_upload_filename(&orig_name) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "invalid file name or extension (allowed: .mkv .mp4 .avi .mov .webm .m4v)",
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        let mut dest = data_dir.join(&safe_name);
+        if dest.exists() {
+            let stem = FsPath::new(&safe_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("video");
+            let ext = FsPath::new(&safe_name)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("mkv");
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            dest = data_dir.join(format!("{stem}_{ts}.{ext}"));
+        }
+
+        let mut outfile = match tokio::fs::File::create(&dest).await {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("create: {e}")).into_response(),
+        };
+        let mut total: u64 = 0;
+        const MAX: u64 = 512 * 1024 * 1024;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    total += chunk.len() as u64;
+                    if total > MAX {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "file too large (max 512 MiB)",
+                        )
+                            .into_response();
+                    }
+                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut outfile, &chunk).await {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&dest).await;
+                    return (StatusCode::BAD_REQUEST, format!("read: {e}")).into_response();
+                }
+            }
+        }
+        if total == 0 {
+            let _ = tokio::fs::remove_file(&dest).await;
+            return (StatusCode::BAD_REQUEST, "empty file").into_response();
+        }
+
+        let name = dest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(safe_name.as_str())
+            .to_string();
+
+        info!(%name, bytes = total, "upload_video saved");
+
+        let rel_path = format!("data/{name}");
+
+        return Json(serde_json::json!({
+            "ok": true,
+            "path": rel_path,
+            "name": name,
+        }))
+        .into_response();
+    }
+
+    (StatusCode::BAD_REQUEST, "missing file field").into_response()
 }
 
 async fn api_streams(State(state): State<AppState>) -> impl IntoResponse {
@@ -649,6 +807,65 @@ async fn api_clear_events(State(state): State<AppState>, _stream: Query<StreamQu
 // /api/open, /api/play, /api/pause, /api/seek.
 // ---------------------------------------------------------------------------
 
+/// Каталог `data_root` — префикс пути `file` (оба пути в одном виде компонентов).
+fn path_is_under_data_root(data_root: &FsPath, file: &FsPath) -> bool {
+    let mut dr = data_root.components();
+    let mut fc = file.components();
+    loop {
+        match (dr.next(), fc.next()) {
+            (None, None) => return true,
+            (None, Some(_)) => return true,
+            (Some(_), None) => return false,
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Каталог `data/` (канонический) содержит файл `path` (канонический).
+/// Дополнительно: сравнение по строке с разделителем — иногда надёжнее, чем только `components()`.
+fn file_is_inside_data_dir(data_dir: &FsPath, path: &FsPath) -> bool {
+    let Ok(dc) = data_dir.canonicalize() else {
+        return false;
+    };
+    let Ok(pc) = path.canonicalize() else {
+        return false;
+    };
+    if path_is_under_data_root(&dc, &pc) {
+        return true;
+    }
+    let d = dc.to_string_lossy();
+    let p = pc.to_string_lossy();
+    let sep = std::path::MAIN_SEPARATOR;
+    let d_trim = d.trim_end_matches(sep);
+    let p_trim = p.trim_end_matches(sep);
+    p_trim == d_trim || p_trim.starts_with(&format!("{d_trim}{sep}"))
+}
+
+/// Безопасное имя файла (без `/`, `\`, `..`) для поиска только в `<root>/data/`.
+fn safe_data_basename(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.contains('/') || raw.contains('\\') || raw.contains("..") {
+        return None;
+    }
+    let name = FsPath::new(raw).file_name()?.to_str()?.to_string();
+    if name != raw {
+        return None;
+    }
+    let ext = FsPath::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    let allowed = ["mkv", "mp4", "avi", "mov", "webm", "m4v"];
+    if !allowed.contains(&ext.as_str()) {
+        return None;
+    }
+    Some(name)
+}
+
 /// Разрешить открытие только видеофайлов внутри `<project>/data/` (после `canonicalize`).
 /// Иначе клиент с доступом к HTTP API может передать абсолютный путь и заставить
 /// video-bridge читать произвольные файлы на машине с бэкендом.
@@ -657,26 +874,57 @@ fn resolve_open_video_path(root: &FsPath, raw: &str) -> Result<PathBuf, String> 
     if raw.is_empty() {
         return Err("path is required".to_string());
     }
+
+    let root_candidates: Vec<PathBuf> = {
+        let mut v = vec![root.to_path_buf()];
+        match root.canonicalize() {
+            Ok(c) if c.as_path() != root => v.push(c),
+            _ => {}
+        }
+        v
+    };
+
     let joined = if FsPath::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
         root.join(raw)
     };
-    let canon_file = joined
-        .canonicalize()
-        .map_err(|_| "video file not found or inaccessible".to_string())?;
-    let data_dir = root.join("data");
-    fs::create_dir_all(&data_dir).map_err(|e| format!("data/: {e}"))?;
-    let canon_data = data_dir
-        .canonicalize()
-        .map_err(|e| format!("data/: {e}"))?;
-    if !canon_file.starts_with(&canon_data) {
-        return Err("video path must be inside the project data/ directory".to_string());
+
+    match joined.canonicalize() {
+        Ok(canon_file) => {
+            for r in &root_candidates {
+                let data_dir = r.join("data");
+                let _ = fs::create_dir_all(&data_dir);
+                if let Ok(canon_data) = data_dir.canonicalize() {
+                    if file_is_inside_data_dir(&canon_data, &canon_file) && canon_file.is_file() {
+                        return Ok(canon_file);
+                    }
+                }
+            }
+        }
+        Err(_) if FsPath::new(raw).is_absolute() => {
+            return Err("video file not found or inaccessible".to_string());
+        }
+        Err(_) => {}
     }
-    if !canon_file.is_file() {
-        return Err("path is not a regular file".to_string());
+
+    // 2) Только имя файла: `clip.mkv` → единственный кандидат в `<root>/data/clip.mkv`.
+    if let Some(base) = safe_data_basename(raw) {
+        for r in &root_candidates {
+            let candidate = r.join("data").join(&base);
+            if let Ok(canon_file) = candidate.canonicalize() {
+                let data_dir = r.join("data");
+                let _ = fs::create_dir_all(&data_dir);
+                if let Ok(canon_data) = data_dir.canonicalize() {
+                    if file_is_inside_data_dir(&canon_data, &canon_file) && canon_file.is_file() {
+                        return Ok(canon_file);
+                    }
+                }
+            }
+        }
     }
-    Ok(canon_file)
+
+    Err("video path must be inside the project data/ directory".to_string())
 }
 
 async fn api_open(State(state): State<AppState>, Json(req): Json<OpenRequest>) -> impl IntoResponse {
@@ -1622,6 +1870,26 @@ mod open_path_tests {
         let abs = outside.canonicalize().unwrap();
         let err = resolve_open_video_path(&tmp, abs.to_str().unwrap()).unwrap_err();
         assert!(err.contains("data/"));
+    }
+
+    #[test]
+    fn resolve_accepts_basename_only() {
+        let tmp = std::env::temp_dir().join(format!("integra_open_base_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("data")).unwrap();
+        fs::write(tmp.join("data").join("only.mp4"), b"x").unwrap();
+        let got = resolve_open_video_path(&tmp, "only.mp4").unwrap();
+        assert!(got.ends_with("only.mp4"));
+    }
+
+    #[test]
+    fn resolve_accepts_data_relative_from_api_files() {
+        let tmp = std::env::temp_dir().join(format!("integra_open_relapi_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("data")).unwrap();
+        fs::write(tmp.join("data").join("clip.mkv"), b"x").unwrap();
+        let got = resolve_open_video_path(&tmp, "data/clip.mkv").unwrap();
+        assert!(got.ends_with("clip.mkv"));
     }
 
     #[test]

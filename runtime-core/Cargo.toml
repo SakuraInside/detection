@@ -14,7 +14,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
 async-stream = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # C++ FFI к integra_ffi.dll / libintegra_ffi.so (см. native/include/integra/integra_ffi.h).
@@ -27,6 +27,7 @@ once_cell = "1"
 sysinfo = { version = "0.30", default-features = false }
 # CLI-парсинг аргументов для infer_worker.
 clap = { version = "4", features = ["derive"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
 [[bin]]
 name = "infer_worker"

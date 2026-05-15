@@ -57,7 +57,7 @@ tracker → FSM) исполняется в C++ / CUDA, без переключе
 ├── static/              # Frontend (index.html, app.js, styles.css)
 ├── data/                # Видеофайлы (mkv, mp4, ...)
 ├── logs/snapshots/      # JPEG snapshots алармовых событий (создаётся автоматически)
-├── models/              # Веса (yolo11n.onnx, yolo11n.engine, ...)
+├── models/              # Веса (yolo11s.pt / .onnx / yolo11s_fp16.engine — см. native/scripts/export_yolo_trt_engine.sh)
 ├── config.json          # Параметры pipeline (engine, conf/iou, analyzer thresholds)
 ├── run.py               # Python-launcher: запускает video-bridge + backend_gateway
 └── README.md
@@ -85,23 +85,29 @@ cmake --build native/build --target integra_ffi -j
 
 Детали — в [`native/README.md`](native/README.md).
 
-### 3.2. Rust workspace
+### 3.2. Rust (`video-bridge` + `backend_gateway`)
+
+Отдельные crate’ы (в корне нет общего `Cargo.toml`):
 
 ```bash
-cargo build --release --workspace
+cargo build --release --manifest-path video-bridge/Cargo.toml
+cargo build --release --manifest-path runtime-core/Cargo.toml --bin backend_gateway
 ```
+
+Проще: **`python3 run.py --release`** сам вызовет `cargo` в этих каталогах (после сборки **`libintegra_ffi.so`**).
 
 Для `video-bridge` нужен libclang (зависимость `opencv-rust` через
 bindgen):
 - Windows: `pip install libclang` → `LIBCLANG_PATH=.venv\Lib\site-packages\clang\native`;
-- Linux: `apt install libclang-dev`.
+- Linux: `apt install clang libclang-dev` (нужен бинарник **`clang`** в `PATH` для bindgen).
 
 ### 3.3. TensorRT: сборка `.engine` из `.onnx` (C++ `integra_trt_bake`, без Python)
 
 Рантайм ожидает **уже собранный** serialized engine (см. `native_analytics.model_path`).
 
 - Утилита **`integra_trt_bake`** (сборка натива с **`INTEGRA_WITH_TENSORRT=ON`**):  
-  `integra_trt_bake --onnx models/yolo11n.onnx --out models/yolo11n_fp16.engine --fp16 --workspace-mb 4096`
+  `integra_trt_bake --onnx models/yolo11s.onnx --out models/yolo11s_fp16.engine --fp16 --workspace-mb 4096`  
+  или `./native/scripts/export_yolo_trt_engine.sh` (pt→onnx→engine, см. native/README.md)
 - Кеш (Linux): **`native/scripts/trt_bake_cached.sh`** (sha256 + compute capability).
 - **Windows (MSVC):** **`native/scripts/build_engine_msvc.ps1`** — CMake + `integra_trt_bake` + `integra_ffi` (параметры `-OpenCvDir`, `-TensorRtRoot` или переменные `INTEGRA_OPENCV_DIR` / `TENSORRT_ROOT`).
 
@@ -129,7 +135,7 @@ bindgen):
 .\scripts\run_backend_gateway.ps1
 ```
 
-Скрипт выставляет `INTEGRA_PROJECT_ROOT`, `INTEGRA_FFI_PATH`, дописывает в `PATH` каталоги **TensorRT `bin`**, **CUDA `bin`**, **OpenCV `bin`** (пути в начале `scripts/run_backend_gateway.ps1` при необходимости поправьте). Нужны собранные `integra_ffi.dll` и `models/yolo11n_fp16.engine` (см. §3).
+Скрипт выставляет `INTEGRA_PROJECT_ROOT`, `INTEGRA_FFI_PATH`, дописывает в `PATH` каталоги **TensorRT `bin`**, **CUDA `bin`**, **OpenCV `bin`** (пути в начале `scripts/run_backend_gateway.ps1` при необходимости поправьте). Нужны собранные `integra_ffi.dll` и `models/yolo11s_fp16.engine` (см. §3 и `native/scripts/export_yolo_trt_engine.sh`).
 
 **Через Python-launcher (как раньше):**
 
@@ -178,6 +184,7 @@ UI откроется на [http://127.0.0.1:8000](http://127.0.0.1:8000).
 |  POST | `/api/seek`                   | `{"frame":N}` — seek по номеру кадра             |
 |  GET  | `/api/metrics`                | process RSS/CPU + system + pipeline EMA          |
 |  GET  | `/api/files`                  | Список видео в `data/`                            |
+|  POST | `/api/upload_video`           | Multipart, поле `file` — загрузка в `data/` (до 512 MiB) |
 |  GET  | `/api/streams`                | Список стримов                                    |
 |  GET  | `/api/events?limit=N`         | Лог последних событий                             |
 |  GET/PUT | `/api/settings`            | Чтение / deep-merge правка `config.json`         |
@@ -202,7 +209,7 @@ WS-сообщения:
 {
   "native_analytics": {
     "engine": "tensorrt",
-    "model_path": "models/yolo11n_fp16.engine",
+    "model_path": "models/yolo11s_fp16.engine",
     "input_size": 640
   },
   "model": {

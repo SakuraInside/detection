@@ -11,6 +11,11 @@
 #
 set -euo pipefail
 
+# integra_trt_bake подгружает libnvinfer_builder_resource_smXX.so.* из каталога TensorRT (не только libnvinfer.so).
+if [[ -n "${TENSORRT_ROOT:-}" ]]; then
+  export LD_LIBRARY_PATH="${TENSORRT_ROOT}/lib:${TENSORRT_ROOT}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+fi
+
 ONNX_PATH="${1:?usage: $0 /path/to/model.onnx [workspace_mb]}"
 WS_MB="${2:-4096}"
 
@@ -65,7 +70,8 @@ if [[ -f "${OUT}" ]]; then
 fi
 
 TMP="${OUT}.tmp.$$"
-"${BAKER}" --onnx "${ONNX_PATH}" --out "${TMP}" --fp16 --workspace-mb "${WS_MB}"
+# integra_trt_bake пишет «записано …tmp…» в stdout — иначе $(...) захватит несколько строк и сломает cp.
+"${BAKER}" --onnx "${ONNX_PATH}" --out "${TMP}" --fp16 --workspace-mb "${WS_MB}" >&2
 mv -f "${TMP}" "${OUT}"
 echo "Wrote ${OUT}" >&2
 echo "${OUT}"

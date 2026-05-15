@@ -1,0 +1,11 @@
+# Экспорт YOLO .pt → ONNX и дальше integra_trt_bake (см. native/scripts/export_yolo_trt_engine.sh).
+#
+# Debian/Ubuntu (PEP 668 — «externally-managed-environment»): не ставьте в системный Python.
+# Из корня репозитория:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -U pip
+#   .venv/bin/pip install -r tools/requirements-trt-export.txt
+#   export INTEGRA_EXPORT_PYTHON="$PWD/.venv/bin/python"   # опционально; скрипт сам найдёт .venv
+#
+ultralytics>=8.3.0
+onnx>=1.14.0
