@@ -162,8 +162,8 @@
     "addr": "127.0.0.1:9909",
     "timeout_sec": 4.0,
     "fallback_to_python": true,
-    "engine": "tensorrt",
-    "model_path": "models/yolo11n_fp16.engine",
+    "engine": "onnx",
+    "model_path": "models/yolo11s.onnx",
     "input_size": 640,
     "require_real_engine": true
   },

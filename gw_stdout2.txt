@@ -1,0 +1,2 @@
+[2m2026-05-15T02:13:03.773944Z[0m [32m INFO[0m [2mbackend_gateway[0m[2m:[0m integra_ffi loaded [3mversion[0m[2m=[0mintegra-ffi 0.1.0
+[2m2026-05-15T02:13:03.775871Z[0m [32m INFO[0m [2mbackend_gateway[0m[2m:[0m backend-gateway listening [3maddr[0m[2m=[0m127.0.0.1:8000

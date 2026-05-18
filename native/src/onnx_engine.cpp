@@ -12,6 +12,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #if INTEGRA_HAS_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -43,7 +47,16 @@ class OnnxEngine final : public IInferenceEngine {
         so.AppendExecutionProvider_CUDA(cuda_opts);
       }
 #endif
+#ifdef _WIN32
+      {
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, cfg.model_path.c_str(), -1, nullptr, 0);
+        std::wstring wpath(wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, cfg.model_path.c_str(), -1, wpath.data(), wlen);
+        session_ = std::make_unique<Ort::Session>(env_, wpath.c_str(), so);
+      }
+#else
       session_ = std::make_unique<Ort::Session>(env_, cfg.model_path.c_str(), so);
+#endif
     } catch (const Ort::Exception& e) {
       std::cerr << "integra: ONNX Runtime: " << e.what() << "\n";
       return false;
