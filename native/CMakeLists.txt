@@ -20,7 +20,7 @@ if(INTEGRA_WITH_TENSORRT AND NOT INTEGRA_ENABLE_CUDA)
   message(FATAL_ERROR "INTEGRA_WITH_TENSORRT=ON требует INTEGRA_ENABLE_CUDA=ON")
 endif()
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio dnn)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio dnn video)
 find_package(Threads REQUIRED)
 
 if(INTEGRA_ENABLE_CUDA)
@@ -41,6 +41,8 @@ add_library(integra_core STATIC
   src/yolo_postprocess.cpp
   src/yolo_letterbox.cpp
   src/iou_tracker.cpp
+  src/byte_track.cpp
+  src/frame_diff_detector.cpp
   src/scene_analyzer.cpp
   src/alarm_sink.cpp
   src/frame_filter.cpp

@@ -1,6 +1,6 @@
 # Integra Native (C++ / CUDA)
 
-Нативный рантайм пайплайна детекции: **декод (OpenCV) → препроцесс (CUDA/CPU) → инференс (TensorRT / ONNX Runtime / OpenCV DNN / stub) → IoU-трекер → FSM `SceneAnalyzer` → события в `integra-alarmd` или FFI / TCP-клиенты**.
+Нативный рантайм пайплайна детекции (два контура по ТЗ): **декод (OpenCV) → препроцесс (CUDA/CPU) → инференс YOLOv11 по всему кадру → [люди cls=0 → `ByteTracker`] + [class-agnostic объекты сцены: `FrameDiffDetector` → `IouTracker`] → поведенческая FSM `SceneAnalyzer` → события в `integra-alarmd` или FFI / TCP-клиенты**. Полная схема — [`../docs/architecture.md`](../docs/architecture.md).
 
 Состоит из библиотеки `integra_core` и исполняемых утилит (см. таблицу ниже + опционально `integra_trt_bake` при `INTEGRA_WITH_TENSORRT=ON`).
 
@@ -30,8 +30,10 @@ native/
 │   ├── inference_engine.hpp    # IInferenceEngine + make_inference_engine() (фабрика)
 │   ├── yolo_postprocess.hpp    # PostprocessParams, decode + NMS, selftest
 │   ├── gpu_preprocess.hpp      # GpuLetterboxPrep: BGR→NCHW float (CUDA path / CPU fallback)
-│   ├── iou_tracker.hpp         # Лёгкий IoU-трекер (временная замена BoT-SORT)
-│   ├── scene_analyzer.hpp      # AnalyzerParams + FSM abandoned / unattended / disappeared
+│   ├── byte_track.hpp         # ByteTracker (Kalman + two-stage) — устойчивые ID людей (cls=0)
+│   ├── iou_tracker.hpp         # IoU-трекер для class-agnostic регионов сцены (контур M3)
+│   ├── frame_diff_detector.hpp # FrameDiffDetector: class-agnostic объекты из изменений кадра
+│   ├── scene_analyzer.hpp      # AnalyzerParams + поведенческая FSM (5 событий ТЗ)
 │   ├── alarm_sink.hpp          # TCP-клиент JSON-lines → integra-alarmd
 │   ├── video_source.hpp        # OpenCV VideoCapture wrapper
 │   └── pipeline.hpp            # Склейка всех этапов в один проход
@@ -45,8 +47,10 @@ native/
 │   ├── video_source.cpp        # Чтение кадров OpenCV-ом (file / stream)
 │   ├── gpu_preprocess.cpp      # CUDA-вариант + CPU fallback (letterbox + нормализация)
 │   ├── yolo_postprocess.cpp    # Декод выхода YOLO + class-aware NMS
-│   ├── iou_tracker.cpp         # Сопоставление треков по IoU
-│   ├── scene_analyzer.cpp      # FSM abandoned / unattended / disappeared (порт логики analyzer)
+│   ├── byte_track.cpp         # ByteTrack: Kalman, BYTE-ассоциация, венгерское назначение
+│   ├── iou_tracker.cpp         # Сопоставление class-agnostic регионов по IoU + центроид
+│   ├── frame_diff_detector.cpp # Пиксельная разница + градиент Собеля → регионы-кандидаты
+│   ├── scene_analyzer.cpp      # Поведенческая FSM: object_left/unattended/removed/missing + person_interaction
 │   ├── alarm_sink.cpp          # TCP-клиент к integra-alarmd
 │   │
 │   ├── trt_bake_main.cpp       # integra_trt_bake: ONNX → serialized engine (nvonnxparser)
@@ -70,7 +74,7 @@ native/
 | Куда подключать                | Файл                                                              |
 | ------------------------------ | ----------------------------------------------------------------- |
 | Новый inference backend        | `include/integra/inference_engine.hpp` + новый `src/*_engine.cpp`, регистрация в `make_inference_engine()` |
-| Замена IoU-трекера на BoT-SORT | `include/integra/iou_tracker.hpp` / `src/iou_tracker.cpp`         |
+| Трекер людей (ByteTrack)       | `include/integra/byte_track.hpp` / `src/byte_track.cpp`           |
 | Бизнес-правила тревог          | `include/integra/scene_analyzer.hpp` / `src/scene_analyzer.cpp`   |
 | Anti-noise фильтр на кадр      | `include/integra/frame_filter.hpp` / `src/frame_filter.cpp` (общий для analyticsd и FFI) |
 | Транспорт событий              | `src/alarm_sink.cpp` (текущий формат — JSON-lines поверх TCP)     |

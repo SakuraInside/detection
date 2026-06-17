@@ -48,3 +48,10 @@ smoke-*.log
 
 # ONNX веса часто сотни МБ — держите локально или через LFS
 models/*.onnx
+
+# Локальные отладочные артефакты (рендеры/логи прогона, не для репо)
+debug_frames/
+run_log.txt
+err.txt
+live_snapshot.jpg
+*.output

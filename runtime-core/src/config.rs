@@ -140,6 +140,66 @@ pub fn build_pipeline_config(root: &Path, cfg: &serde_json::Value) -> PipelineCo
         }
     }
 
+    // ByteTrack (class-based контур людей): секция model.tracker.
+    if let Some(t) = cfg.get("model").and_then(|m| m.get("tracker")) {
+        if let Some(v) = t.get("high_thresh").and_then(|v| v.as_f64()) {
+            p.bytetrack_high_thresh = v as f32;
+        }
+        if let Some(v) = t.get("low_thresh").and_then(|v| v.as_f64()) {
+            p.bytetrack_low_thresh = v as f32;
+        }
+        if let Some(v) = t.get("new_thresh").and_then(|v| v.as_f64()) {
+            p.bytetrack_new_thresh = v as f32;
+        }
+        if let Some(v) = t.get("match_thresh").and_then(|v| v.as_f64()) {
+            p.bytetrack_match_thresh = v as f32;
+        }
+        if let Some(v) = t.get("track_buffer").and_then(|v| v.as_i64()) {
+            p.bytetrack_buffer = v as i32;
+        }
+        if let Some(v) = t.get("frame_rate").and_then(|v| v.as_f64()) {
+            p.bytetrack_frame_rate = v as f32;
+        }
+    }
+    // Частота кадров источника → time-to-live потерянных треков ByteTrack.
+    if let Some(v) = cfg
+        .get("pipeline")
+        .and_then(|pp| pp.get("target_fps"))
+        .and_then(|v| v.as_f64())
+    {
+        if v > 0.0 {
+            p.bytetrack_frame_rate = v as f32;
+        }
+    }
+
+    // class-agnostic объекты сцены + семантика контуров (секция analyzer).
+    if let Some(a) = cfg.get("analyzer") {
+        if let Some(v) = a.get("track_only_persons").and_then(|v| v.as_bool()) {
+            p.track_only_persons = v;
+        }
+        if let Some(v) = a.get("use_frame_diff_detector").and_then(|v| v.as_bool()) {
+            p.object_candidates_enabled = v;
+        }
+        if let Some(v) = a.get("frame_diff_buffer_size").and_then(|v| v.as_i64()) {
+            p.frame_diff_buffer_size = v as i32;
+        }
+        if let Some(v) = a.get("frame_diff_pixel_threshold").and_then(|v| v.as_f64()) {
+            p.frame_diff_pixel_threshold = v as f32;
+        }
+        if let Some(v) = a
+            .get("frame_diff_gradient_threshold")
+            .and_then(|v| v.as_f64())
+        {
+            p.frame_diff_gradient_threshold = v as f32;
+        }
+        if let Some(v) = a
+            .get("frame_diff_min_region_area_px")
+            .and_then(|v| v.as_i64())
+        {
+            p.frame_diff_min_region_area_px = v as i32;
+        }
+    }
+
     p.camera_id = "main".to_string();
     p
 }

@@ -1,6 +1,9 @@
 #include "integra/pipeline.hpp"
 
 #include "integra/alarm_sink.hpp"
+#include "integra/byte_track.hpp"
+#include "integra/frame_diff_detector.hpp"
+#include "integra/geom.hpp"
 #include "integra/gpu_preprocess.hpp"
 #include "integra/inference_engine.hpp"
 #include "integra/iou_tracker.hpp"
@@ -16,6 +19,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,23 +37,6 @@ static void parse_alarm_addr(const std::string& spec, std::string& host, int& po
   }
   host = spec.substr(0, pos);
   port = std::atoi(spec.substr(pos + 1).c_str());
-}
-
-/// Статический «бутылка» в координатах feed (640×640), если модель ничего не вернула.
-static void apply_synth_bbox(int feed_w, int feed_h, DetectionBatch& dets) {
-  if (!dets.items.empty()) {
-    return;
-  }
-  Detection d;
-  d.class_id = 39;
-  d.cls_name = "bottle";
-  d.confidence = 0.95f;
-  const float side = static_cast<float>(std::min(feed_w, feed_h));
-  const float m = 0.2f * side;
-  const float cx = feed_w * 0.5f;
-  const float cy = feed_h * 0.55f;
-  d.bbox = {cx - m, cy - m, cx + m, cy + m};
-  dets.items.push_back(d);
 }
 
 }  // namespace
@@ -84,8 +71,16 @@ int run_pipeline(const PipelineConfig& cfg) {
     return 3;
   }
 
-  IouTracker tracker(0.35f, 10, true);
+  // M2 (class-based): люди — ByteTrack. M3 (class-agnostic): объекты — IoU + центроид.
+  ByteTracker person_tracker;
+  IouTracker object_tracker(0.35f, 10, true);
   SceneAnalyzer analyzer(cfg.analyzer);
+  std::unique_ptr<FrameDiffDetector> diff_detector;
+  if (cfg.analyzer.use_frame_diff_detector) {
+    diff_detector =
+        std::make_unique<FrameDiffDetector>(cfg.analyzer.frame_diff_buffer_size);
+  }
+  const int person_class_id = cfg.analyzer.person_class_id;
 
 #if INTEGRA_HAS_CUDA
   int pw = 0, ph = 0;
@@ -157,33 +152,52 @@ int run_pipeline(const PipelineConfig& cfg) {
     }
     infer_ms_acc += static_cast<double>(dets.inference_ms);
 
-    if (cfg.synth_detect) {
-      apply_synth_bbox(feed.cols, feed.rows, dets);
-    }
-
     if (cfg.inference_input_size > 0) {
       yolo_unletterbox_dets(dets.items, letter, bgr.cols, bgr.rows);
     }
 
-    tracker.update(dets.items, bgr.cols, bgr.rows);
-
+    // M2 (class-based): люди cls=0 → ByteTrack (устойчивые ID).
     std::vector<Detection> persons;
-    std::vector<Detection> objects;
-    persons.reserve(dets.items.size());
-    objects.reserve(dets.items.size());
     for (const auto& d : dets.items) {
-      if (d.class_id == cfg.analyzer.person_class_id) {
+      if (d.class_id == person_class_id) {
         persons.push_back(d);
-      } else {
-        objects.push_back(d);
       }
+    }
+    person_tracker.update(persons, bgr.cols, bgr.rows);
+
+    // M3 (class-agnostic): регионы-кандидаты из FrameDiffDetector (имя класса не присваивается).
+    std::vector<Detection> objects;
+    if (diff_detector) {
+      auto regions = diff_detector->process_frame(
+          bgr, cfg.analyzer.frame_diff_pixel_threshold,
+          cfg.analyzer.frame_diff_gradient_threshold,
+          cfg.analyzer.frame_diff_min_region_area_px);
+      for (const auto& region : regions) {
+        bool on_person = false;
+        for (const auto& per : persons) {
+          if (iou_xyxy(per.bbox, region.bbox) > 0.20f) {
+            on_person = true;
+            break;
+          }
+        }
+        if (on_person) {
+          continue;
+        }
+        Detection det;
+        det.bbox = region.bbox;
+        det.confidence = std::min(1.f, region.combined_score / 255.f);
+        det.class_id = -1;  // class-agnostic
+        det.cls_name = "object";
+        objects.push_back(det);
+      }
+      object_tracker.update(objects, bgr.cols, bgr.rows);
     }
 
     const double ts =
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 
     std::vector<AlarmEvent> alarm_evts =
-        analyzer.ingest(ts, meta.pos_ms, cfg.camera_id, objects, persons, bgr.cols, bgr.rows);
+        analyzer.ingest(ts, meta.pos_ms, cfg.camera_id, objects, persons, bgr.cols, bgr.rows, bgr);
     if (alarms.is_configured()) {
       for (const auto& ev : alarm_evts) {
         alarms.send(ev);

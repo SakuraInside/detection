@@ -37,7 +37,7 @@ struct DetectionBatch {
 
 /// Событие для внешней системы (JSON line → integra-alarmd или SIEM).
 struct AlarmEvent {
-  std::string type;       // abandoned | disappeared | ...
+  std::string type;       // person_interaction | object_left | object_unattended | object_removed | object_missing
   std::string camera_id;
   std::int64_t track_id = -1;
   int cls_id = 0;

@@ -6,7 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Алерт от SceneAnalyzer (abandoned / disappeared / …).
+/// Событие сцены от SceneAnalyzer: person_interaction / object_left /
+/// object_unattended / object_removed / object_missing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AlarmEvent {
     #[serde(rename = "type")]

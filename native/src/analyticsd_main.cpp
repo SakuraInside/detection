@@ -5,7 +5,10 @@
 // Build: this executable links integra_core. For real inference you must build
 // with -DINTEGRA_WITH_TENSORRT=ON and provide --engine tensorrt + --model .engine.
 
+#include "integra/byte_track.hpp"
+#include "integra/frame_diff_detector.hpp"
 #include "integra/frame_filter.hpp"
+#include "integra/geom.hpp"
 #include "integra/gpu_preprocess.hpp"
 #include "integra/inference_engine.hpp"
 #include "integra/iou_tracker.hpp"
@@ -22,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -361,13 +365,16 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
   }
 
   integra::GpuLetterboxPrep prep;
-  integra::IouTracker tracker(trk_iou, trk_miss, trk_soft);
+  // M2 (class-based): люди — ByteTrack. M3 (class-agnostic): объекты — IoU + FrameDiff.
+  integra::ByteTracker person_tracker;
+  integra::IouTracker object_tracker(trk_iou, trk_miss, trk_soft);
   integra::SceneAnalyzer analyzer(session_cfg.ap);
-  std::vector<int> object_classes;
-  parse_i32_array_field(line, "object_classes", object_classes);
-  object_classes.erase(
-      std::remove(object_classes.begin(), object_classes.end(), session_cfg.ap.person_class_id),
-      object_classes.end());
+  std::unique_ptr<integra::FrameDiffDetector> diff_detector;
+  if (session_cfg.ap.use_frame_diff_detector) {
+    diff_detector = std::make_unique<integra::FrameDiffDetector>(
+        session_cfg.ap.frame_diff_buffer_size);
+  }
+  const int person_class_id = session_cfg.ap.person_class_id;
 
 #if INTEGRA_HAS_CUDA
   int pw = 0, ph = 0;
@@ -380,7 +387,9 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
   while (true) {
     if (!read_line(c, line)) break;
     if (has_type(line, "reset")) {
-      tracker.reset();
+      person_tracker.reset();
+      object_tracker.reset();
+      if (diff_detector) diff_detector->reset();
       analyzer.reset();
       if (!send_all(c, reset_ok())) {
         break;
@@ -465,37 +474,46 @@ static void handle_client(socket_t c, const ServerConfig& cfg) {
     if (cfg.input_size > 0) {
       integra::yolo_unletterbox_dets(batch.items, lb, bgr.cols, bgr.rows);
     }
-    // Отсекаем нерелевантные классы до трекера/FSM:
-    // это резко снижает ложные треки и RAM на сцене без деградации целевого кейса.
-    std::vector<integra::Detection> filtered;
-    filtered.reserve(batch.items.size());
+    // M2 (class-based): люди cls=0 из YOLO → фильтр → ByteTrack (устойчивые ID).
+    std::vector<integra::Detection> persons;
     for (const auto& d : batch.items) {
-      if (is_relevant_class(d.class_id, session_cfg.ap.person_class_id, object_classes)) {
-        filtered.push_back(d);
-      }
+      if (d.class_id == person_class_id) persons.push_back(d);
     }
-    batch.items = apply_frame_filter(filtered, bgr.cols, bgr.rows, session_cfg.ap.person_class_id, ff);
-    integra::merge_same_class_objects_only(batch.items, session_cfg.ap.person_class_id, 0.48f);
-    integra::merge_luggage_cross_class_by_iou(batch.items, session_cfg.ap.person_class_id, 0.38f);
-    integra::suppress_duplicate_bottles_by_iou(batch.items, session_cfg.ap.person_class_id, 0.40f);
-
+    persons = apply_frame_filter(persons, bgr.cols, bgr.rows, person_class_id, ff);
     auto t3 = std::chrono::steady_clock::now();
-    tracker.update(batch.items, bgr.cols, bgr.rows);
+    person_tracker.update(persons, bgr.cols, bgr.rows);
     auto t4 = std::chrono::steady_clock::now();
 
-    std::vector<integra::Detection> persons;
+    // M3 (class-agnostic): регионы-кандидаты из FrameDiffDetector (имя класса не присваивается).
     std::vector<integra::Detection> objects;
-    persons.reserve(batch.items.size());
-    objects.reserve(batch.items.size());
-    for (const auto& d : batch.items) {
-      if (d.class_id == session_cfg.ap.person_class_id) persons.push_back(d);
-      else objects.push_back(d);
+    if (diff_detector) {
+      auto regions = diff_detector->process_frame(
+          bgr, session_cfg.ap.frame_diff_pixel_threshold,
+          session_cfg.ap.frame_diff_gradient_threshold,
+          session_cfg.ap.frame_diff_min_region_area_px);
+      for (const auto& region : regions) {
+        bool on_person = false;
+        for (const auto& per : persons) {
+          if (integra::iou_xyxy(per.bbox, region.bbox) > 0.20f) {
+            on_person = true;
+            break;
+          }
+        }
+        if (on_person) continue;
+        integra::Detection det;
+        det.bbox = region.bbox;
+        det.confidence = std::min(1.f, region.combined_score / 255.f);
+        det.class_id = -1;  // class-agnostic
+        det.cls_name = "object";
+        objects.push_back(det);
+      }
+      object_tracker.update(objects, bgr.cols, bgr.rows);
     }
 
     const double ts = now_wall_sec();
     auto t5 = std::chrono::steady_clock::now();
     std::vector<integra::AlarmEvent> evs =
-        analyzer.ingest(ts, pos_ms, "main", objects, persons, bgr.cols, bgr.rows);
+        analyzer.ingest(ts, pos_ms, "main", objects, persons, bgr.cols, bgr.rows, bgr);
     auto t6 = std::chrono::steady_clock::now();
     std::vector<integra::TrackSnapshot> tracks = analyzer.tracks_snapshot(ts);
 
@@ -554,6 +572,8 @@ int main(int argc, char** argv) {
   cfg.ap.min_object_area_px = 100.0;
   cfg.ap.centroid_history_maxlen = 72;
   cfg.ap.max_active_tracks = 256;
+  // M3: class-agnostic объекты сцены через FrameDiffDetector (по умолчанию включено).
+  cfg.ap.use_frame_diff_detector = true;
 
   socket_t srv = static_cast<socket_t>(socket(AF_INET, SOCK_STREAM, 0));
   if (

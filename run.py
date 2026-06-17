@@ -181,7 +181,7 @@ def _ensure_clang_for_opencvrs(env: dict[str, str]) -> bool:
         if layout:
             cb, lcd = layout
             apply_layout(cb, lcd)
-            print(f"[run.py] LLVM toolchain → clang={cb}, LIBCLANG_PATH={lcd}", flush=True)
+            print(f"[run.py] LLVM toolchain -> clang={cb}, LIBCLANG_PATH={lcd}", flush=True)
             return True
 
     w = shutil.which("clang.exe") or shutil.which("clang")
@@ -191,7 +191,7 @@ def _ensure_clang_for_opencvrs(env: dict[str, str]) -> bool:
         if layout:
             cb, lcd = layout
             apply_layout(cb, lcd)
-            print(f"[run.py] LLVM из PATH → clang={cb}, LIBCLANG_PATH={lcd}", flush=True)
+            print(f"[run.py] LLVM из PATH -> clang={cb}, LIBCLANG_PATH={lcd}", flush=True)
             return True
 
     print(
@@ -293,7 +293,7 @@ def _sync_opencv_dnn_cuda_env(root: Path, env: dict[str, str]) -> None:
         if "cuda" in dev:
             env["INTEGRA_OPENCV_DNN_CUDA"] = "1"
             print(
-                "[run.py] model.device указывает CUDA → INTEGRA_OPENCV_DNN_CUDA=1 для OpenCV DNN.\n"
+                "[run.py] model.device указывает CUDA -> INTEGRA_OPENCV_DNN_CUDA=1 для OpenCV DNN.\n"
                 "         Нужен OpenCV, собранный с CUDA/cuDNN; иначе останется CPU (~100+ мс на кадр).",
                 flush=True,
             )
@@ -342,7 +342,7 @@ def _add_tensorrt_to_path(env: dict[str, str]) -> None:
     for d in candidates:
         if d.is_dir() and any(d.glob("nvinfer_10.dll")):
             env["PATH"] = str(d.resolve()) + os.pathsep + env.get("PATH", "")
-            print(f"[run.py] TensorRT DLLs → {d}", flush=True)
+            print(f"[run.py] TensorRT DLLs -> {d}", flush=True)
             return
     print(
         "[run.py] Предупреждение: nvinfer_10.dll не найдена.\n"
@@ -404,7 +404,22 @@ def main() -> None:
         default=60.0,
         help="сколько ждать старта infer_worker (секунды)",
     )
+    parser.add_argument(
+        "--py-infer",
+        action="store_true",
+        help="инференс в Python-воркере (pyinfer: ONNX YOLOv11 + ByteTrack, без torch/FFI). "
+             "Gateway работает в infer_worker-режиме; integra_ffi не требуется.",
+    )
+    parser.add_argument(
+        "--py-infer-addr",
+        default="127.0.0.1:9910",
+        help="адрес Python infer_worker при --py-infer",
+    )
     args = parser.parse_args()
+
+    # --py-infer => используем worker-режим gateway, адрес = py-infer-addr.
+    if args.py_infer and not args.infer_worker_addr:
+        args.infer_worker_addr = args.py_infer_addr
 
     root = Path(__file__).resolve().parent
     env: dict[str, str] = dict(os.environ)
@@ -441,17 +456,20 @@ def main() -> None:
             )
         raise SystemExit(br.returncode)
 
+    # В режиме --py-infer gateway работает как worker-клиент и НЕ грузит FFI —
+    # integra_ffi не обязателен (нативную сборку можно не держать).
     ffi_lib = _find_integra_ffi(root)
-    if ffi_lib is None:
+    if ffi_lib is None and not args.py_infer:
         print(
             "[run.py] integra_ffi не найдена.\n"
             "         Соберите native: cmake --build native/build-msvc --config RelWithDebInfo --target integra_ffi\n"
-            "         или укажите INTEGRA_FFI_PATH вручную.",
+            "         или укажите INTEGRA_FFI_PATH вручную, либо запустите с --py-infer.",
             file=sys.stderr,
         )
         raise SystemExit(2)
-    env["INTEGRA_FFI_PATH"] = str(ffi_lib)
-    env["PATH"] = str(ffi_lib.parent) + os.pathsep + env.get("PATH", "")
+    if ffi_lib is not None:
+        env["INTEGRA_FFI_PATH"] = str(ffi_lib)
+        env["PATH"] = str(ffi_lib.parent) + os.pathsep + env.get("PATH", "")
 
     # TensorRT DLL: если INTEGRA_TENSORRT_BIN задан или C:\TensorRT-*/lib существует — добавляем в PATH.
     _add_tensorrt_to_path(env)
@@ -531,39 +549,51 @@ def main() -> None:
             raise SystemExit(1)
 
     if args.infer_worker_addr:
-        iw_build_cmd = ["cargo", "build", "--bin", "infer_worker"]
-        if args.release:
-            iw_build_cmd.insert(2, "--release")
-            iw_target_dir = "release"
+        if args.py_infer:
+            print("[run.py] запуск Python infer_worker (pyinfer) …", flush=True)
+            infer_proc = subprocess.Popen(
+                [sys.executable, "-m", "pyinfer.worker", "--listen", args.infer_worker_addr],
+                cwd=str(root),
+                env=env,
+            )
+            print(
+                f"[run.py] pyinfer worker: {args.infer_worker_addr} (pid={infer_proc.pid})",
+                flush=True,
+            )
         else:
-            iw_target_dir = "debug"
+            iw_build_cmd = ["cargo", "build", "--bin", "infer_worker"]
+            if args.release:
+                iw_build_cmd.insert(2, "--release")
+                iw_target_dir = "release"
+            else:
+                iw_target_dir = "debug"
 
-        print("[run.py] cargo build infer_worker …", flush=True)
-        ibr = subprocess.run(iw_build_cmd, cwd=str(root / "runtime-core"), env=env)
-        if ibr.returncode != 0:
-            print("[run.py] Сборка infer_worker не удалась.", file=sys.stderr)
-            if bridge_proc is not None:
-                bridge_proc.terminate()
-            raise SystemExit(ibr.returncode)
+            print("[run.py] cargo build infer_worker …", flush=True)
+            ibr = subprocess.run(iw_build_cmd, cwd=str(root / "runtime-core"), env=env)
+            if ibr.returncode != 0:
+                print("[run.py] Сборка infer_worker не удалась.", file=sys.stderr)
+                if bridge_proc is not None:
+                    bridge_proc.terminate()
+                raise SystemExit(ibr.returncode)
 
-        infer_exe = root / "runtime-core" / "target" / iw_target_dir / (
-            "infer_worker.exe" if sys.platform.startswith("win") else "infer_worker"
-        )
-        if not infer_exe.is_file():
-            print(f"[run.py] нет бинарника после сборки: {infer_exe}", file=sys.stderr)
-            if bridge_proc is not None:
-                bridge_proc.terminate()
-            raise SystemExit(1)
+            infer_exe = root / "runtime-core" / "target" / iw_target_dir / (
+                "infer_worker.exe" if sys.platform.startswith("win") else "infer_worker"
+            )
+            if not infer_exe.is_file():
+                print(f"[run.py] нет бинарника после сборки: {infer_exe}", file=sys.stderr)
+                if bridge_proc is not None:
+                    bridge_proc.terminate()
+                raise SystemExit(1)
 
-        infer_proc = subprocess.Popen(
-            [str(infer_exe), "--listen", args.infer_worker_addr],
-            cwd=str(root),
-            env=env,
-        )
-        print(
-            f"[run.py] infer_worker: {args.infer_worker_addr} (pid={infer_proc.pid})",
-            flush=True,
-        )
+            infer_proc = subprocess.Popen(
+                [str(infer_exe), "--listen", args.infer_worker_addr],
+                cwd=str(root),
+                env=env,
+            )
+            print(
+                f"[run.py] infer_worker: {args.infer_worker_addr} (pid={infer_proc.pid})",
+                flush=True,
+            )
 
         if not _wait_tcp_listening(args.infer_worker_addr, timeout_sec=args.infer_worker_wait_sec):
             print(
@@ -586,13 +616,13 @@ def main() -> None:
             raise SystemExit(1)
 
         env["INTEGRA_INFER_WORKER_ADDR"] = args.infer_worker_addr
-        print(f"[run.py] gateway → infer_worker @ {args.infer_worker_addr}", flush=True)
+        print(f"[run.py] gateway -> infer_worker @ {args.infer_worker_addr}", flush=True)
 
     gw_cmd = ["cargo", "run", "--bin", "backend_gateway"]
     if args.release:
         gw_cmd.insert(2, "--release")
 
-    print(f"[run.py] FFI: {ffi_lib}")
+    print(f"[run.py] FFI: {ffi_lib if ffi_lib is not None else '(не используется, --py-infer)'}")
     print(f"[run.py] backend-gateway: {args.host}:{args.port}")
 
     def _stop_proc(proc: subprocess.Popen | None) -> None:

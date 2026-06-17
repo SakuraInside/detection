@@ -159,6 +159,18 @@ fn write_handshake_error(stream: &mut std::net::TcpStream, msg: &str) -> Result<
     Ok(())
 }
 
+/// URL живого потока (RTSP/RTMP/HTTP-MJPEG/…). Для них не проверяем наличие
+/// файла на диске — открываем напрямую через FFmpeg.
+fn is_stream_url(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    [
+        "rtsp://", "rtsps://", "rtmp://", "rtmps://", "http://", "https://",
+        "udp://", "tcp://", "rtp://", "srt://", "mms://",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p))
+}
+
 fn run_session(
     stream: &mut std::net::TcpStream,
     path: &str,
@@ -166,9 +178,19 @@ fn run_session(
     target_fps: u32,
     prefer_hw_decode: bool,
 ) -> Result<()> {
-    if !Path::new(path).exists() {
+    let is_url = is_stream_url(path);
+    if !is_url && !Path::new(path).exists() {
         write_handshake_error(stream, &format!("file not found: {path}"))?;
         return Ok(());
+    }
+
+    // RTSP по умолчанию через TCP (надёжнее UDP в локалке) + таймаут, если
+    // пользователь не задал свои OPENCV_FFMPEG_CAPTURE_OPTIONS.
+    if is_url && std::env::var("OPENCV_FFMPEG_CAPTURE_OPTIONS").is_err() {
+        std::env::set_var(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            "rtsp_transport;tcp|stimeout;5000000",
+        );
     }
 
     let mut cap =
@@ -262,7 +284,9 @@ fn run_session(
         }
     });
 
-    let period = if target_fps > 0 {
+    // Для живого потока не ограничиваем темп: читаем кадры по мере поступления,
+    // иначе при target_fps ниже частоты камеры копится задержка.
+    let period = if target_fps > 0 && !is_url {
         Some(Duration::from_secs_f64(1.0 / target_fps as f64))
     } else {
         None

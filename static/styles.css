@@ -389,12 +389,16 @@ body.theme-dark .file-tile:hover { background: rgba(30, 41, 59, 0.9); }
   padding: 0.05rem 0.4rem;
   border-radius: 3px;
 }
-.event-appeared    { border-left-color: var(--green); }
-.event-appeared    .ev-type { background: #e9f4ec; color: #1f7a36; }
-.event-abandoned   { border-left-color: var(--danger); background: #fdecf1; }
-.event-abandoned   .ev-type { background: var(--danger); color: #ffffff; }
-.event-disappeared { border-left-color: #7c3aed; background: #f3eafd; }
-.event-disappeared .ev-type { background: #7c3aed; color: #ffffff; }
+.event-object_left       { border-left-color: var(--green); }
+.event-object_left       .ev-type { background: #e9f4ec; color: #1f7a36; }
+.event-object_unattended { border-left-color: var(--danger); background: #fdecf1; }
+.event-object_unattended .ev-type { background: var(--danger); color: #ffffff; }
+.event-object_removed    { border-left-color: #d97706; background: #fdf3e7; }
+.event-object_removed    .ev-type { background: #d97706; color: #ffffff; }
+.event-object_missing    { border-left-color: #7c3aed; background: #f3eafd; }
+.event-object_missing    .ev-type { background: #7c3aed; color: #ffffff; }
+.event-person_interaction { border-left-color: #2563eb; background: #eaf1fd; }
+.event-person_interaction .ev-type { background: #2563eb; color: #ffffff; }
 
 /* ---------- всплывающие уведомления ---------- */
 

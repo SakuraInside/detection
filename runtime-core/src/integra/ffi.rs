@@ -1,6 +1,6 @@
 //! Низкоуровневый FFI-слой: `extern "C"` сигнатуры + `IntegraLib`.
 //!
-//! Сигнатуры зеркалят `native/include/integra/integra_ffi.h` (ABI v4).
+//! Сигнатуры зеркалят `native/include/integra/integra_ffi.h` (ABI v5).
 //! `IntegraLib` — handle на загруженную DLL/so; экземпляр один на процесс
 //! (через `OnceCell`), чтобы C++ синглтоны (`SharedTRTEngine` кэш и т.п.)
 //! не дублировались.
@@ -17,7 +17,7 @@ use once_cell::sync::OnceCell;
 // ABI constants — должны точно соответствовать integra_ffi.h.
 // ---------------------------------------------------------------------------
 
-pub const INTEGRA_FFI_ABI_VERSION: c_int = 4;
+pub const INTEGRA_FFI_ABI_VERSION: c_int = 5;
 
 // ---------------------------------------------------------------------------
 // IntegraConfig — repr(C), один-в-один с C struct.
@@ -73,6 +73,21 @@ pub struct IntegraConfig {
     pub class_min_conf_count: c_int,
     pub class_min_conf_class_ids: [c_int; 16],
     pub class_min_conf_thresholds: [f32; 16],
+    // ByteTrack (контур людей)
+    pub bytetrack_high_thresh: f32,
+    pub bytetrack_low_thresh: f32,
+    pub bytetrack_new_thresh: f32,
+    pub bytetrack_match_thresh: f32,
+    pub bytetrack_buffer: c_int,
+    pub bytetrack_frame_rate: f32,
+    // class-agnostic объекты сцены (FrameDiffDetector)
+    pub object_candidates_enabled: c_int,
+    pub frame_diff_buffer_size: c_int,
+    pub frame_diff_pixel_threshold: f32,
+    pub frame_diff_gradient_threshold: f32,
+    pub frame_diff_min_region_area_px: c_int,
+    // семантика контуров
+    pub track_only_persons: c_int,
 }
 
 // Pipeline в C — opaque struct; в Rust представляем как enum без вариантов.

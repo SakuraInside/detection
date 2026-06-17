@@ -39,7 +39,7 @@ extern "C" {
 #endif
 
 // При несовпадении ABI integra_pipeline_create вернёт NULL.
-#define INTEGRA_FFI_ABI_VERSION 4
+#define INTEGRA_FFI_ABI_VERSION 5
 
 /// Максимум пар (class_id → min confidence) из `model.class_min_conf` для нативного фильтра.
 #define INTEGRA_CLASS_MIN_CONF_MAX 16
@@ -52,7 +52,8 @@ typedef struct IntegraPipeline IntegraPipeline;
 // ---------------------------------------------------------------------------
 // Callback type. Вызывается синхронно из integra_pipeline_push_frame().
 //
-//   type_tag    — "event"  : alarm event (abandoned / disappeared / …)
+//   type_tag    — "event"  : событие сцены (person_interaction / object_left /
+//                            object_unattended / object_removed / object_missing)
 //                 "frame_result" : полный результат кадра (tracks + persons + stats)
 //   payload_json — UTF-8 JSON, null-terminated, ВАЛИДЕН ТОЛЬКО НА ВРЕМЯ ВЫЗОВА.
 //   user_data    — то, что было передано в push_frame.
@@ -126,6 +127,24 @@ typedef struct {
   int         class_min_conf_count;
   int         class_min_conf_class_ids[INTEGRA_CLASS_MIN_CONF_MAX];
   float       class_min_conf_thresholds[INTEGRA_CLASS_MIN_CONF_MAX];
+
+  // ---- ByteTrack (class-based контур людей; cls=0) ----
+  float       bytetrack_high_thresh;       /* <=0 => 0.50 — порог 1-й ассоциации */
+  float       bytetrack_low_thresh;        /* <=0 => 0.10 — нижняя граница BYTE 2-го прохода */
+  float       bytetrack_new_thresh;        /* <=0 => 0.60 — порог старта нового трека */
+  float       bytetrack_match_thresh;      /* <=0 => 0.80 — cost=1-IoU матча 1-го прохода */
+  int         bytetrack_buffer;            /* <=0 => 30 — кадров держим потерянный трек */
+  float       bytetrack_frame_rate;        /* <=0 => 30 — частота кадров источника */
+
+  // ---- class-agnostic объекты сцены (FrameDiffDetector) ----
+  int         object_candidates_enabled;    /* 0 => выкл; иначе вкл (контур M3) */
+  int         frame_diff_buffer_size;       /* <=0 => 10 */
+  float       frame_diff_pixel_threshold;   /* <=0 => 20 */
+  float       frame_diff_gradient_threshold;/* <=0 => 15 */
+  int         frame_diff_min_region_area_px;/* <=0 => 100 */
+
+  // ---- семантика контуров (информативно) ----
+  int         track_only_persons;           /* 1 = устойчивые ID только у людей */
 } IntegraConfig;
 
 // ---------------------------------------------------------------------------

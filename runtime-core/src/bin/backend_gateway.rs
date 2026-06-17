@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::Command;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,8 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use runtime_core::integra::{
-    self, encode_preview_jpeg, FrameResult, IntegraLib, PersonDet, StreamMessage, TrackSnapshot,
+    self, encode_preview_jpeg_with_options, FrameResult, IntegraLib, PersonDet, StreamMessage,
+    TrackSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +125,10 @@ struct AppState {
     bridge_cmd_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<serde_json::Value>>>>,
     /// `config.json` → `ui.show_persons`: рисовать ли bbox людей на MJPEG (ложные person на фоне иначе мешают).
     preview_draw_person_boxes: Arc<AtomicBool>,
+    preview_max_long_edge: Arc<AtomicU32>,
+    preview_jpeg_quality: Arc<AtomicU32>,
+    preview_encode_max_fps: Arc<AtomicU32>,
+    metrics_history: Arc<Mutex<VecDeque<serde_json::Value>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +152,13 @@ struct LimitQuery {
 struct StreamQuery {
     #[allow(dead_code)]
     stream_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewSettings {
+    max_long_edge: u32,
+    jpeg_quality: u8,
+    max_fps: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +217,10 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     ));
+    let preview_settings = preview_settings_from_config(&cfg0);
+    let preview_max_long_edge = Arc::new(AtomicU32::new(preview_settings.max_long_edge));
+    let preview_jpeg_quality = Arc::new(AtomicU32::new(preview_settings.jpeg_quality as u32));
+    let preview_encode_max_fps = Arc::new(AtomicU32::new(preview_settings.max_fps));
 
     let state = AppState {
         info: Arc::new(RwLock::new(GatewayInfo::default())),
@@ -221,6 +237,10 @@ async fn main() -> anyhow::Result<()> {
         snapshots_dir,
         bridge_cmd_tx: Arc::new(Mutex::new(None)),
         preview_draw_person_boxes,
+        preview_max_long_edge,
+        preview_jpeg_quality,
+        preview_encode_max_fps,
+        metrics_history: Arc::new(Mutex::new(VecDeque::with_capacity(180))),
     };
 
     // Периодическая рассылка `status` через WS (как Python делал по таймеру).
@@ -421,36 +441,78 @@ fn gpu_metrics_from_nvidia_smi() -> Option<serde_json::Value> {
             "--query-gpu=name,utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        .output();
+    
+    match output {
+        Ok(out) => {
+            if !out.status.success() {
+                warn!("nvidia-smi returned non-zero status");
+                return None;
+            }
+            
+            let stdout = match String::from_utf8(out.stdout) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("nvidia-smi output is not valid UTF-8: {}", e);
+                    return None;
+                }
+            };
+            
+            let line = stdout.lines().next()?.trim();
+            if line.is_empty() {
+                warn!("nvidia-smi output is empty");
+                return None;
+            }
+            
+            let parts: Vec<&str> = line
+                .split(',')
+                .map(|s| s.trim().trim_matches('"'))
+                .collect();
+                
+            if parts.len() < 4 {
+                warn!("nvidia-smi output has unexpected format: expected >= 4 fields, got {}", parts.len());
+                return None;
+            }
+            
+            let n = parts.len();
+            let mem_total_mib: u64 = match parts[n - 1].parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to parse GPU memory total: {}", e);
+                    return None;
+                }
+            };
+            let mem_used_mib: u64 = match parts[n - 2].parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to parse GPU memory used: {}", e);
+                    return None;
+                }
+            };
+            let util: f64 = match parts[n - 3].parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to parse GPU utilization: {}", e);
+                    return None;
+                }
+            };
+            
+            let name = parts[..n - 3].join(", ");
+            const MIB: u64 = 1024 * 1024;
+            
+            Some(serde_json::json!({
+                "available": true,
+                "name": name,
+                "util_percent": util,
+                "memory_used_bytes": mem_used_mib.saturating_mul(MIB),
+                "memory_total_bytes": mem_total_mib.saturating_mul(MIB),
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to run nvidia-smi: {}", e);
+            None
+        }
     }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let line = stdout.lines().next()?.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = line
-        .split(',')
-        .map(|s| s.trim().trim_matches('"'))
-        .collect();
-    if parts.len() < 4 {
-        return None;
-    }
-    let n = parts.len();
-    let mem_total_mib: u64 = parts[n - 1].parse().ok()?;
-    let mem_used_mib: u64 = parts[n - 2].parse().ok()?;
-    let util: f64 = parts[n - 3].parse().ok()?;
-    let name = parts[..n - 3].join(", ");
-    const MIB: u64 = 1024 * 1024;
-    Some(serde_json::json!({
-        "available": true,
-        "name": name,
-        "util_percent": util,
-        "memory_used_bytes": mem_used_mib.saturating_mul(MIB),
-        "memory_total_bytes": mem_total_mib.saturating_mul(MIB),
-    }))
 }
 
 fn tracks_payload(tracks: &[TrackSnapshot]) -> serde_json::Value {
@@ -479,22 +541,76 @@ async fn api_metrics(State(state): State<AppState>, _q: Query<StreamQuery>) -> i
     drop(info);
 
     // Системные метрики через sysinfo (синхронные, держим минимум информации).
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.refresh_cpu();
+    let mut sys = System::new_all();
+    sys.refresh_all();
     // Refresh CPU дважды — sysinfo требует это для корректного % (между измерениями
     // ждать MINIMUM_CPU_UPDATE_INTERVAL = 200ms). Делаем blocking sleep на пару мс,
     // чтобы не залипать: погрешность приемлема.
-    std::thread::sleep(StdDuration::from_millis(50));
-    sys.refresh_cpu();
-
     let pid = sysinfo::Pid::from_u32(std::process::id());
-    sys.refresh_process(pid);
     let proc_info = sys.process(pid);
     let rss = proc_info.map(|p| p.memory()).unwrap_or(0); // bytes
     let cpu_pct = proc_info.map(|p| p.cpu_usage()).unwrap_or(0.0);
 
     let uptime_sec = state.started_at.elapsed().as_secs_f64();
+    let latest_jpeg_bytes = info_clone.latest_jpeg.as_ref().map(|j| j.len()).unwrap_or(0) as u64;
+    let frame_bytes = if info_clone.width > 0 && info_clone.height > 0 {
+        (info_clone.width as u64)
+            .saturating_mul(info_clone.height as u64)
+            .saturating_mul(3)
+    } else {
+        0
+    };
+    let cfg = read_config_json(&state.root).unwrap_or_else(|| serde_json::json!({}));
+    let memory_warning_bytes = cfg
+        .get("pipeline")
+        .and_then(|p| p.get("memory_chart_warning_bytes"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(419_430_400);
+    let memory_critical_bytes = cfg
+        .get("pipeline")
+        .and_then(|p| p.get("memory_chart_critical_bytes"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(524_288_000);
+    let preview_max_long_edge = state.preview_max_long_edge.load(Ordering::Relaxed);
+    let preview_jpeg_quality = state
+        .preview_jpeg_quality
+        .load(Ordering::Relaxed)
+        .clamp(35, 95);
+    let preview_encode_max_fps = state
+        .preview_encode_max_fps
+        .load(Ordering::Relaxed)
+        .clamp(1, 60);
+
+    let mut processes_top_rss: Vec<serde_json::Value> = sys
+        .processes()
+        .iter()
+        .map(|(pid, process)| {
+            serde_json::json!({
+                "pid": pid.as_u32(),
+                "name": process.name(),
+                "rss_bytes": process.memory(),
+            })
+        })
+        .filter(|p| p.get("rss_bytes").and_then(|v| v.as_u64()).unwrap_or(0) >= 80 * 1024 * 1024)
+        .collect();
+    processes_top_rss.sort_by_key(|p| {
+        std::cmp::Reverse(p.get("rss_bytes").and_then(|v| v.as_u64()).unwrap_or(0))
+    });
+    processes_top_rss.truncate(8);
+
+    let rss_history = {
+        let mut history = state.metrics_history.lock().await;
+        history.push_back(serde_json::json!({
+            "t": uptime_sec,
+            "rss_total_bytes": rss,
+            "rss_pipeline_bytes": rss,
+            "rss_ema_bytes": rss,
+        }));
+        while history.len() > 180 {
+            history.pop_front();
+        }
+        history.iter().cloned().collect::<Vec<_>>()
+    };
 
     Json(serde_json::json!({
         "process": {
@@ -624,6 +740,16 @@ async fn api_put_settings(
             .unwrap_or(false),
         Ordering::Relaxed,
     );
+    let preview_settings = preview_settings_from_config(&cur);
+    state
+        .preview_max_long_edge
+        .store(preview_settings.max_long_edge, Ordering::Relaxed);
+    state
+        .preview_jpeg_quality
+        .store(preview_settings.jpeg_quality as u32, Ordering::Relaxed);
+    state
+        .preview_encode_max_fps
+        .store(preview_settings.max_fps, Ordering::Relaxed);
     Json(cur).into_response()
 }
 
@@ -649,13 +775,30 @@ async fn api_clear_events(State(state): State<AppState>, _stream: Query<StreamQu
 // /api/open, /api/play, /api/pause, /api/seek.
 // ---------------------------------------------------------------------------
 
-/// Разрешить открытие только видеофайлов внутри `<project>/data/` (после `canonicalize`).
-/// Иначе клиент с доступом к HTTP API может передать абсолютный путь и заставить
-/// video-bridge читать произвольные файлы на машине с бэкендом.
+/// Разрешить открытие видеофайла по пути. Сервер слушает только `127.0.0.1`,
+/// поэтому открываем любой локальный видеофайл по абсолютному пути (ограничение
+/// `data/` снято по требованию пользователя). Базовые проверки оставляем: файл
+/// существует, это обычный файл, расширение — видео. Относительные пути по-преж-
+/// нему резолвятся относительно корня проекта (тайлы из `data/` работают как есть).
+/// URL живого потока (RTSP/RTMP/HTTP-MJPEG/…) — отдаём как есть, без файловых
+/// проверок: OpenCV/FFmpeg откроет это в video-bridge напрямую.
+fn is_stream_url(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    [
+        "rtsp://", "rtsps://", "rtmp://", "rtmps://", "http://", "https://",
+        "udp://", "tcp://", "rtp://", "srt://", "mms://",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p))
+}
+
 fn resolve_open_video_path(root: &FsPath, raw: &str) -> Result<PathBuf, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("path is required".to_string());
+    }
+    if is_stream_url(raw) {
+        return Ok(PathBuf::from(raw));
     }
     let joined = if FsPath::new(raw).is_absolute() {
         PathBuf::from(raw)
@@ -665,16 +808,23 @@ fn resolve_open_video_path(root: &FsPath, raw: &str) -> Result<PathBuf, String> 
     let canon_file = joined
         .canonicalize()
         .map_err(|_| "video file not found or inaccessible".to_string())?;
-    let data_dir = root.join("data");
-    fs::create_dir_all(&data_dir).map_err(|e| format!("data/: {e}"))?;
-    let canon_data = data_dir
-        .canonicalize()
-        .map_err(|e| format!("data/: {e}"))?;
-    if !canon_file.starts_with(&canon_data) {
-        return Err("video path must be inside the project data/ directory".to_string());
-    }
     if !canon_file.is_file() {
         return Err("path is not a regular file".to_string());
+    }
+    let ext_ok = canon_file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "mkv" | "mp4" | "avi" | "mov" | "webm" | "m4v"
+            )
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err(
+            "unsupported file type (expected a video: mkv/mp4/avi/mov/webm/m4v)".to_string(),
+        );
     }
     Ok(canon_file)
 }
@@ -790,6 +940,9 @@ async fn video_snapshot(State(state): State<AppState>, _stream: Query<StreamQuer
 async fn video_feed(State(state): State<AppState>, _stream: Query<StreamQuery>) -> impl IntoResponse {
     let body_stream = stream! {
         let boundary = "frame";
+        let _last_preview_encode = Instant::now()
+            .checked_sub(StdDuration::from_secs(1))
+            .unwrap_or_else(Instant::now);
         loop {
             let maybe = {
                 let info = state.info.read().await;
@@ -1332,6 +1485,10 @@ fn start_bridge_stream(state: AppState, video_path: String) {
             });
         }
 
+        let mut last_preview_encode = Instant::now()
+            .checked_sub(StdDuration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+
         loop {
             if state.playback_gen.load(Ordering::SeqCst) != my_gen {
                 break;
@@ -1409,6 +1566,20 @@ fn start_bridge_stream(state: AppState, video_path: String) {
                 pts_ms as i64,
             );
 
+            let max_preview_fps = state
+                .preview_encode_max_fps
+                .load(Ordering::Relaxed)
+                .clamp(1, 60);
+            let preview_period = StdDuration::from_secs_f64(1.0 / max_preview_fps as f64);
+            if last_preview_encode.elapsed() < preview_period {
+                let info = state.info.clone();
+                tokio::runtime::Handle::current().spawn(async move {
+                    info.write().await.current_frame = frame_id;
+                });
+                continue;
+            }
+            last_preview_encode = Instant::now();
+
             // 2. Снимок треков и людей (для overlay).
             let (tracks_snapshot, persons_snapshot) = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -1419,13 +1590,20 @@ fn start_bridge_stream(state: AppState, video_path: String) {
 
             // 3. BGR → RGB, даунскейл, bbox, JPEG.
             let draw_person_boxes = state.preview_draw_person_boxes.load(Ordering::Relaxed);
-            let jpeg = encode_preview_jpeg(
+            let max_long_edge = state.preview_max_long_edge.load(Ordering::Relaxed);
+            let jpeg_quality = state
+                .preview_jpeg_quality
+                .load(Ordering::Relaxed)
+                .clamp(35, 95) as u8;
+            let jpeg = encode_preview_jpeg_with_options(
                 &*bgr_shared,
                 w as u32,
                 h as u32,
                 &tracks_snapshot,
                 &persons_snapshot,
                 draw_person_boxes,
+                max_long_edge,
+                jpeg_quality,
             );
 
             if let Some(jpeg) = jpeg {
@@ -1483,9 +1661,14 @@ fn now_secs() -> f64 {
 }
 
 fn is_alarm_event(kind: &str) -> bool {
-    // C++ pipeline шлёт kind вида "alarm_abandoned" / "alarm_disappeared"
-    // (см. analyticsd_main.cpp::serialize_alarm). Также принимаем legacy-имена
-    // "abandoned" / "disappeared" — на всякий случай.
+    // Тревожные события ТЗ (object_left / person_interaction — контекстные, без снапшота).
+    if matches!(
+        kind,
+        "object_unattended" | "object_removed" | "object_missing"
+    ) {
+        return true;
+    }
+    // Legacy-фоллбэк для старых сборок FFI (alarm_* / abandoned / disappeared).
     kind.starts_with("alarm_") || kind == "abandoned" || kind == "disappeared"
 }
 
@@ -1561,6 +1744,30 @@ fn read_config_json(root: &FsPath) -> Option<serde_json::Value> {
     let p = root.join("config.json");
     let raw = fs::read_to_string(p).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+fn preview_settings_from_config(cfg: &serde_json::Value) -> PreviewSettings {
+    let pipeline = cfg.get("pipeline");
+    let max_long_edge = pipeline
+        .and_then(|p| p.get("preview_max_long_edge"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(960)
+        .clamp(320, 1920) as u32;
+    let jpeg_quality = pipeline
+        .and_then(|p| p.get("preview_jpeg_quality"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(70)
+        .clamp(35, 95) as u8;
+    let max_fps = pipeline
+        .and_then(|p| p.get("preview_encode_max_fps"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(12)
+        .clamp(1, 60) as u32;
+    PreviewSettings {
+        max_long_edge,
+        jpeg_quality,
+        max_fps,
+    }
 }
 
 fn write_config_json(root: &FsPath, v: &serde_json::Value) -> anyhow::Result<()> {

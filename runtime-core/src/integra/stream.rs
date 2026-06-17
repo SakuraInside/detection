@@ -36,10 +36,11 @@ use super::pipeline::{Pipeline, PipelineConfig};
 use super::preview_encode;
 
 /// Размер канала событий (уменьшен для ниже пикового ОЗУ на очереди).
-pub const EVENTS_CHANNEL_CAP: usize = 40;
+pub const EVENTS_CHANNEL_CAP: usize = 24;
 
 /// Меньше слотов — меньше пиковое ОЗУ (каждый слот ≈ один полный кадр BGR в `Arc`).
-pub const FRAMES_CHANNEL_CAP: usize = 3;
+/// При лимите ОЗУ ≤500 МБ держим только один кадр «в полёте» — drop-newest для остального.
+pub const FRAMES_CHANNEL_CAP: usize = 1;
 
 /// Один сырой BGR-кадр.
 ///
@@ -99,8 +100,14 @@ pub fn spawn_stream(
 
     let camera_id = cfg.camera_id.clone();
     let join = tokio::task::spawn_blocking(move || {
+        // Граница «аналитика → тревоги» (M5): ядро только публикует Event в канал.
+        // Снимок прикрепляем лишь к тревожным событиям; контекстные (object_left /
+        // person_interaction) идут без снапшота.
         fn alarm_needs_snapshot(kind: &str) -> bool {
-            kind.starts_with("alarm_") || kind == "abandoned" || kind == "disappeared"
+            matches!(
+                kind,
+                "object_unattended" | "object_removed" | "object_missing"
+            )
         }
 
         info!(camera_id = %camera_id, "integra stream worker started");

@@ -68,6 +68,24 @@ pub struct PipelineConfig {
     /// До 16 пар (COCO class_id, min confidence) из `model.class_min_conf`.
     pub class_min_conf: Vec<(i32, f32)>,
 
+    // ByteTrack (class-based контур людей).
+    pub bytetrack_high_thresh: f32,
+    pub bytetrack_low_thresh: f32,
+    pub bytetrack_new_thresh: f32,
+    pub bytetrack_match_thresh: f32,
+    pub bytetrack_buffer: i32,
+    pub bytetrack_frame_rate: f32,
+
+    // class-agnostic объекты сцены (FrameDiffDetector).
+    pub object_candidates_enabled: bool,
+    pub frame_diff_buffer_size: i32,
+    pub frame_diff_pixel_threshold: f32,
+    pub frame_diff_gradient_threshold: f32,
+    pub frame_diff_min_region_area_px: i32,
+
+    /// Устойчивые ID — только у людей (class-based); объекты — class-agnostic.
+    pub track_only_persons: bool,
+
     pub camera_id: String,
 }
 
@@ -110,6 +128,18 @@ impl Default for PipelineConfig {
             tracker_max_missed_frames: 10,
             tracker_soft_centroid_match: true,
             class_min_conf: Vec::new(),
+            bytetrack_high_thresh: 0.5,
+            bytetrack_low_thresh: 0.1,
+            bytetrack_new_thresh: 0.6,
+            bytetrack_match_thresh: 0.8,
+            bytetrack_buffer: 30,
+            bytetrack_frame_rate: 30.0,
+            object_candidates_enabled: true,
+            frame_diff_buffer_size: 10,
+            frame_diff_pixel_threshold: 20.0,
+            frame_diff_gradient_threshold: 15.0,
+            frame_diff_min_region_area_px: 100,
+            track_only_persons: true,
             camera_id: "main".into(),
         }
     }
@@ -209,6 +239,19 @@ impl Pipeline {
             class_min_conf_count: n as std::os::raw::c_int,
             class_min_conf_class_ids: class_ids,
             class_min_conf_thresholds: class_thresholds,
+            bytetrack_high_thresh: cfg.bytetrack_high_thresh,
+            bytetrack_low_thresh: cfg.bytetrack_low_thresh,
+            bytetrack_new_thresh: cfg.bytetrack_new_thresh,
+            bytetrack_match_thresh: cfg.bytetrack_match_thresh,
+            bytetrack_buffer: cfg.bytetrack_buffer as std::os::raw::c_int,
+            bytetrack_frame_rate: cfg.bytetrack_frame_rate,
+            object_candidates_enabled: if cfg.object_candidates_enabled { 1 } else { 0 },
+            frame_diff_buffer_size: cfg.frame_diff_buffer_size as std::os::raw::c_int,
+            frame_diff_pixel_threshold: cfg.frame_diff_pixel_threshold,
+            frame_diff_gradient_threshold: cfg.frame_diff_gradient_threshold,
+            frame_diff_min_region_area_px: cfg.frame_diff_min_region_area_px
+                as std::os::raw::c_int,
+            track_only_persons: if cfg.track_only_persons { 1 } else { 0 },
         };
 
         let handle = unsafe { (lib.create)(INTEGRA_FFI_ABI_VERSION, &c_cfg as *const _) };

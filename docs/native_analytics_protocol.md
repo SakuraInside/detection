@@ -79,16 +79,21 @@ Purpose:
   "type":"result","v":1,
   "frame_id":123,"pos_ms":4567.0,
   "metrics":{"preprocess_ms":1.2,"infer_ms":8.4,"postprocess_ms":0.7,"tracker_ms":0.2,"analyzer_ms":0.1},
-  "detections":[{"track_id":1,"cls_id":39,"cls_name":"bottle","confidence":0.91,"bbox":[10,20,30,40]}],
+  "detections":[{"track_id":7,"cls_id":-1,"cls_name":"object","confidence":0.42,"bbox":[10,20,30,40]}],
   "persons":[{"track_id":2,"cls_id":0,"cls_name":"person","confidence":0.88,"bbox":[...]}],
-  "tracks":[{"id":1,"cls":"bottle","state":"alarm_abandoned","bbox":[...],"conf":0.91,
+  "tracks":[{"id":7,"cls":"object","state":"alarm_unattended","bbox":[...],"conf":0.42,
              "static_for_sec":12.3,"unattended_for_sec":7.1,"alarm":true}],
-  "events":[{"type":"abandoned","track_id":1,"cls_id":39,"cls_name":"bottle","confidence":0.91,"bbox":[...],
-             "note":"..."}]
+  "events":[{"type":"object_unattended","track_id":7,"cls_id":-1,"cls_name":"object","confidence":0.42,
+             "bbox":[...],"note":"unattended_for=..."}]
 }
 ```
 
 Notes:
-- `tracks` is a snapshot intended for UI `/api/info.tracks` compatibility.
+- Два контура (ТЗ): `persons` — class-based (YOLO cls=0, ByteTrack, устойчивые ID);
+  `detections` — class-agnostic объекты сцены из FrameDiffDetector (`cls_id=-1`, `cls_name="object"`).
+- `events[].type` ∈ `person_interaction` | `object_left` | `object_unattended` |
+  `object_removed` | `object_missing` — событие определяется поведением во времени, не классом.
+- `tracks[].state` ∈ `unattended` | `alarm_unattended` | `alarm_removed` | `alarm_missing`
+  (candidate/static на оверлей не выводятся). `tracks` — снимок для UI `/api/info.tracks`.
 - Server may omit optional metric keys; client must treat missing as `0`.
 

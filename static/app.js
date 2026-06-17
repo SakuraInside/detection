@@ -23,8 +23,28 @@ const state = {
 };
 
 const EVENT_UI = {
-  abandoned: { title: "Обнаружен предмет", desc: "Подозрительный предмет оставлен без владельца." },
-  disappeared: { title: "Предмет пропал", desc: "Ранее обнаруженный предмет исчез из кадра." },
+  person_interaction: { title: "Взаимодействие", desc: "Человек подошёл к объекту сцены." },
+  object_left: { title: "Предмет оставлен", desc: "Объект оставлен, владелец отошёл." },
+  object_unattended: { title: "Бесхозный предмет", desc: "Предмет без владельца дольше порога." },
+  object_removed: { title: "Предмет забрали", desc: "Объект исчез после взаимодействия с человеком." },
+  object_missing: { title: "Предмет пропал", desc: "Ранее наблюдавшийся объект исчез из кадра." },
+};
+
+// Какие типы событий показываем в журнале (person_interaction — контекст, не засоряем журнал).
+const JOURNAL_EVENT_TYPES = new Set([
+  "object_left", "object_unattended", "object_removed", "object_missing",
+]);
+
+// Тревожные события (звук + индикатор).
+const ALARM_EVENT_TYPES = new Set([
+  "object_unattended", "object_removed", "object_missing",
+]);
+
+// Оформление карточки активной тревоги по состоянию трека.
+const ALARM_STATE_UI = {
+  alarm_unattended: { label: "бесхозный предмет", badge: "badge badge-danger", tag: "БЕСХОЗНЫЙ" },
+  alarm_removed: { label: "предмет забрали", badge: "badge badge-warn", tag: "ЗАБРАЛИ" },
+  alarm_missing: { label: "предмет пропал", badge: "badge badge-warn", tag: "ПРОПАЛ" },
 };
 
 // ----------------------------------------------------------- вспомогательные функции
@@ -463,14 +483,14 @@ function renderAlarms() {
   }
   for (const a of state.alarms.values()) {
     const el = document.createElement("div");
-    const badgeClass = a.state === "alarm_disappeared" ? "badge badge-warn" : "badge badge-danger";
+    const ui = ALARM_STATE_UI[a.state] || ALARM_STATE_UI.alarm_unattended;
     el.className = "alarm-card alarm-active";
     el.innerHTML = `
       <div>
         <div class="text-sm font-medium text-slate-900">#${a.id} · ${a.cls}</div>
-        <div class="text-[11px] text-slate-500">${a.state === "alarm_disappeared" ? "предмет пропал" : "обнаружен предмет"}</div>
+        <div class="text-[11px] text-slate-500">${ui.label}</div>
       </div>
-      <span class="${badgeClass}">${a.state === "alarm_disappeared" ? "ПРОПАЛ" : "ОБНАРУЖЕН"}</span>
+      <span class="${ui.badge}">${ui.tag}</span>
     `;
     root.appendChild(el);
   }
@@ -494,7 +514,7 @@ function renderEvents(events) {
     return;
   }
   for (const ev of events) {
-    if (ev.type !== "abandoned" && ev.type !== "disappeared") continue;
+    if (!JOURNAL_EVENT_TYPES.has(ev.type)) continue;
     const ui = EVENT_UI[ev.type] || { title: ev.type, desc: "" };
     const card = document.createElement("div");
     card.className = `event-card event-${ev.type}`;
@@ -656,7 +676,7 @@ function connectWs() {
 function onEventMessage(ev) {
   if (ev.stream_id && ev.stream_id !== state.activeStreamId) return;
   refreshEvents();
-  if (ev.type === "abandoned" || ev.type === "disappeared") {
+  if (ALARM_EVENT_TYPES.has(ev.type)) {
     if (state.settings?.ui?.alarm_sound) {
       try { $("#alarm-sound").currentTime = 0; $("#alarm-sound").play(); } catch {}
     }
@@ -699,6 +719,16 @@ function wireControls() {
     const p = $("#custom-path").value.trim();
     if (p) openVideo(p);
   };
+  $("#btn-open-rtsp").onclick = () => {
+    const url = $("#rtsp-url").value.trim();
+    if (url) openVideo(url);
+  };
+  $("#rtsp-url").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      const url = $("#rtsp-url").value.trim();
+      if (url) openVideo(url);
+    }
+  });
   $("#btn-open-system-file").onclick = () => $("#video-file-picker").click();
   $("#video-file-picker").addEventListener("change", async (ev) => {
     const file = ev.target.files && ev.target.files[0];

@@ -14,17 +14,20 @@ namespace integra {
 
 namespace {
 
-// Кандидаты не попадают в tracks_snapshot (оверлей): только подтверждённо статичные и далее.
-// FSM по-прежнему ведёт кандидатов внутри ingest.
+// Кандидаты/статика не попадают в tracks_snapshot (оверлей): показываем только
+// unattended и тревоги. FSM по-прежнему ведёт кандидатов внутри ingest.
 constexpr double kCandidateDropSilentSec = 2.0;
+// Троттлинг повторных person_interaction по одному региону.
+constexpr double kInteractionThrottleSec = 1.5;
 
 enum class St {
   kNone = 0,
   kCandidate,
   kStatic,
   kUnattended,
-  kAlarmAbandoned,
-  kAlarmDisappeared,
+  kAlarmUnattended,
+  kAlarmRemoved,
+  kAlarmMissing,
 };
 
 struct CentroidEntry {
@@ -46,14 +49,18 @@ struct TH {
   float last_conf = 0.f;
   double static_since_ts = 0;
   double unattended_since_ts = 0;
-  double abandoned_at_ts = 0;
   double last_owner_near_ts = 0;
+  double last_interaction_emit_ts = 0;
   bool ever_owner_near = false;
+  bool owner_near_prev = false;
+  bool was_confirmed = false;  // достигал статики хотя бы раз (реальный объект)
   std::vector<CentroidEntry> centroid_history;
   int presence_count = 0;
   int frames_seen = 0;
-  bool raised_abandoned = false;
-  bool raised_disappeared = false;
+  bool object_left_emitted = false;
+  bool raised_unattended = false;
+  bool raised_removed = false;
+  bool raised_missing = false;
 
   float area() const { return bbox_area(last_bbox); }
 
@@ -73,7 +80,7 @@ struct TH {
   }
 };
 
-/// Человек перекрывает bbox объекта (окклюзия): не копим silent / не спешим с disappeared.
+/// Человек перекрывает bbox объекта (окклюзия): не копим silent / не спешим с missing.
 bool person_overlaps_bbox(const BBoxXYXY& obj_bbox, const std::vector<Detection>& persons,
                           int frame_w, int frame_h) {
   if (persons.empty()) {
@@ -120,7 +127,7 @@ bool is_person_near(const Detection& obj, const std::vector<Detection>& persons,
   constexpr float kOwnerPersonMaxAreaRatio = 0.09f;
   // Силуэт человека для proximity: слишком широкий бокс ≈ мебель/FP.
   constexpr float kOwnerPersonMaxAspect = 1.42f;
-  // Минимальное пересечение person–object: иначе «рядом по пикселям» цепляет бутылки
+  // Минимальное пересечение person–object: иначе «рядом по пикселям» цепляет объекты
   // на столе при проходе человека у лестницы / у стойки.
   constexpr float kOwnerObjectMinIou = 0.055f;
 
@@ -200,7 +207,9 @@ struct SceneAnalyzer::Impl {
   std::unordered_map<int, TH> tracks;
 };
 
-SceneAnalyzer::SceneAnalyzer(AnalyzerParams p) : impl_(std::make_unique<Impl>()) { impl_->p = p; }
+SceneAnalyzer::SceneAnalyzer(AnalyzerParams p) : impl_(std::make_unique<Impl>()) {
+  impl_->p = p;
+}
 
 SceneAnalyzer::~SceneAnalyzer() = default;
 
@@ -212,7 +221,8 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
                                                const std::string& camera_id,
                                                const std::vector<Detection>& objects,
                                                const std::vector<Detection>& persons,
-                                               int frame_w, int frame_h) {
+                                               int frame_w, int frame_h,
+                                               const cv::Mat& /*bgr_frame*/) {
   auto& p = impl_->p;
   auto& tracks = impl_->tracks;
   std::vector<AlarmEvent> events;
@@ -221,6 +231,7 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
 
   const int mlen = std::max(8, p.centroid_history_maxlen);
 
+  // ---- Обновление регионов-кандидатов (class-agnostic объекты сцены) ----
   for (const auto& det : objects) {
     const int tid = det.track_id;
     if (tid < 0) {
@@ -261,11 +272,15 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
       continue;
     }
 
-    if (is_person_near(det, persons, p.owner_proximity_px, frame_w, frame_h)) {
+    // Близость / взаимодействие человека.
+    const bool owner_near =
+        is_person_near(det, persons, p.owner_proximity_px, frame_w, frame_h);
+    if (owner_near) {
       tr.last_owner_near_ts = ts;
       tr.ever_owner_near = true;
     }
 
+    // Статичность по окну.
     const double disp = tr.displacement_window(ts - p.static_window_sec);
     const bool is_static =
         disp <= p.static_displacement_px && (ts - tr.first_seen_ts) >= p.static_window_sec;
@@ -273,41 +288,65 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
     if (tr.state == St::kCandidate && is_static) {
       tr.state = St::kStatic;
       tr.static_since_ts = ts;
+      tr.was_confirmed = true;
     } else if (tr.state == St::kStatic && !is_static) {
+      // Объект снова задвигался — назад в кандидаты, сбрасываем «оставленность».
       tr.state = St::kCandidate;
       tr.static_since_ts = 0;
       tr.unattended_since_ts = 0;
+      tr.object_left_emitted = false;
+      tr.owner_near_prev = owner_near;
       continue;
     }
 
-    if (tr.state == St::kStatic || tr.state == St::kUnattended || tr.state == St::kAlarmAbandoned) {
-      // Без хотя бы одного «владелец рядом» постоянный фон (бутылки, турникет) уходит в
-      // unattended через несколько секунд — поэтому ждём реальную близость человека.
+    // person_interaction: вход человека в зону подтверждённого объекта (false→true).
+    if (owner_near && !tr.owner_near_prev && tr.was_confirmed &&
+        (ts - tr.last_interaction_emit_ts) > kInteractionThrottleSec) {
+      events.push_back(
+          make_ev("person_interaction", camera_id, video_pos_ms, tr, "owner near object"));
+      tr.last_interaction_emit_ts = ts;
+    }
+    tr.owner_near_prev = owner_near;
+
+    // Владелец вернулся к ещё не-тревожному unattended — отменяем «оставленность».
+    if (owner_near && tr.state == St::kUnattended && !tr.raised_unattended) {
+      tr.state = St::kStatic;
+      tr.unattended_since_ts = 0;
+      tr.object_left_emitted = false;
+    }
+
+    // object_left → object_unattended.
+    if (tr.state == St::kStatic || tr.state == St::kUnattended ||
+        tr.state == St::kAlarmUnattended) {
+      // Без хотя бы одного «владелец рядом» постоянный фон не считаем объектом сцены.
       if (!tr.ever_owner_near) {
         continue;
       }
       const double without_owner_for =
           tr.last_owner_near_ts > 0 ? (ts - tr.last_owner_near_ts) : (ts - tr.first_seen_ts);
-      if (without_owner_for >= p.owner_left_sec) {
-        if (tr.state == St::kStatic) {
-          tr.state = St::kUnattended;
-          tr.unattended_since_ts = ts;
+      if (without_owner_for >= p.owner_left_sec && tr.state == St::kStatic) {
+        tr.state = St::kUnattended;
+        tr.unattended_since_ts = ts;
+        if (!tr.object_left_emitted) {
+          events.push_back(make_ev("object_left", camera_id, video_pos_ms, tr,
+                                    "owner left object"));
+          tr.object_left_emitted = true;
         }
       }
     }
 
     if (tr.state == St::kUnattended) {
       const double unattended_for = ts - tr.unattended_since_ts;
-      if (unattended_for >= p.abandon_time_sec && !tr.raised_abandoned) {
-        tr.state = St::kAlarmAbandoned;
-        tr.abandoned_at_ts = ts;
-        tr.raised_abandoned = true;
+      if (unattended_for >= p.abandon_time_sec && !tr.raised_unattended) {
+        tr.state = St::kAlarmUnattended;
+        tr.raised_unattended = true;
         std::string note = "unattended_for=" + std::to_string(unattended_for);
-        events.push_back(make_ev("abandoned", camera_id, video_pos_ms, tr, note));
+        events.push_back(make_ev("object_unattended", camera_id, video_pos_ms, tr, note));
       }
     }
   }
 
+  // ---- Исчезновения: object_removed (после взаимодействия) / object_missing ----
   std::vector<int> to_drop;
   for (auto& kv : tracks) {
     const int tid = kv.first;
@@ -322,23 +361,39 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
     if (seen) {
       continue;
     }
+    // Окклюзия человеком — держим трек, не считаем исчезнувшим.
     if (!persons.empty() && person_overlaps_bbox(tr.last_bbox, persons, frame_w, frame_h)) {
       tr.last_seen_ts = ts;
       continue;
     }
     const double silent_for = ts - tr.last_seen_ts;
-    if (tr.raised_abandoned && !tr.raised_disappeared) {
-      if (silent_for >= p.disappear_grace_sec) {
-        tr.state = St::kAlarmDisappeared;
-        tr.raised_disappeared = true;
+
+    if (tr.was_confirmed && !tr.raised_removed && !tr.raised_missing &&
+        silent_for >= p.disappear_grace_sec) {
+      // Недавнее взаимодействие перед исчезновением → «забрали».
+      const bool recent_interaction =
+          tr.last_owner_near_ts > 0 &&
+          (tr.last_seen_ts - tr.last_owner_near_ts) <= p.owner_left_sec;
+      if (recent_interaction) {
+        tr.state = St::kAlarmRemoved;
+        tr.raised_removed = true;
+        std::string note = "removed_after_interaction silent_for=" + std::to_string(silent_for);
+        events.push_back(make_ev("object_removed", camera_id, video_pos_ms, tr, note));
+      } else {
+        tr.state = St::kAlarmMissing;
+        tr.raised_missing = true;
         std::string note = "silent_for=" + std::to_string(silent_for);
-        events.push_back(make_ev("disappeared", camera_id, video_pos_ms, tr, note));
+        events.push_back(make_ev("object_missing", camera_id, video_pos_ms, tr, note));
       }
     }
-    // Кандидат без детекции долго — мигание/шум; интервал мягче 2 с, чтобы не рвать редкие детекции.
+
+    // Уборка треков.
     if (tr.state == St::kCandidate && silent_for >= kCandidateDropSilentSec) {
       to_drop.push_back(tid);
-    } else if (!tr.raised_abandoned &&
+    } else if ((tr.raised_removed || tr.raised_missing) &&
+               silent_for > p.disappear_grace_sec * 2.0) {
+      to_drop.push_back(tid);
+    } else if (!tr.was_confirmed &&
                silent_for > std::max(22.0, p.disappear_grace_sec * 3.0)) {
       to_drop.push_back(tid);
     }
@@ -347,13 +402,14 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
     tracks.erase(tid);
   }
 
+  // ---- Жёсткий потолок активных треков (защита от всплеска FP) ----
   const int max_tracks = std::max(64, p.max_active_tracks);
   if (static_cast<int>(tracks.size()) > max_tracks) {
     std::vector<std::tuple<double, int>> evict;
     evict.reserve(tracks.size());
     for (const auto& kv : tracks) {
       const TH& t = kv.second;
-      if (t.raised_abandoned || t.raised_disappeared) {
+      if (t.raised_unattended || t.raised_removed || t.raised_missing) {
         continue;
       }
       evict.emplace_back(t.last_seen_ts, kv.first);
@@ -374,19 +430,12 @@ std::vector<AlarmEvent> SceneAnalyzer::ingest(double ts, double video_pos_ms,
 }
 
 std::vector<TrackSnapshot> SceneAnalyzer::tracks_snapshot(double now_ts) const {
-  const auto& p = impl_->p;
-  (void)p;
   std::vector<TrackSnapshot> out;
   out.reserve(impl_->tracks.size());
   for (const auto& kv : impl_->tracks) {
     const TH& t = kv.second;
-    if (t.state == St::kCandidate) {
-      continue;
-    }
-    if (t.state == St::kStatic) {
-      continue;
-    }
-    if (t.state == St::kNone) {
+    // На оверлей выводим только unattended и тревоги (без candidate/static/none).
+    if (t.state == St::kCandidate || t.state == St::kStatic || t.state == St::kNone) {
       continue;
     }
     TrackSnapshot s;
@@ -403,11 +452,14 @@ std::vector<TrackSnapshot> SceneAnalyzer::tracks_snapshot(double now_ts) const {
       case St::kUnattended:
         s.state = "unattended";
         break;
-      case St::kAlarmAbandoned:
-        s.state = "alarm_abandoned";
+      case St::kAlarmUnattended:
+        s.state = "alarm_unattended";
         break;
-      case St::kAlarmDisappeared:
-        s.state = "alarm_disappeared";
+      case St::kAlarmRemoved:
+        s.state = "alarm_removed";
+        break;
+      case St::kAlarmMissing:
+        s.state = "alarm_missing";
         break;
     }
     s.bbox[0] = t.last_bbox.x1;
@@ -418,7 +470,8 @@ std::vector<TrackSnapshot> SceneAnalyzer::tracks_snapshot(double now_ts) const {
     s.static_for_sec = t.static_since_ts > 0 ? std::max(0.0, now_ts - t.static_since_ts) : 0.0;
     s.unattended_for_sec =
         t.unattended_since_ts > 0 ? std::max(0.0, now_ts - t.unattended_since_ts) : 0.0;
-    s.alarm = (t.state == St::kAlarmAbandoned || t.state == St::kAlarmDisappeared);
+    s.alarm = (t.state == St::kAlarmUnattended || t.state == St::kAlarmRemoved ||
+               t.state == St::kAlarmMissing);
     out.push_back(std::move(s));
   }
   return out;
