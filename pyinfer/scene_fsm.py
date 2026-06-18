@@ -180,6 +180,14 @@ class SceneAnalyzer:
             if owner_near:
                 tr.last_owner_near_ts = ts
                 tr.ever_owner_near = True
+            elif getattr(det, "owner_near", False) and not tr.ever_owner_near:
+                # Трекер региона зафиксировал владельца в ранние кадры (человек принёс
+                # коробку/рюкзак, поставил и отошёл раньше, чем предмет дозрел до
+                # stable). Привязываем владельца и стартуем таймер «без владельца»
+                # от появления предмета — иначе тревога «оставленного» не сработает.
+                tr.ever_owner_near = True
+                if tr.last_owner_near_ts == 0.0:
+                    tr.last_owner_near_ts = tr.first_seen_ts
 
             disp = tr.displacement_window(ts - p.static_window_sec)
             is_static = (disp <= p.static_displacement_px

@@ -15,7 +15,7 @@ import numpy as np
 
 from .geom import iou_xyxy
 
-WORK_LONG_EDGE = 640
+WORK_LONG_EDGE = 960
 LEARNING_RATE = 0.00035
 # Кадры прогрева модели фона после reset.
 WARMUP_FRAMES = 60
@@ -34,6 +34,7 @@ class Det:
     track_id: int = -1
     class_id: int = -1
     cls_name: str = "object"
+    owner_near: bool = False  # человек физически перекрывал предмет в жизни трека
 
 
 class ObjectCandidates:
@@ -96,6 +97,9 @@ class ObjectCandidates:
             bh = bbox[3] - bbox[1]
             if bw < MIN_REGION_SIDE_PX or bh < MIN_REGION_SIDE_PX:
                 continue
+            # фильтр структурности: гладкие блики/тени на полу отсекаем
+            if _edge_density(gray, (x, y, x + rw, y + rh)) < EDGE_DENSITY_MIN:
+                continue
             if self._on_person(bbox, persons):
                 continue
             regions.append(bbox)
@@ -149,6 +153,7 @@ class _Track:
     gone_streak: int = 0      # подряд кадров, когда верификация говорит «предмета нет»
     birth_frame: int = 0      # кадр потока, на котором трек создан
     baseline: bool = False    # фон сцены (есть с самого старта) — НЕ тревожный
+    owner_seen: bool = False  # человек перекрывал bbox трека (привязка владельца)
 
 
 # Темпоральная фильтрация. Пороги невысокие — от шума защищает пиксельная
@@ -176,15 +181,36 @@ def _eff_static_radius(gray) -> float:
 # живёт пока физически на месте, а фантом (тень/отблеск/остаточный регион)
 # исчезает, как только участок кадра вернулся к фону.
 PATCH_SZ = 32
-PATCH_PRESENT_CORR = 0.45   # corr ≥ → предмет на месте
-PATCH_GONE_FRAMES = 20      # столько кадров «нет» подряд → дроп стабильного трека
-PERSON_OCCLUDE_IOU = 0.30   # человек закрывает трек — верификацию пропускаем
+PATCH_PRESENT_CORR = 0.45   # corr ≥ → предмет на месте (для текстурных)
+PATCH_PRESENT_MAD = 26.0    # MAD ≤ → предмет на месте (работает для ОДНОТОННЫХ)
+PATCH_GONE_FRAMES = 30      # столько кадров «нет» подряд → дроп стабильного трека
+PERSON_OCCLUDE_IOU = 0.22   # человек рядом с треком — верификацию пропускаем (заморозка)
 
-# Объект, ставший стабильным в первые BASELINE_FRAMES потока — это фон сцены
-# (мебель, урна, стойка: было с самого начала), а не принесённый предмет.
-# Помечаем baseline=True и НЕ отдаём в FSM (ни жёлтой рамки, ни тревоги).
-# Принесённые позже предметы стабилизируются после baseline → тревожат как надо.
-BASELINE_FRAMES = 220       # ~10с @22fps
+# Фильтр плотности краёв: реальный предмет имеет контур/структуру, а блик/тень
+# на глянцевом полу — гладкие. Регион проходит, только если доля краевых
+# пикселей (Canny) в нём ≥ порога. Главный фильтр шума на полу.
+EDGE_DENSITY_MIN = 0.040
+
+# Объект, ставший стабильным в первые BASELINE_FRAMES потока, — фон сцены
+# (мебель/начальная обстановка): помечаем baseline=True, в FSM не отдаём.
+# Предметы приносят позже (через десятки секунд) → они НЕ baseline → тревожат.
+# Защита от абсорбции: если на месте baseline-объекта появляется НОВЫЙ предмет
+# (патч меняется сильнее SHED_MAD), метка снимается и предмет снова тревожит.
+BASELINE_FRAMES = 330       # ~15с @22fps
+BASELINE_SHED_MAD = 48.0    # MAD патча от эталона выше → сцена изменилась → снять baseline
+
+# Привязка владельца. Объект становится виден FSM только дозрев до stable (~0.7с),
+# а к этому моменту человек, поставивший предмет, уже отошёл за зону владельца —
+# и FSM не успевает зафиксировать owner_near → тревога никогда не срабатывает.
+# Поэтому ЗДЕСЬ, на уровне трека региона (живёт с момента появления предмета),
+# латчим факт: человек физически перекрыл ≥ OWNER_OVERLAP_FRAC площади предмета
+# (поставил / стоял над ним). Этот флаг проносится в FSM как «владелец был».
+# Требуем именно перекрытие (а не близость) — толпа рядом не привязывается.
+# Дополнительно: владелец должен быть КРУПНЕЕ предмета (человек носит/ставит вещь
+# меньше себя). Регион лавки/мебели сопоставим или больше человека → НЕ владелец;
+# рюкзак/сумка много меньше → привязывается. Это режет лавочные ложные тревоги.
+OWNER_OVERLAP_FRAC = 0.15
+OWNER_MAX_OBJ_TO_PERSON = 0.70
 
 
 def _extract_patch(gray, bbox):
@@ -198,17 +224,35 @@ def _extract_patch(gray, bbox):
     return p.astype(np.float32)
 
 
-def _patch_corr(a, b) -> float:
-    """Нормированная кросс-корреляция двух патчей (устойчива к смене яркости)."""
-    if a is None or b is None:
-        return 0.0
-    a = a - a.mean()
-    b = b - b.mean()
+def _patch_present(cur, ref) -> bool:
+    """Предмет на месте? Надёжно для ОДНОТОННЫХ объектов (коробка/рюкзак):
+    основной критерий — MAD (средняя абс. разница) мал; для текстурных
+    дополнительно проходит высокая корреляция.
+    """
+    if cur is None or ref is None:
+        return False
+    mad = float(np.abs(cur - ref).mean())
+    if mad <= PATCH_PRESENT_MAD:
+        return True
+    a = cur - cur.mean()
+    b = ref - ref.mean()
     da = float(np.sqrt((a * a).sum()))
     db = float(np.sqrt((b * b).sum()))
     if da < 1e-6 or db < 1e-6:
+        return False
+    return float((a * b).sum() / (da * db)) >= PATCH_PRESENT_CORR
+
+
+def _edge_density(gray, bbox) -> float:
+    """Доля краевых пикселей (Canny) внутри bbox — мера «структурности» региона."""
+    h, w = gray.shape[:2]
+    x1 = max(0, int(bbox[0])); y1 = max(0, int(bbox[1]))
+    x2 = min(w, int(bbox[2])); y2 = min(h, int(bbox[3]))
+    if x2 - x1 < 4 or y2 - y1 < 4:
         return 0.0
-    return float((a * b).sum() / (da * db))
+    roi = gray[y1:y2, x1:x2]
+    edges = cv2.Canny(roi, 50, 150)
+    return float(np.count_nonzero(edges)) / float(edges.size)
 
 
 class IouTracker:
@@ -260,6 +304,9 @@ class IouTracker:
                     tr.stable = True
                     if gray is not None:
                         tr.ref_patch = _extract_patch(gray, tr.bbox)
+                    # стабилизировался в стартовом окне → фон сцены (мебель)
+                    if tr.birth_frame <= BASELINE_FRAMES:
+                        tr.baseline = True
                 used[best_j] = True
             else:
                 # MOG2 не дал контур в этом кадре. Для СТАТИЧНОГО предмета контур
@@ -279,9 +326,36 @@ class IouTracker:
                 ))
                 self._next_id += 1
 
+        # --- Привязка владельца: латчим перекрытие предмета человеком ---
+        # Делаем для ВСЕХ треков (включая ещё не stable) — именно в ранние кадры,
+        # пока хозяин не отошёл, есть перекрытие bbox.
+        if persons:
+            for tr in self._tracks:
+                if tr.owner_seen:
+                    continue
+                rarea = max(1.0, (tr.bbox[2] - tr.bbox[0]) * (tr.bbox[3] - tr.bbox[1]))
+                for p in persons:
+                    pb = p.bbox
+                    parea = max(1.0, (pb[2] - pb[0]) * (pb[3] - pb[1]))
+                    if rarea > OWNER_MAX_OBJ_TO_PERSON * parea:
+                        continue  # предмет крупнее носителя → это не оставленная вещь
+                    ix = max(0.0, min(tr.bbox[2], pb[2]) - max(tr.bbox[0], pb[0]))
+                    iy = max(0.0, min(tr.bbox[3], pb[3]) - max(tr.bbox[1], pb[1]))
+                    if (ix * iy) / rarea >= OWNER_OVERLAP_FRAC:
+                        tr.owner_seen = True
+                        break
+
         # --- Верификация стабильных треков, не подтверждённых MOG2 в этом кадре ---
         survivors = []
         for tr in self._tracks:
+            # Снятие baseline: на месте мебели появился НОВЫЙ предмет (патч сильно
+            # изменился) → это уже не фон, делаем трек тревожным и обновляем эталон.
+            if tr.baseline and gray is not None and tr.ref_patch is not None:
+                cur = _extract_patch(gray, tr.bbox)
+                if cur is not None and float(np.abs(cur - tr.ref_patch).mean()) > BASELINE_SHED_MAD:
+                    tr.baseline = False
+                    tr.ref_patch = cur
+
             if not tr.stable:
                 # обычный трек: живёт пока missed <= max_missed
                 if tr.missed <= self.max_missed:
@@ -305,8 +379,7 @@ class IouTracker:
                     survivors.append(tr)
                 continue
 
-            corr = _patch_corr(_extract_patch(gray, tr.bbox), tr.ref_patch)
-            if corr >= PATCH_PRESENT_CORR:
+            if _patch_present(_extract_patch(gray, tr.bbox), tr.ref_patch):
                 tr.gone_streak = 0
                 survivors.append(tr)  # предмет физически на месте → держим
             else:
@@ -322,7 +395,8 @@ class IouTracker:
         # порождает жёлтых рамок, а реальный предмет показывается, дозрев до stable.
         out = []
         for t in self._tracks:
-            if not t.stable:
-                continue
-            out.append(Det(bbox=t.bbox, confidence=0.5, track_id=t.track_id))
+            if not t.stable or t.baseline:
+                continue  # baseline = фон сцены (мебель) — в FSM не выходит
+            out.append(Det(bbox=t.bbox, confidence=0.5, track_id=t.track_id,
+                           owner_near=t.owner_seen))
         return out

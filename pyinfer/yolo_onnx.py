@@ -155,19 +155,35 @@ class YoloOnnx:
         res = np.concatenate([xyxy[idxs], cls_conf[idxs, None]], axis=1)
         return res.astype(np.float32)
 
-    def detect_all(self, bgr: np.ndarray, object_classes, object_conf: float):
-        """Один проход → (persons Nx5, objects list[(x1,y1,x2,y2,score,cls_id)]).
+    def detect_all(self, bgr: np.ndarray, object_classes, object_conf: float,
+                   person_floor_conf: float = 0.0):
+        """Один проход → (persons Nx5, objects list[(x1,y1,x2,y2,score,cls_id)],
+        weak_persons Nx5).
 
         object_classes — множество COCO-id «оставляемых» предметов.
+        weak_persons — person-детекции на ПОНИЖЕННОМ пороге `person_floor_conf`
+        (включают сильных). Нужны не для трекинга, а как маска ПОДАВЛЕНИЯ объект-
+        кандидатов: сидящий/ближний человек даёт слабый person-отклик (0.05–0.3),
+        которого не хватает на трек ByteTrack, но достаточно чтобы погасить его
+        силуэт-фантом. Реальный предмет person-отклика не даёт → не подавляется.
         """
         xyxy, cls_ids, cls_conf = self._infer(bgr)
         if xyxy.shape[0] == 0:
-            return np.zeros((0, 5), np.float32), []
+            return np.zeros((0, 5), np.float32), [], np.zeros((0, 5), np.float32)
 
-        # люди
+        # люди (для трекинга — порог self.conf)
         pidx = self._nms_subset(xyxy, cls_conf, cls_ids == self.person_class, self.conf, self.iou)
         persons = (np.concatenate([xyxy[pidx], cls_conf[pidx, None]], axis=1).astype(np.float32)
                    if pidx else np.zeros((0, 5), np.float32))
+
+        # слабые люди (для подавления — пониженный порог)
+        weak_persons = np.zeros((0, 5), np.float32)
+        if person_floor_conf > 0.0 and person_floor_conf < self.conf:
+            widx = self._nms_subset(xyxy, cls_conf, cls_ids == self.person_class,
+                                    person_floor_conf, self.iou)
+            if widx:
+                weak_persons = np.concatenate(
+                    [xyxy[widx], cls_conf[widx, None]], axis=1).astype(np.float32)
 
         # объекты — NMS отдельно по каждому классу
         objects = []
@@ -179,4 +195,4 @@ class YoloOnnx:
                     b = xyxy[i]
                     objects.append((float(b[0]), float(b[1]), float(b[2]), float(b[3]),
                                     float(cls_conf[i]), int(c)))
-        return persons, objects
+        return persons, objects, weak_persons

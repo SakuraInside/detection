@@ -1,7 +1,7 @@
 {
   "model": {
     "weights": "models/yolo11s.pt",
-    "imgsz": 640,
+    "imgsz": 960,
     "device": "cuda:0",
     "half": true,
     "conf": 0.35,
@@ -89,6 +89,9 @@
     "tracker_max_missed_frames": 45,
     "tracker_soft_centroid_match": 1,
 
+    "max_object_area_ratio": 0.0,
+    "suppress_lost_person_frames": 20,
+
     "use_frame_diff_detector": true,
     "frame_diff_buffer_size": 10,
     "frame_diff_pixel_threshold": 20.0,
@@ -102,7 +105,7 @@
     "fallback_to_python": true,
     "engine": "opencv",
     "model_path": "models/yolo11s.onnx",
-    "input_size": 640,
+    "input_size": 960,
     "require_real_engine": true
   },
   "ui": {

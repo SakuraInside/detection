@@ -361,3 +361,14 @@ class BYTETracker:
             self.removed_stracks = self.removed_stracks[-1000:]
 
         return [t for t in self.tracked_stracks if t.is_activated]
+
+    def predicted_lost(self, max_age: int = 20):
+        """Недавно «потерянные» треки с Kalman-предсказанной позицией (tlbr).
+
+        Нужны как зона ПОДАВЛЕНИЯ объект-кандидатов: сидящий человек мерцает в YOLO,
+        и на кадрах-пропусках его силуэт ловится MOG2 как «оставленный объект».
+        Пока трек жив предсказанием — гасим этот регион. В FSM/UI НЕ отдаём.
+        """
+        if max_age <= 0:
+            return []
+        return [t for t in self.lost_stracks if (self.frame_id - t.frame_id) <= max_age]

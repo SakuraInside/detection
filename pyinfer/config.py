@@ -50,6 +50,14 @@ class AnalyzerCfg:
     frame_diff_min_region_area_px: int = 100
     tracker_iou_match_threshold: float = 0.15
     tracker_max_missed_frames: int = 15
+    # Верхняя граница площади объект-региона (доля кадра). Регион крупнее — это не
+    # «оставленная вещь», а ближний план / силуэт крупного сидящего человека → дроп.
+    # По умолчанию ВЫКЛ (0): приоритет recall — близко к камере предмет крупный.
+    max_object_area_ratio: float = 0.0
+    # Подавление объект-регионов по «потерянным» person-трекам ByteTrack: сидящий
+    # человек мерцает в YOLO; столько кадров держим его предсказанный бокс как зону
+    # подавления, чтобы силуэт не стал ложным объектом. 0 — выключить.
+    suppress_lost_person_frames: int = 20
     # зона игнорирования детекций объектов (норм. координаты), [x1,y1,x2,y2] или None
     ignore_norm_rect: tuple | None = None
 
@@ -74,6 +82,10 @@ class Config:
     # пропускает: положены до warmup / постановка под окклюзией).
     object_detect_classes: tuple = tuple(DEFAULT_OBJECT_CLASSES)
     object_detect_conf: float = 0.35
+    # Порог «слабых» person-детекций для ПОДАВЛЕНИЯ объект-фантомов (сидящие/ближний
+    # план, которых YOLO видит слабо). 0 — выключить. Ниже self.conf(=low_thresh).
+    # По умолчанию ВЫКЛ: приоритет recall (может душить реально оставленный предмет).
+    person_suppress_conf: float = 0.0
     tracker: TrackerCfg = field(default_factory=TrackerCfg)
     analyzer: AnalyzerCfg = field(default_factory=AnalyzerCfg)
 
@@ -112,6 +124,7 @@ def load_config(root: Path) -> Config:
     elif odc == [] or model.get("disable_object_detect"):
         c.object_detect_classes = tuple()  # явное отключение YOLO-предметов
     c.object_detect_conf = _f(model, "detect_object_conf", 0.35)
+    c.person_suppress_conf = _f(model, "person_suppress_conf", 0.08)
 
     c.tracker = TrackerCfg(
         high_thresh=_f(trk, "high_thresh", 0.5),
@@ -147,6 +160,8 @@ def load_config(root: Path) -> Config:
         frame_diff_min_region_area_px=_i(analyzer, "frame_diff_min_region_area_px", 100),
         tracker_iou_match_threshold=_f(analyzer, "tracker_iou_match_threshold", 0.15),
         tracker_max_missed_frames=_i(analyzer, "tracker_max_missed_frames", 15),
+        max_object_area_ratio=_f(analyzer, "max_object_area_ratio", 0.10),
+        suppress_lost_person_frames=_i(analyzer, "suppress_lost_person_frames", 20),
         ignore_norm_rect=ignore_rect,
     )
     return c

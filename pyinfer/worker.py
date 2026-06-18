@@ -67,6 +67,41 @@ def _merge_regions(primary, secondary, iou_thr: float) -> list:
     return out
 
 
+def _drop_oversized(regions, max_area_ratio, fw, fh):
+    """Убрать объект-регионы крупнее `max_area_ratio` площади кадра.
+
+    «Оставленная вещь» (сумка/рюкзак/чемодан) мала в кадре. Большой регион — это
+    ближний план или силуэт крупного СИДЯЩЕГО человека, которого YOLO не взял как
+    person. Без класса отличаем по размеру: люди-силуэты крупные, предметы — нет.
+    """
+    if max_area_ratio <= 0 or fw <= 0 or fh <= 0:
+        return list(regions)
+    cap = max_area_ratio * float(fw) * float(fh)
+    return [r for r in regions
+            if (r[2] - r[0]) * (r[3] - r[1]) <= cap]
+
+
+def _drop_in_ignore_rect(regions, ignore_rect, fw, fh):
+    """Убрать объект-кандидаты, чей центроид попал в зону игнорирования
+    (норм. координаты [x1,y1,x2,y2]).
+
+    Зеркалит native/src/frame_filter.cpp: люди НЕ трогаются (их ведёт ByteTrack),
+    отсекаются только class-agnostic объект-регионы. Главный давитель шума на
+    «мёртвых» участках сцены (витрина/монитор/эскалатор/блики в зоне rect).
+    """
+    if not ignore_rect or fw <= 0 or fh <= 0:
+        return list(regions)
+    x1, y1, x2, y2 = ignore_rect
+    out = []
+    for r in regions:
+        nx = 0.5 * (r[0] + r[2]) / fw
+        ny = 0.5 * (r[1] + r[3]) / fh
+        if x1 <= nx <= x2 and y1 <= ny <= y2:
+            continue
+        out.append(r)
+    return out
+
+
 def _suppress_near_persons(regions, persons, margin=0.10, contain=0.55):
     """Убрать кандидатов, которые реально НА человеке (его держат/часть тела).
 
@@ -136,9 +171,11 @@ class Session:
         h, w = bgr.shape[:2]
 
         t0 = time.perf_counter()
-        # Один проход YOLO: люди + «оставляемые» предметы (второй источник кандидатов).
-        dets, yolo_objs = self.model.detect_all(
-            bgr, self.cfg.object_detect_classes, self.cfg.object_detect_conf)
+        # Один проход YOLO: люди + «оставляемые» предметы (второй источник кандидатов)
+        # + «слабые» люди (маска подавления фантомов сидящих/ближнего плана).
+        dets, yolo_objs, weak = self.model.detect_all(
+            bgr, self.cfg.object_detect_classes, self.cfg.object_detect_conf,
+            self.cfg.person_suppress_conf)
         t1 = time.perf_counter()
 
         # M2: ByteTrack людей
@@ -148,16 +185,33 @@ class Session:
             b = st.tlbr
             persons.append(PersonDet(int(st.track_id), float(st.score),
                                      (float(b[0]), float(b[1]), float(b[2]), float(b[3]))))
+        # Расширенный список ТОЛЬКО для подавления регионов (в FSM/UI/owner НЕ идёт):
+        #  + «потерянные» person-треки (Kalman-предсказание, мерцающий человек),
+        #  + «слабые» сырые person-детекции (сидящие/ближний план, score<self.conf).
+        suppress_persons = list(persons)
+        lost = self.tracker.predicted_lost(self.cfg.analyzer.suppress_lost_person_frames)
+        for t in lost:
+            suppress_persons.append(PersonDet(int(t.track_id), float(t.score),
+                                              tuple(float(x) for x in t.tlbr)))
+        for b in weak:
+            suppress_persons.append(PersonDet(-1, float(b[4]),
+                                              (float(b[0]), float(b[1]), float(b[2]), float(b[3]))))
         t2 = time.perf_counter()
 
         # M3: class-agnostic объекты сцены = MOG2 (движение) + YOLO (статичные предметы)
         objects = []
         if self.cfg.analyzer.use_frame_diff_detector:
-            regions = self.candidates.process(bgr, persons)
+            regions = self.candidates.process(bgr, suppress_persons)
             yolo_boxes = [(o[0], o[1], o[2], o[3]) for o in yolo_objs]
             regions = _merge_regions(yolo_boxes, regions, 0.40)
-            # Жёсткое подавление кандидатов в зоне людей (главный давитель шума).
-            regions = _suppress_near_persons(regions, persons)
+            # Жёсткое подавление кандидатов в зоне людей (главный давитель шума) —
+            # включая предсказанные «потерянные» треки сидящих.
+            regions = _suppress_near_persons(regions, suppress_persons)
+            # Верхний размерный порог: силуэты крупных людей в ближнем плане — не вещи.
+            regions = _drop_oversized(regions, self.cfg.analyzer.max_object_area_ratio, w, h)
+            # Зона игнорирования объектов (config.analyzer.ignore_detection_norm_rect):
+            # в py-infer-режиме native frame_filter не работает, фильтруем здесь.
+            regions = _drop_in_ignore_rect(regions, self.cfg.analyzer.ignore_norm_rect, w, h)
             gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
             objects = self.obj_tracker.update(regions, persons, gray_full)
         t3 = time.perf_counter()

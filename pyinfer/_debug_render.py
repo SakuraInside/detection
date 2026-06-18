@@ -20,7 +20,8 @@ import numpy as np
 from .bytetrack import BYTETracker
 from .candidates import (CONFIRM_HITS, IouTracker, ObjectCandidates)
 from .config import load_config
-from .worker import _box_on_person, _merge_regions
+from .worker import (_box_on_person, _merge_regions, _suppress_near_persons,
+                     _drop_oversized, _drop_in_ignore_rect)
 from .yolo_onnx import YoloOnnx
 
 
@@ -59,14 +60,26 @@ def main():
         if not ok:
             break
         n += 1
-        dets, yolo_objs = model.detect_all(frame, cfg.object_detect_classes, cfg.object_detect_conf)
+        dets, yolo_objs, weak = model.detect_all(
+            frame, cfg.object_detect_classes, cfg.object_detect_conf, cfg.person_suppress_conf)
         stracks = tracker.update(dets)
         persons = [_P(int(s.track_id), float(s.score),
                       tuple(float(x) for x in s.tlbr)) for s in stracks]
-        regions = cand.process(frame, persons)
+        h, w = frame.shape[:2]
+        suppress_persons = list(persons)
+        for t in tracker.predicted_lost(cfg.analyzer.suppress_lost_person_frames):
+            suppress_persons.append(_P(int(t.track_id), float(t.score),
+                                       tuple(float(x) for x in t.tlbr)))
+        weak_boxes = [(float(b[0]), float(b[1]), float(b[2]), float(b[3])) for b in weak]
+        for wb in weak_boxes:
+            suppress_persons.append(_P(-1, 0.1, wb))
+        regions = cand.process(frame, suppress_persons)
         yolo_boxes = [(o[0], o[1], o[2], o[3]) for o in yolo_objs
                       if not _box_on_person((o[0], o[1], o[2], o[3]), persons, 0.70)]
         regions = _merge_regions(yolo_boxes, regions, 0.40)
+        regions = _suppress_near_persons(regions, suppress_persons)
+        regions = _drop_oversized(regions, cfg.analyzer.max_object_area_ratio, w, h)
+        regions = _drop_in_ignore_rect(regions, cfg.analyzer.ignore_norm_rect, w, h)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         objs = obj_tracker.update(regions, persons, gray)
 

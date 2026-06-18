@@ -77,16 +77,31 @@ def main():
         h, w = frame.shape[:2]
         fw, fh = w, h
 
-        dets, _yolo_objs = model.detect_all(frame, cfg.object_detect_classes, cfg.object_detect_conf)
+        dets, _yolo_objs, weak = model.detect_all(
+            frame, cfg.object_detect_classes, cfg.object_detect_conf, cfg.person_suppress_conf)
         stracks = tracker.update(dets)
         persons = [_P(int(s.track_id), float(s.score),
                       tuple(float(x) for x in s.tlbr)) for s in stracks]
 
-        regions = candidates.process(frame, persons)
-        from .worker import _box_on_person, _merge_regions
+        # потерянные треки + слабые люди — только в подавление (зеркалим worker.process)
+        suppress_persons = list(persons)
+        for t in tracker.predicted_lost(cfg.analyzer.suppress_lost_person_frames):
+            suppress_persons.append(_P(int(t.track_id), float(t.score),
+                                       tuple(float(x) for x in t.tlbr)))
+        for b in weak:
+            suppress_persons.append(_P(-1, float(b[4]),
+                                       (float(b[0]), float(b[1]), float(b[2]), float(b[3]))))
+
+        regions = candidates.process(frame, suppress_persons)
+        from .worker import (_box_on_person, _merge_regions, _suppress_near_persons,
+                             _drop_in_ignore_rect, _drop_oversized)
         yolo_boxes = [(o[0], o[1], o[2], o[3]) for o in _yolo_objs
                       if not _box_on_person((o[0], o[1], o[2], o[3]), persons, 0.70)]
         regions = _merge_regions(yolo_boxes, regions, 0.40)
+        # зеркалим прод-пайплайн (worker.process): подавление + размерный порог + ignore-rect
+        regions = _suppress_near_persons(regions, suppress_persons)
+        regions = _drop_oversized(regions, cfg.analyzer.max_object_area_ratio, w, h)
+        regions = _drop_in_ignore_rect(regions, cfg.analyzer.ignore_norm_rect, w, h)
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         objects = obj_tracker.update(regions, persons, gray_full)
 
@@ -94,19 +109,26 @@ def main():
         events = analyzer.ingest(ts, pts_ms, cfg.camera_id, objects, persons, w, h)
         for e in events:
             ev_counter[e["type"]] += 1
+            if e["type"] in ("object_unattended", "object_removed", "object_missing"):
+                bx = e["bbox"]
+                ncx = (bx[0] + bx[2]) / 2 / max(1, w)
+                ncy = (bx[1] + bx[3]) / 2 / max(1, h)
+                print(f"  >>> {e['type']} @ {pts_ms/1000:6.1f}s  id={e['track_id']} "
+                      f"центр=({ncx:.2f},{ncy:.2f})  note={e.get('note','')}")
             if e["type"] == "object_unattended" and first_unattended_pts is None:
                 first_unattended_pts = pts_ms / 1000.0
 
         region_hist.append(len(regions))
         confirmed_hist.append(len(objects))
         persons_hist.append(len(persons))
-        cur_stable = [t for t in obj_tracker._tracks if t.stable]
+        cur_stable = [t for t in obj_tracker._tracks if t.stable and not getattr(t, "baseline", False)]
         stable_hist.append(len(cur_stable))
         for t in cur_stable:
             ever_stable_ids.add(t.track_id)
-            d = _life.setdefault(t.track_id, [n, n, t.bbox])
+            d = _life.setdefault(t.track_id, [n, n, t.bbox, False])
             d[1] = n  # последний кадр, когда стабилен
             d[2] = t.bbox
+            d[3] = d[3] or getattr(t, "owner_seen", False)  # владелец был привязан
 
         if n % 100 == 0:
             stable = sum(1 for t in obj_tracker._tracks if t.stable)
@@ -132,13 +154,14 @@ def main():
     stats("людей/кадр", persons_hist)
     print(f"всего РАЗНЫХ треков, дошедших до stable: {len(ever_stable_ids)}")
     top = sorted(_life.values(), key=lambda d: d[1] - d[0], reverse=True)[:12]
-    print("долгоживущие стабильные треки (старт→длительность @ норм.центр):")
-    for first, last, bbox in top:
+    print("долгоживущие стабильные треки (старт->длительность @ норм.центр):")
+    for first, last, bbox, owner in top:
         life_s = (last - first) / fps
         cx = (bbox[0] + bbox[2]) / 2 / fw
         cy = (bbox[1] + bbox[3]) / 2 / fh
         bench = "  <-- ЛАВКА" if (cx < 0.55 and cy > 0.5) else ""
-        print(f"   старт={first/fps:6.1f}s  жил {life_s:5.1f}s  центр=({cx:.2f},{cy:.2f}){bench}")
+        own = "  [OWNER]" if owner else ""
+        print(f"   старт={first/fps:6.1f}s  жил {life_s:5.1f}s  центр=({cx:.2f},{cy:.2f}){own}{bench}")
     if first_unattended_pts is not None:
         print(f"первый object_unattended на: {first_unattended_pts:.1f}s видео")
     print(f"события: {dict(ev_counter) if ev_counter else 'НЕТ'}")
