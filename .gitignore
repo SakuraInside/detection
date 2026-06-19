@@ -55,3 +55,4 @@ run_log.txt
 err.txt
 live_snapshot.jpg
 *.output
+logs/
