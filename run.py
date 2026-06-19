@@ -428,6 +428,13 @@ def main() -> None:
     env["INTEGRA_BACKEND_PORT"] = str(args.port)
     env["INTEGRA_VIDEO_BRIDGE_ADDR"] = args.bridge_addr
 
+    # RTSP/IP-камеры: транспорт TCP + I/O-таймаут по умолчанию. Ставим в окружение
+    # ДО старта video-bridge — на Windows значение, выставленное уже изнутри процесса,
+    # может не дойти до getenv внутри OpenCV/FFmpeg (отдельный CRT-кэш), и поток
+    # пойдёт по UDP → не подключится (VLC при этом работает по TCP). Не перетираем
+    # пользовательское значение.
+    env.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|timeout;5000000")
+
     if args.bridge_build_only and args.no_bridge:
         parser.error("--bridge-build-only несовместим с --no-bridge")
 

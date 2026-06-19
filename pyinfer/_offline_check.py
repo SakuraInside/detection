@@ -20,7 +20,7 @@ from .bytetrack import BYTETracker
 from .candidates import IouTracker, ObjectCandidates
 from .config import load_config
 from .scene_fsm import SceneAnalyzer
-from .yolo_onnx import YoloOnnx
+from .worker import _build_model
 
 
 class _P:
@@ -42,8 +42,7 @@ def main():
     root = Path(__file__).resolve().parent.parent
     cfg = load_config(root)
     yolo_conf = max(0.05, min(0.30, cfg.tracker.low_thresh))
-    model = YoloOnnx(cfg.model_path, imgsz=cfg.imgsz, conf=yolo_conf,
-                     iou=cfg.iou, person_class=cfg.person_class, threads=cfg.onnx_threads)
+    model = _build_model(cfg, yolo_conf)
 
     tracker = BYTETracker(cfg.tracker)
     candidates = ObjectCandidates(cfg.analyzer.frame_diff_min_region_area_px)

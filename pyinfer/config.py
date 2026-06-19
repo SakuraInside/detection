@@ -41,6 +41,10 @@ class AnalyzerCfg:
     owner_proximity_px: float = 180.0
     owner_left_sec: float = 5.0
     disappear_grace_sec: float = 4.0
+    # Fallback-эскалация без подтверждённого владельца: объект, простоявший статично
+    # столько секунд, переходит в UNATTENDED даже если хозяин не был задетектен рядом
+    # (сидящий/окклюзия/дальний план). 0 — выключить (строго ТЗ: нужен owner).
+    unattended_without_owner_sec: float = 0.0
     min_object_area_px: float = 600.0
     centroid_history_maxlen: int = 72
     max_active_tracks: int = 256
@@ -152,6 +156,7 @@ def load_config(root: Path) -> Config:
         owner_proximity_px=_f(analyzer, "owner_proximity_px", 180.0),
         owner_left_sec=_f(analyzer, "owner_left_sec", 5.0),
         disappear_grace_sec=_f(analyzer, "disappear_grace_sec", 4.0),
+        unattended_without_owner_sec=_f(analyzer, "unattended_without_owner_sec", 0.0),
         min_object_area_px=_f(analyzer, "min_object_area_px", 600.0),
         centroid_history_maxlen=_i(analyzer, "centroid_history_maxlen", 72),
         max_active_tracks=_i(analyzer, "max_active_tracks", 256),

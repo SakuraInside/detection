@@ -13,7 +13,7 @@
 //!
 //! Python в рантайме = 0 процессов.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::process::Command;
@@ -106,29 +106,86 @@ struct SessionHandle {
     _events_task: JoinHandle<()>,
 }
 
+/// Всё состояние ОДНОГО потока (камера/файл). Несколько таких живут параллельно
+/// в `AppState.streams`, ключ — `stream_id` ("cam1"/"cam2"/…). Это даёт несколько
+/// одновременно открытых видео/RTSP, каждое со своим мостом, worker-сессией,
+/// превью и таймлайном.
+struct Stream {
+    id: String,
+    info: RwLock<GatewayInfo>,
+    /// Зеркало `info.playing` без async-лока — читается в горячем bridge read-loop
+    /// каждый кадр (см. историю фикса троттла моста).
+    playing: AtomicBool,
+    playback_gen: AtomicU64,
+    session: Mutex<Option<SessionHandle>>,
+    /// Sender команд в активный bridge_worker этого потока (seek/pause/play/close).
+    bridge_cmd_tx: Mutex<Option<std::sync::mpsc::Sender<serde_json::Value>>>,
+}
+
+impl Stream {
+    fn new(id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            id: id.to_string(),
+            info: RwLock::new(GatewayInfo::default()),
+            playing: AtomicBool::new(false),
+            playback_gen: AtomicU64::new(0),
+            session: Mutex::new(None),
+            bridge_cmd_tx: Mutex::new(None),
+        })
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
-    info: Arc<RwLock<GatewayInfo>>,
+    /// Карта потоков по stream_id. Создаётся лениво при первом /api/open|/api/streams.
+    streams: Arc<RwLock<HashMap<String, Arc<Stream>>>>,
     events: Arc<Mutex<VecDeque<serde_json::Value>>>,
     root: PathBuf,
     bridge_addr: String,
-    playback_gen: Arc<AtomicU64>,
-    session: Arc<Mutex<Option<SessionHandle>>>,
     ws_tx: broadcast::Sender<String>,
     lib: Option<Arc<IntegraLib>>,
     infer_worker_addr: Option<String>,
     started_at: Instant,
     snapshots_dir: PathBuf,
-    /// Sender команд в активный bridge_worker (seek/pause/play/close).
-    /// При новом /api/open перетирается на свежий sender; старая bridge_worker-сессия
-    /// сама завершится (playback_gen) и её mpsc::Receiver уйдёт в drop.
-    bridge_cmd_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<serde_json::Value>>>>,
     /// `config.json` → `ui.show_persons`: рисовать ли bbox людей на MJPEG (ложные person на фоне иначе мешают).
     preview_draw_person_boxes: Arc<AtomicBool>,
     preview_max_long_edge: Arc<AtomicU32>,
     preview_jpeg_quality: Arc<AtomicU32>,
     preview_encode_max_fps: Arc<AtomicU32>,
     metrics_history: Arc<Mutex<VecDeque<serde_json::Value>>>,
+}
+
+/// stream_id по умолчанию, когда клиент не указал явно.
+const DEFAULT_STREAM_ID: &str = "cam1";
+
+fn sid(q: &StreamQuery) -> String {
+    q.stream_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_STREAM_ID.to_string())
+}
+
+impl AppState {
+    /// Получить (создать при отсутствии) поток по id.
+    async fn stream(&self, id: &str) -> Arc<Stream> {
+        if let Some(s) = self.streams.read().await.get(id) {
+            return s.clone();
+        }
+        let mut w = self.streams.write().await;
+        w.entry(id.to_string())
+            .or_insert_with(|| Stream::new(id))
+            .clone()
+    }
+
+    /// Получить поток только если он уже существует.
+    async fn try_stream(&self, id: &str) -> Option<Arc<Stream>> {
+        self.streams.read().await.get(id).cloned()
+    }
+
+    /// Снимок всех потоков (для тикера статуса / api_streams).
+    async fn all_streams(&self) -> Vec<Arc<Stream>> {
+        self.streams.read().await.values().cloned().collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,19 +280,16 @@ async fn main() -> anyhow::Result<()> {
     let preview_encode_max_fps = Arc::new(AtomicU32::new(preview_settings.max_fps));
 
     let state = AppState {
-        info: Arc::new(RwLock::new(GatewayInfo::default())),
+        streams: Arc::new(RwLock::new(HashMap::new())),
         events: Arc::new(Mutex::new(VecDeque::with_capacity(1024))),
         root,
         bridge_addr: std::env::var("INTEGRA_VIDEO_BRIDGE_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:9876".to_string()),
-        playback_gen: Arc::new(AtomicU64::new(0)),
-        session: Arc::new(Mutex::new(None)),
         ws_tx,
         lib,
         infer_worker_addr,
         started_at: Instant::now(),
         snapshots_dir,
-        bridge_cmd_tx: Arc::new(Mutex::new(None)),
         preview_draw_person_boxes,
         preview_max_long_edge,
         preview_jpeg_quality,
@@ -258,7 +312,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/seek", post(api_seek))
         .route("/api/metrics", get(api_metrics))
         .route("/api/files", get(api_files))
-        .route("/api/streams", get(api_streams))
+        .route("/api/streams", get(api_streams).post(api_create_stream))
+        .route("/api/close_stream", post(api_close_stream))
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/events", get(api_events).delete(api_clear_events))
         .route("/video_snapshot", get(video_snapshot))
@@ -372,13 +427,17 @@ fn content_type_for_path(path: &FsPath) -> &'static str {
 // /api/info, /api/metrics, /api/files, /api/streams, /api/settings, /api/events.
 // ---------------------------------------------------------------------------
 
-async fn api_info(State(state): State<AppState>, _q: Query<StreamQuery>) -> impl IntoResponse {
-    let info = state.info.read().await;
-    Json(info_payload(&info))
+async fn api_info(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> impl IntoResponse {
+    let id = sid(&q);
+    match state.try_stream(&id).await {
+        Some(st) => Json(info_payload(&id, &*st.info.read().await)),
+        None => Json(info_payload(&id, &GatewayInfo::default())),
+    }
 }
 
-fn info_payload(info: &GatewayInfo) -> serde_json::Value {
+fn info_payload(stream_id: &str, info: &GatewayInfo) -> serde_json::Value {
     serde_json::json!({
+        "stream_id": stream_id,
         "loaded": info.loaded,
         "playing": info.playing,
         "video_path": info.video_path,
@@ -535,10 +594,12 @@ fn tracks_payload(tracks: &[TrackSnapshot]) -> serde_json::Value {
     )
 }
 
-async fn api_metrics(State(state): State<AppState>, _q: Query<StreamQuery>) -> impl IntoResponse {
-    let info = state.info.read().await;
-    let info_clone = info.clone();
-    drop(info);
+async fn api_metrics(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> impl IntoResponse {
+    let id = sid(&q);
+    let info_clone = match state.try_stream(&id).await {
+        Some(st) => st.info.read().await.clone(),
+        None => GatewayInfo::default(),
+    };
 
     // Системные метрики через sysinfo (синхронные, держим минимум информации).
     let mut sys = System::new_all();
@@ -704,15 +765,63 @@ async fn api_files(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn api_streams(State(state): State<AppState>) -> impl IntoResponse {
-    let info = state.info.read().await;
-    Json(serde_json::json!({
-        "streams": [{
-            "stream_id": "main",
+    let mut out = Vec::new();
+    for st in state.all_streams().await {
+        let info = st.info.read().await;
+        out.push(serde_json::json!({
+            "stream_id": st.id,
             "loaded": info.loaded,
             "playing": info.playing,
             "video_path": info.video_path,
-        }]
-    }))
+            "width": info.width,
+            "height": info.height,
+            "fps": info.fps,
+        }));
+    }
+    // Стабильный порядок (cam1, cam2, …) — иначе сетка панелей «прыгает».
+    out.sort_by(|a, b| {
+        a.get("stream_id").and_then(|v| v.as_str()).unwrap_or("")
+            .cmp(b.get("stream_id").and_then(|v| v.as_str()).unwrap_or(""))
+    });
+    Json(serde_json::json!({ "streams": out }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateStreamRequest {
+    stream_id: Option<String>,
+}
+
+/// Создать (зарегистрировать) пустой поток — фронт зовёт при «+ Добавить поток».
+async fn api_create_stream(
+    State(state): State<AppState>,
+    Json(req): Json<CreateStreamRequest>,
+) -> impl IntoResponse {
+    let id = req
+        .stream_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_STREAM_ID.to_string());
+    let _ = state.stream(&id).await; // get-or-create
+    Json(serde_json::json!({"ok": true, "stream_id": id}))
+}
+
+/// Закрыть и удалить поток (остановить мост/сессию).
+async fn api_close_stream(
+    State(state): State<AppState>,
+    Json(req): Json<CreateStreamRequest>,
+) -> impl IntoResponse {
+    let id = req
+        .stream_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_STREAM_ID.to_string());
+    if let Some(st) = state.try_stream(&id).await {
+        // Останавливаем мост (смена gen → read-loop выходит) и worker-сессию.
+        st.playing.store(false, Ordering::SeqCst);
+        st.playback_gen.fetch_add(1, Ordering::SeqCst);
+        *st.session.lock().await = None;
+        *st.bridge_cmd_tx.lock().await = None;
+    }
+    state.streams.write().await.remove(&id);
+    Json(serde_json::json!({"ok": true, "stream_id": id}))
 }
 
 async fn api_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -838,30 +947,38 @@ async fn api_open(State(state): State<AppState>, Json(req): Json<OpenRequest>) -
         Err(msg) => return (StatusCode::FORBIDDEN, msg).into_response(),
     };
     let path_for_workers = abs_path.to_string_lossy().into_owned();
+    let stream_id = req
+        .stream_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_STREAM_ID.to_string());
+    let st = state.stream(&stream_id).await;
     {
-        let mut info = state.info.write().await;
+        let mut info = st.info.write().await;
         info.loaded = true;
         info.playing = true;
+        st.playing.store(true, Ordering::SeqCst);
         info.video_path = Some(path_for_workers.clone());
         info.tracks.clear();
         info.persons.clear();
         info.stats = PipelineStats::default();
     }
 
-    // Стартуем (или переоткрываем) FFI сессию.
-    if let Err(e) = open_pipeline_session(state.clone(), path_for_workers.clone()).await {
+    // Стартуем (или переоткрываем) сессию инференса для ЭТОГО потока.
+    if let Err(e) = open_pipeline_session(state.clone(), st.clone(), path_for_workers.clone()).await {
         error!(error = %e, "failed to open pipeline session");
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("pipeline open: {e}"))
             .into_response();
     }
 
-    // Подключаемся к video-bridge для получения кадров.
-    start_bridge_stream(state.clone(), path_for_workers.clone());
+    // Подключаемся к video-bridge для получения кадров этого потока.
+    start_bridge_stream(state.clone(), st.clone(), path_for_workers.clone());
 
     push_event(
         &state,
         serde_json::json!({
             "ts": now_secs(),
+            "stream_id": stream_id,
             "video_pos_ms": 0.0,
             "type": "system_open",
             "track_id": null,
@@ -873,45 +990,52 @@ async fn api_open(State(state): State<AppState>, Json(req): Json<OpenRequest>) -
     )
     .await;
 
-    Json(serde_json::json!({"ok":true,"path":path_for_workers})).into_response()
+    Json(serde_json::json!({"ok":true,"path":path_for_workers,"stream_id":stream_id})).into_response()
 }
 
-async fn api_play(State(state): State<AppState>) -> impl IntoResponse {
-    {
-        let mut info = state.info.write().await;
-        info.playing = true;
+async fn api_play(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> impl IntoResponse {
+    let id = sid(&q);
+    if let Some(st) = state.try_stream(&id).await {
+        st.info.write().await.playing = true;
+        st.playing.store(true, Ordering::SeqCst);
+        send_bridge_command(&st, serde_json::json!({"cmd": "play"})).await;
     }
-    send_bridge_command(&state, serde_json::json!({"cmd": "play"})).await;
-    Json(serde_json::json!({"playing":true}))
+    Json(serde_json::json!({"playing":true,"stream_id":id}))
 }
 
-async fn api_pause(State(state): State<AppState>) -> impl IntoResponse {
-    {
-        let mut info = state.info.write().await;
-        info.playing = false;
+async fn api_pause(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> impl IntoResponse {
+    let id = sid(&q);
+    if let Some(st) = state.try_stream(&id).await {
+        st.info.write().await.playing = false;
+        st.playing.store(false, Ordering::SeqCst);
+        send_bridge_command(&st, serde_json::json!({"cmd": "pause"})).await;
     }
-    send_bridge_command(&state, serde_json::json!({"cmd": "pause"})).await;
-    Json(serde_json::json!({"playing":false}))
+    Json(serde_json::json!({"playing":false,"stream_id":id}))
 }
 
-async fn api_seek(State(state): State<AppState>, Json(req): Json<SeekRequest>) -> impl IntoResponse {
-    // Optimistic update — UI обновит timeline сразу. Реальная позиция придёт
-    // от video-bridge в meta следующего кадра (через ≤ длительность 1 кадра).
-    {
-        let mut info = state.info.write().await;
-        info.current_frame = req.frame.max(0);
+async fn api_seek(
+    State(state): State<AppState>,
+    Query(q): Query<StreamQuery>,
+    Json(req): Json<SeekRequest>,
+) -> impl IntoResponse {
+    let id = sid(&q);
+    let mut sent = false;
+    if let Some(st) = state.try_stream(&id).await {
+        // Optimistic update — UI обновит timeline сразу. Реальная позиция придёт
+        // от video-bridge в meta следующего кадра (через ≤ длительность 1 кадра).
+        st.info.write().await.current_frame = req.frame.max(0);
+        sent = send_bridge_command(
+            &st,
+            serde_json::json!({"cmd": "seek", "frame": req.frame.max(0)}),
+        )
+        .await;
     }
-    let sent = send_bridge_command(
-        &state,
-        serde_json::json!({"cmd": "seek", "frame": req.frame.max(0)}),
-    )
-    .await;
-    Json(serde_json::json!({"ok": sent, "frame": req.frame.max(0)}))
+    Json(serde_json::json!({"ok": sent, "frame": req.frame.max(0), "stream_id": id}))
 }
 
-async fn send_bridge_command(state: &AppState, cmd: serde_json::Value) -> bool {
+async fn send_bridge_command(st: &Arc<Stream>, cmd: serde_json::Value) -> bool {
     let tx = {
-        let guard = state.bridge_cmd_tx.lock().await;
+        let guard = st.bridge_cmd_tx.lock().await;
         guard.as_ref().cloned()
     };
     match tx {
@@ -924,9 +1048,13 @@ async fn send_bridge_command(state: &AppState, cmd: serde_json::Value) -> bool {
 // MJPEG / snapshot.
 // ---------------------------------------------------------------------------
 
-async fn video_snapshot(State(state): State<AppState>, _stream: Query<StreamQuery>) -> impl IntoResponse {
-    let info = state.info.read().await;
-    if let Some(jpeg) = info.latest_jpeg.clone() {
+async fn video_snapshot(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> impl IntoResponse {
+    let id = sid(&q);
+    let jpeg = match state.try_stream(&id).await {
+        Some(st) => st.info.read().await.latest_jpeg.clone(),
+        None => None,
+    };
+    if let Some(jpeg) = jpeg {
         return (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")],
@@ -937,16 +1065,17 @@ async fn video_snapshot(State(state): State<AppState>, _stream: Query<StreamQuer
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn video_feed(State(state): State<AppState>, _stream: Query<StreamQuery>) -> impl IntoResponse {
+async fn video_feed(State(state): State<AppState>, Query(q): Query<StreamQuery>) -> impl IntoResponse {
+    let id = sid(&q);
     let body_stream = stream! {
         let boundary = "frame";
         let _last_preview_encode = Instant::now()
             .checked_sub(StdDuration::from_secs(1))
             .unwrap_or_else(Instant::now);
         loop {
-            let maybe = {
-                let info = state.info.read().await;
-                info.latest_jpeg.clone()
+            let maybe = match state.try_stream(&id).await {
+                Some(st) => st.info.read().await.latest_jpeg.clone(),
+                None => None,
             };
             if let Some(jpeg) = maybe {
                 let mut chunk = Vec::with_capacity(jpeg.len() + 128);
@@ -982,13 +1111,16 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn ws_loop(mut ws: WebSocket, state: AppState) {
-    // hello — текущий снэпшот.
-    let hello = {
-        let info = state.info.read().await;
-        serde_json::json!({"type":"hello","stream_id":"main","info": info_payload(&info)}).to_string()
-    };
-    if ws.send(Message::Text(hello)).await.is_err() {
-        return;
+    // hello — текущий снэпшот по КАЖДОМУ открытому потоку.
+    for st in state.all_streams().await {
+        let hello = {
+            let info = st.info.read().await;
+            serde_json::json!({"type":"hello","stream_id": st.id, "info": info_payload(&st.id, &info)})
+                .to_string()
+        };
+        if ws.send(Message::Text(hello)).await.is_err() {
+            return;
+        }
     }
 
     let mut rx = state.ws_tx.subscribe();
@@ -1011,13 +1143,15 @@ fn spawn_ws_status_ticker(state: AppState) {
         let mut tick = time::interval(Duration::from_millis(500));
         loop {
             tick.tick().await;
-            // Не пушим тяжёлые статусы, если нет подписчиков (broadcast::send отдаст Err).
-            let payload = {
-                let info = state.info.read().await;
-                serde_json::json!({"type":"status","stream_id":"main","info": info_payload(&info)})
-                    .to_string()
-            };
-            let _ = state.ws_tx.send(payload);
+            // Статус по каждому открытому потоку (фронт раскладывает по панелям).
+            for st in state.all_streams().await {
+                let payload = {
+                    let info = st.info.read().await;
+                    serde_json::json!({"type":"status","stream_id": st.id, "info": info_payload(&st.id, &info)})
+                        .to_string()
+                };
+                let _ = state.ws_tx.send(payload);
+            }
         }
     });
 }
@@ -1026,15 +1160,22 @@ fn spawn_ws_status_ticker(state: AppState) {
 // FFI pipeline session.
 // ---------------------------------------------------------------------------
 
-async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::Result<()> {
+async fn open_pipeline_session(
+    state: AppState,
+    st: Arc<Stream>,
+    _video_path: String,
+) -> anyhow::Result<()> {
     // Берём настройки из config.json (если есть) — иначе разумные дефолты.
     let cfg_json = read_config_json(&state.root).unwrap_or_else(|| serde_json::json!({}));
     let pcfg = build_pipeline_config(&state.root, &cfg_json);
 
-    info!(engine = %pcfg.engine_kind, model = %pcfg.model_path, "creating integra pipeline");
+    info!(stream = %st.id, engine = %pcfg.engine_kind, model = %pcfg.model_path, "creating integra pipeline");
 
+    // Каждый поток открывает СВОЁ соединение к infer_worker (воркер — поток на
+    // подключение, инференс сериализован общим локом). Так несколько камер
+    // обрабатываются параллельно одной моделью.
     let stream_handle = if let Some(ref addr) = state.infer_worker_addr {
-        info!(addr = %addr, "connecting to infer_worker via TCP");
+        info!(addr = %addr, stream = %st.id, "connecting to infer_worker via TCP");
         integra::spawn_tcp_stream(addr.clone())
             .map_err(|e| anyhow::anyhow!("tcp_stream connect failed: {e}"))?
     } else {
@@ -1047,12 +1188,13 @@ async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::
         join: _join,
     } = stream_handle;
 
-    let info_arc = state.info.clone();
     let events_arc = state.events.clone();
     let ws_tx = state.ws_tx.clone();
     let snapshots_dir = state.snapshots_dir.clone();
+    let st_task = st.clone();
 
     let events_task = tokio::spawn(async move {
+        let stream_id = st_task.id.clone();
         while let Some(msg) = events_rx.recv().await {
             match msg {
                 StreamMessage::Event(ev) => {
@@ -1062,7 +1204,7 @@ async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::
                         if let Some(ref bytes) = ev.snapshot_jpeg {
                             write_snapshot(&snapshots_dir, &ev.kind, ev.track_id, bytes)
                         } else {
-                            let latest = info_arc.read().await.latest_jpeg.clone();
+                            let latest = st_task.info.read().await.latest_jpeg.clone();
                             latest.and_then(|jpeg| {
                                 write_snapshot(&snapshots_dir, &ev.kind, ev.track_id, &jpeg)
                             })
@@ -1073,6 +1215,7 @@ async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::
 
                     let json_ev = serde_json::json!({
                         "ts": now_secs(),
+                        "stream_id": stream_id.clone(),
                         "video_pos_ms": ev.video_pos_ms,
                         "type": ev.kind,
                         "track_id": ev.track_id,
@@ -1091,23 +1234,23 @@ async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::
                         }
                     }
                     {
-                        let mut info = info_arc.write().await;
+                        let mut info = st_task.info.write().await;
                         info.stats.events_total = info.stats.events_total.saturating_add(1);
                     }
                     let _ = ws_tx.send(
-                        serde_json::json!({"type":"event","stream_id":"main","event":json_ev})
+                        serde_json::json!({"type":"event","stream_id": stream_id.clone(), "event": json_ev})
                             .to_string(),
                     );
                 }
                 StreamMessage::Frame(fr) => {
-                    update_info_from_frame(&info_arc, &fr).await;
+                    update_info_from_frame(&st_task.info, &fr).await;
                 }
                 StreamMessage::Error(e) => {
-                    warn!(error = %e, "integra stream error");
+                    warn!(stream = %stream_id, error = %e, "integra stream error");
                 }
             }
         }
-        info!("integra events consumer stopped");
+        info!(stream = %st_task.id, "integra events consumer stopped");
     });
 
     let new_session = SessionHandle {
@@ -1115,13 +1258,12 @@ async fn open_pipeline_session(state: AppState, _video_path: String) -> anyhow::
         _events_task: events_task,
     };
 
-    // Замена старой сессии (старая frame_tx уйдёт в drop → spawn_stream worker завершится).
-    let mut slot = state.session.lock().await;
-    *slot = Some(new_session);
+    // Замена старой сессии этого потока (старая frame_tx уйдёт в drop → worker завершится).
+    *st.session.lock().await = Some(new_session);
     Ok(())
 }
 
-async fn update_info_from_frame(info_arc: &Arc<RwLock<GatewayInfo>>, fr: &FrameResult) {
+async fn update_info_from_frame(info_arc: &RwLock<GatewayInfo>, fr: &FrameResult) {
     let mut info = info_arc.write().await;
     info.tracks = fr.tracks.clone();
     info.persons = fr.persons.clone();
@@ -1414,22 +1556,22 @@ fn build_pipeline_config(root: &FsPath, cfg: &serde_json::Value) -> integra::Pip
 // Video-bridge consumer: тянет кадры по TCP, кодит JPEG с overlay, пушит в pipeline.
 // ---------------------------------------------------------------------------
 
-fn start_bridge_stream(state: AppState, video_path: String) {
-    let my_gen = state.playback_gen.fetch_add(1, Ordering::SeqCst) + 1;
+fn start_bridge_stream(state: AppState, st: Arc<Stream>, video_path: String) {
+    let my_gen = st.playback_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let bridge_addr = state.bridge_addr.clone();
 
     // Канал команд из API-handlers в этот воркер. Воркер пишет JSON-строки в сокет
     // video-bridge; bridge применяет их перед чтением следующего кадра.
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<serde_json::Value>();
 
-    // Регистрируем sender в AppState — старый автоматически перетрётся (его receiver уйдёт
+    // Регистрируем sender в потоке — старый автоматически перетрётся (его receiver уйдёт
     // в drop вместе с предыдущей spawn_blocking task, которая уже завершилась по playback_gen).
     {
-        let state_cmd = state.bridge_cmd_tx.clone();
+        let st_cmd = st.clone();
         let tx = cmd_tx.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                *state_cmd.lock().await = Some(tx);
+                *st_cmd.bridge_cmd_tx.lock().await = Some(tx);
             });
         });
     }
@@ -1438,10 +1580,11 @@ fn start_bridge_stream(state: AppState, video_path: String) {
         let mut sock = match std::net::TcpStream::connect(&bridge_addr) {
             Ok(s) => s,
             Err(e) => {
-                error!(addr=%bridge_addr, error=%e, "failed to connect to video-bridge");
-                let info = state.info.clone();
+                error!(addr=%bridge_addr, stream=%st.id, error=%e, "failed to connect to video-bridge");
+                st.playing.store(false, Ordering::SeqCst);
+                let st_err = st.clone();
                 tokio::runtime::Handle::current().spawn(async move {
-                    info.write().await.playing = false;
+                    st_err.info.write().await.playing = false;
                 });
                 return;
             }
@@ -1467,17 +1610,43 @@ fn start_bridge_stream(state: AppState, video_path: String) {
         }
         let hs_v: serde_json::Value = serde_json::from_str(hs.trim()).unwrap_or_default();
         if !hs_v.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            warn!(handshake=%hs.trim(), "video-bridge handshake failed");
+            let msg = hs_v
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("video-bridge handshake failed")
+                .to_string();
+            warn!(stream=%st.id, handshake=%hs.trim(), "video-bridge handshake failed");
+            // Сообщаем UI: поток не открылся (главное для диагностики RTSP).
+            st.playing.store(false, Ordering::SeqCst);
+            let st_err = st.clone();
+            let st_state = state.clone();
+            let sid_err = st.id.clone();
+            tokio::runtime::Handle::current().spawn(async move {
+                st_err.info.write().await.playing = false;
+                push_event(
+                    &st_state,
+                    serde_json::json!({
+                        "ts": now_secs(),
+                        "stream_id": sid_err,
+                        "video_pos_ms": 0.0,
+                        "type": "system_error",
+                        "track_id": null, "cls_name": "", "confidence": null,
+                        "bbox": [0,0,0,0],
+                        "note": format!("Источник не открылся: {msg}"),
+                    }),
+                )
+                .await;
+            });
             return;
         }
         {
-            let info = state.info.clone();
+            let st_hs = st.clone();
             let fps = hs_v.get("fps").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let frames = hs_v.get("frames").and_then(|v| v.as_i64()).unwrap_or(0);
             let width = hs_v.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let height = hs_v.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             tokio::runtime::Handle::current().spawn(async move {
-                let mut info = info.write().await;
+                let mut info = st_hs.info.write().await;
                 info.fps = fps;
                 info.frame_count = frames;
                 info.width = width;
@@ -1489,8 +1658,29 @@ fn start_bridge_stream(state: AppState, video_path: String) {
             .checked_sub(StdDuration::from_secs(1))
             .unwrap_or_else(Instant::now);
 
+        // Клонируем frame_tx ОДИН раз: tokio mpsc::Sender::try_send синхронный, так
+        // что в цикле кадры уходят воркеру без async-лока на st.session (раньше
+        // это был ещё один block_in_place(block_on) на каждый кадр).
+        let frame_tx: Option<mpsc::Sender<integra::Frame>> =
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    st.session.lock().await.as_ref().map(|s| s.frame_tx.clone())
+                })
+            });
+
+        // fps-EMA считаем локально (без лока); в общий state пишем только на такте
+        // превью (≤ preview_encode_max_fps) — для UI этого с запасом достаточно.
+        let mut local_fps = 0.0_f64;
+        let mut last_video_at: Option<Instant> = None;
+        // Кодирование превью (downscale+overlay+JPEG, десятки мс на 1080p@q92)
+        // вынесено с потока read-loop: раньше оно шло ИНЛАЙН и гейтило приём
+        // кадров (decode залипал на ~12fps при 25fps-кодировании). Теперь кодируем
+        // в отдельной задаче; guard пропускает такт, если предыдущий кадр ещё
+        // кодируется — превью само себя троттлит, а декод идёт в реальном времени.
+        let preview_busy = Arc::new(AtomicBool::new(false));
+
         loop {
-            if state.playback_gen.load(Ordering::SeqCst) != my_gen {
+            if st.playback_gen.load(Ordering::SeqCst) != my_gen {
                 break;
             }
 
@@ -1503,12 +1693,7 @@ fn start_bridge_stream(state: AppState, video_path: String) {
                 }
                 let _ = std::io::Write::flush(&mut sock);
             }
-            let playing = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    state.info.read().await.playing
-                })
-            });
-            if !playing {
+            if !st.playing.load(Ordering::SeqCst) {
                 std::thread::sleep(StdDuration::from_millis(30));
                 continue;
             }
@@ -1541,99 +1726,78 @@ fn start_bridge_stream(state: AppState, video_path: String) {
                 continue;
             }
 
-            // 0. Скорость приёма кадров с video-bridge (плавность видео; не путать с pipeline_process_fps).
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut info = state.info.write().await;
-                    let now = Instant::now();
-                    if let Some(prev) = info.stats.last_video_frame_at {
-                        let dt = now.duration_since(prev).as_secs_f64().max(1e-6);
-                        let inst_fps = 1.0 / dt;
-                        let a = 0.25_f64;
-                        info.stats.video_bridge_fps =
-                            a * inst_fps + (1.0 - a) * info.stats.video_bridge_fps;
-                    }
-                    info.stats.last_video_frame_at = Some(now);
-                });
-            });
+            // 0. Скорость приёма кадров с video-bridge (локальный EMA, без лока).
+            let now = Instant::now();
+            if let Some(prev) = last_video_at {
+                let dt = now.duration_since(prev).as_secs_f64().max(1e-6);
+                local_fps = 0.25 * (1.0 / dt) + 0.75 * local_fps;
+            }
+            last_video_at = Some(now);
 
+            // 1. Кадр воркеру (drop-newest): прямой try_send, без async-лока.
             let bgr_shared = Arc::new(bgr);
-            push_frame_to_pipeline(
-                &state,
-                bgr_shared.clone(),
-                w as u32,
-                h as u32,
-                pts_ms as i64,
-            );
+            if let Some(tx) = &frame_tx {
+                let _ = tx.try_send(integra::Frame {
+                    bgr: bgr_shared.clone(),
+                    width: w as u32,
+                    height: h as u32,
+                    pts_ms: pts_ms as i64,
+                });
+            }
 
             let max_preview_fps = state
                 .preview_encode_max_fps
                 .load(Ordering::Relaxed)
                 .clamp(1, 60);
             let preview_period = StdDuration::from_secs_f64(1.0 / max_preview_fps as f64);
-            if last_preview_encode.elapsed() < preview_period {
-                let info = state.info.clone();
-                tokio::runtime::Handle::current().spawn(async move {
-                    info.write().await.current_frame = frame_id;
-                });
+            // Пропускаем такт, если ещё не пришло время ИЛИ предыдущее превью всё
+            // ещё кодируется (guard) — read-loop никогда не ждёт энкодер.
+            if last_preview_encode.elapsed() < preview_period
+                || preview_busy.load(Ordering::Acquire)
+            {
                 continue;
             }
             last_preview_encode = Instant::now();
+            preview_busy.store(true, Ordering::Release);
 
-            // 2. Снимок треков и людей (для overlay).
-            let (tracks_snapshot, persons_snapshot) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let g = state.info.read().await;
-                    (g.tracks.clone(), g.persons.clone())
-                })
-            });
-
-            // 3. BGR → RGB, даунскейл, bbox, JPEG.
+            // Кодирование вынесено в отдельную задачу: снимок треков (async-read),
+            // затем тяжёлый encode на blocking-пуле. read-loop сразу идёт за
+            // следующим кадром — декод не зависит от частоты/качества превью.
+            // Настройки превью — общие (state), кадр/треки — этого потока (st).
+            let st_pv = st.clone();
+            let busy = preview_busy.clone();
+            let bgr_for_preview = bgr_shared.clone();
             let draw_person_boxes = state.preview_draw_person_boxes.load(Ordering::Relaxed);
             let max_long_edge = state.preview_max_long_edge.load(Ordering::Relaxed);
-            let jpeg_quality = state
-                .preview_jpeg_quality
-                .load(Ordering::Relaxed)
-                .clamp(35, 95) as u8;
-            let jpeg = encode_preview_jpeg_with_options(
-                &*bgr_shared,
-                w as u32,
-                h as u32,
-                &tracks_snapshot,
-                &persons_snapshot,
-                draw_person_boxes,
-                max_long_edge,
-                jpeg_quality,
-            );
-
-            if let Some(jpeg) = jpeg {
-                let info = state.info.clone();
-                tokio::runtime::Handle::current().spawn(async move {
-                    let mut info = info.write().await;
-                    info.current_frame = frame_id;
-                    info.latest_jpeg = Some(jpeg);
-                });
-            }
-        }
-    });
-}
-
-fn push_frame_to_pipeline(state: &AppState, bgr: Arc<Vec<u8>>, width: u32, height: u32, pts_ms: i64) {
-    let session_arc = state.session.clone();
-    // try_send из блокирующего контекста — берём lock в block_on'ом.
-    let _ = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async move {
-            let g = session_arc.lock().await;
-            if let Some(s) = g.as_ref() {
-                let frame = integra::Frame {
-                    bgr,
-                    width,
-                    height,
-                    pts_ms,
+            let jpeg_quality =
+                state.preview_jpeg_quality.load(Ordering::Relaxed).clamp(35, 95) as u8;
+            let (pw, ph, pframe, fps_now) = (w as u32, h as u32, frame_id, local_fps);
+            tokio::runtime::Handle::current().spawn(async move {
+                let (tracks_snapshot, persons_snapshot) = {
+                    let g = st_pv.info.read().await;
+                    (g.tracks.clone(), g.persons.clone())
                 };
-                let _ = s.frame_tx.try_send(frame);
-            }
-        });
+                let jpeg = tokio::task::spawn_blocking(move || {
+                    encode_preview_jpeg_with_options(
+                        &*bgr_for_preview, pw, ph,
+                        &tracks_snapshot, &persons_snapshot,
+                        draw_person_boxes, max_long_edge, jpeg_quality,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                {
+                    let mut info = st_pv.info.write().await;
+                    info.current_frame = pframe;
+                    info.stats.video_bridge_fps = fps_now;
+                    if let Some(jpeg) = jpeg {
+                        info.latest_jpeg = Some(jpeg);
+                    }
+                }
+                busy.store(false, Ordering::Release);
+            });
+        }
     });
 }
 

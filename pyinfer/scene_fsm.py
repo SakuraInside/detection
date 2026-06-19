@@ -219,16 +219,35 @@ class SceneAnalyzer:
 
             if tr.state in (St.STATIC, St.UNATTENDED, St.ALARM_UNATTENDED):
                 if not tr.ever_owner_near:
-                    continue
-                without_owner_for = (ts - tr.last_owner_near_ts) if tr.last_owner_near_ts > 0 \
-                    else (ts - tr.first_seen_ts)
-                if without_owner_for >= p.owner_left_sec and tr.state == St.STATIC:
-                    # Переход в UNATTENDED — ВНУТРЕННИЙ (нужен для таймера тревоги).
-                    # Событие object_left в ленту НЕ шлём (по просьбе: оставляем
-                    # только реальные тревоги со снимками — unattended/removed/missing).
-                    tr.state = St.UNATTENDED
-                    tr.unattended_since_ts = ts
-                    tr.object_left_emitted = True
+                    # Владелец не зафиксирован: поставивший предмет человек не был
+                    # чисто задетектен рядом (сидящий / окклюзия / дальний план /
+                    # слабый conf < OWNER_MIN_CONF). Раньше такой объект ВЕЧНО висел
+                    # жёлтым и в тревогу не переходил — главный симптом, на который
+                    # жаловался пользователь. Fallback: объект, простоявший статично
+                    # без движения дольше расширенного порога, всё равно считаем
+                    # «оставленным» и эскалируем. Порог выше owner-пути — это плата
+                    # за отсутствие подтверждённого хозяина (меньше ложных).
+                    static_for = (ts - tr.static_since_ts) if tr.static_since_ts > 0 else 0.0
+                    if (p.unattended_without_owner_sec > 0.0 and tr.state == St.STATIC
+                            and static_for >= p.unattended_without_owner_sec):
+                        tr.state = St.UNATTENDED
+                        tr.unattended_since_ts = ts
+                        tr.object_left_emitted = True
+                    elif tr.state == St.STATIC:
+                        # ещё дозревает (порог fallback не достигнут) — ждём.
+                        continue
+                    # если fallback уже перевёл в UNATTENDED/ALARM — НЕ continue,
+                    # проваливаемся ниже к таймеру тревоги.
+                else:
+                    without_owner_for = (ts - tr.last_owner_near_ts) if tr.last_owner_near_ts > 0 \
+                        else (ts - tr.first_seen_ts)
+                    if without_owner_for >= p.owner_left_sec and tr.state == St.STATIC:
+                        # Переход в UNATTENDED — ВНУТРЕННИЙ (нужен для таймера тревоги).
+                        # Событие object_left в ленту НЕ шлём (по просьбе: оставляем
+                        # только реальные тревоги со снимками — unattended/removed/missing).
+                        tr.state = St.UNATTENDED
+                        tr.unattended_since_ts = ts
+                        tr.object_left_emitted = True
 
             if tr.state == St.UNATTENDED:
                 unattended_for = ts - tr.unattended_since_ts

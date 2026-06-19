@@ -1,19 +1,18 @@
 /* Front-end Integra-LOST.
-   Сборка не нужна: чистый ES2020 в браузере. */
+   Сборка не нужна: чистый ES2020 в браузере.
+   Мультипоток: до MAX_STREAMS панелей (камеры/файлы) работают ОДНОВРЕМЕННО,
+   каждая со своим видео/таймлайном; журнал событий и тревоги — общие с пометкой потока. */
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+const MAX_STREAMS = 4;
+
 const state = {
-  loaded: false,
-  playing: false,
-  activeStreamId: "main",
   currentPage: "monitor",
-  streams: [],
-  totalFrames: 0,
-  fps: 30,
-  seekDragging: false,
-  // Храним активные тревоги в памяти UI: ключ = track_id.
+  // stream_id -> { info, panel:{...}, seekDragging }
+  streams: new Map(),
+  // ключ `${stream_id}:${track_id}` -> { stream_id, id, cls, state }
   alarms: new Map(),
   ws: null,
   settings: null,
@@ -28,19 +27,17 @@ const EVENT_UI = {
   object_unattended: { title: "Бесхозный предмет", desc: "Предмет без владельца дольше порога." },
   object_removed: { title: "Предмет забрали", desc: "Объект исчез после взаимодействия с человеком." },
   object_missing: { title: "Предмет пропал", desc: "Ранее наблюдавшийся объект исчез из кадра." },
+  system_error: { title: "Ошибка источника", desc: "Поток/файл не открылся." },
 };
 
-// Какие типы событий показываем в журнале (person_interaction — контекст, не засоряем журнал).
 const JOURNAL_EVENT_TYPES = new Set([
-  "object_left", "object_unattended", "object_removed", "object_missing",
+  "object_left", "object_unattended", "object_removed", "object_missing", "system_error",
 ]);
 
-// Тревожные события (звук + индикатор).
 const ALARM_EVENT_TYPES = new Set([
   "object_unattended", "object_removed", "object_missing",
 ]);
 
-// Оформление карточки активной тревоги по состоянию трека.
 const ALARM_STATE_UI = {
   alarm_unattended: { label: "бесхозный предмет", badge: "badge badge-danger", tag: "БЕСХОЗНЫЙ" },
   alarm_removed: { label: "предмет забрали", badge: "badge badge-warn", tag: "ЗАБРАЛИ" },
@@ -116,7 +113,7 @@ async function api(method, path, body) {
   return r.json();
 }
 
-function withStream(path, streamId = state.activeStreamId) {
+function withStream(path, streamId) {
   const hasQ = path.includes("?");
   return `${path}${hasQ ? "&" : "?"}stream_id=${encodeURIComponent(streamId)}`;
 }
@@ -139,23 +136,424 @@ function renderSkeletonList(root, rows = 4) {
   }
 }
 
-// ----------------------------------------------------------- опрос статуса
+// ----------------------------------------------------------- потоки и панели
 
-async function refreshInfo() {
-  try {
-    const info = await api("GET", withStream("/api/info"));
-    applyInfo(info);
-  } catch (e) {
-    console.warn("info fail", e);
+/** Свободный cam-id (cam1..camN), которого ещё нет среди потоков. */
+function nextStreamId() {
+  for (let i = 1; i <= MAX_STREAMS; i++) {
+    const id = "cam" + i;
+    if (!state.streams.has(id)) return id;
+  }
+  return null; // лимит достигнут
+}
+
+/** Создать (или вернуть) запись потока + DOM-панель. */
+function ensureStream(streamId) {
+  let s = state.streams.get(streamId);
+  if (s) return s;
+  const panel = buildPanel(streamId);
+  s = { info: null, panel, seekDragging: false };
+  state.streams.set(streamId, s);
+  $("#streams-grid").appendChild(panel.root);
+  syncGridLayout();
+  renderTargetSelect();
+  return s;
+}
+
+function removeStream(streamId) {
+  const s = state.streams.get(streamId);
+  if (!s) return;
+  s.panel.root.remove();
+  state.streams.delete(streamId);
+  // убрать тревоги этого потока
+  for (const key of [...state.alarms.keys()]) {
+    if (key.startsWith(streamId + ":")) state.alarms.delete(key);
+  }
+  renderAlarms();
+  syncGridLayout();
+  renderTargetSelect();
+}
+
+/** Раскладка сетки: 1 поток — широкая, 2+ — по два столбца. */
+function syncGridLayout() {
+  const grid = $("#streams-grid");
+  const n = state.streams.size;
+  grid.classList.toggle("cols-1", n <= 1);
+  grid.classList.toggle("cols-2", n >= 2);
+  $("#streams-empty").style.display = n === 0 ? "block" : "none";
+  $("#streams-count").textContent = n ? `· ${n}/${MAX_STREAMS}` : "";
+}
+
+/** Построить DOM-панель потока с собственными контролами. */
+function buildPanel(streamId) {
+  const root = document.createElement("div");
+  root.className = "stream-panel card-animated";
+  root.dataset.stream = streamId;
+  root.innerHTML = `
+    <div class="panel-head">
+      <span class="panel-dot"></span>
+      <span class="panel-title" title="${streamId}">${streamId}</span>
+      <span class="panel-src text-slate-400 truncate"></span>
+      <button class="panel-close" title="Закрыть поток">✕</button>
+    </div>
+    <div class="panel-video-wrap">
+      <img class="panel-video" alt="${streamId}"/>
+      <div class="panel-alarm-ring hidden"></div>
+      <div class="panel-novideo">Нет видео</div>
+    </div>
+    <div class="panel-controls">
+      <button class="panel-play btn-icon" title="Воспроизведение">▶</button>
+      <button class="panel-pause btn-icon" title="Пауза">⏸</button>
+      <input class="panel-seek" type="range" min="0" max="0" value="0" step="1"/>
+      <span class="panel-meta">0 / 0 · — fps</span>
+    </div>
+  `;
+  const panel = {
+    root,
+    img: root.querySelector(".panel-video"),
+    ring: root.querySelector(".panel-alarm-ring"),
+    novideo: root.querySelector(".panel-novideo"),
+    title: root.querySelector(".panel-title"),
+    src: root.querySelector(".panel-src"),
+    seek: root.querySelector(".panel-seek"),
+    meta: root.querySelector(".panel-meta"),
+    playBtn: root.querySelector(".panel-play"),
+    pauseBtn: root.querySelector(".panel-pause"),
+  };
+
+  panel.playBtn.onclick = () =>
+    api("POST", withStream("/api/play", streamId)).catch((e) => console.warn(e));
+  panel.pauseBtn.onclick = () =>
+    api("POST", withStream("/api/pause", streamId)).catch((e) => console.warn(e));
+  panel.close = root.querySelector(".panel-close");
+  panel.close.onclick = async () => {
+    try { await api("POST", "/api/close_stream", { stream_id: streamId }); } catch {}
+    removeStream(streamId);
+  };
+
+  const s = () => state.streams.get(streamId);
+  panel.seek.addEventListener("mousedown", () => { if (s()) s().seekDragging = true; });
+  panel.seek.addEventListener("touchstart", () => { if (s()) s().seekDragging = true; });
+  const release = () => {
+    const st = s();
+    if (!st || !st.seekDragging) return;
+    st.seekDragging = false;
+    api("POST", withStream("/api/seek", streamId), { frame: Number(panel.seek.value) })
+      .catch((e) => console.warn(e));
+  };
+  panel.seek.addEventListener("mouseup", release);
+  panel.seek.addEventListener("touchend", release);
+  panel.seek.addEventListener("change", () => {
+    const st = s();
+    if (st && !st.seekDragging) {
+      api("POST", withStream("/api/seek", streamId), { frame: Number(panel.seek.value) })
+        .catch((e) => console.warn(e));
+    }
+  });
+
+  attachVideoStream(streamId, panel);
+  return panel;
+}
+
+/** Применить info одного потока к его панели + синхронизировать тревоги. */
+function applyInfo(streamId, info) {
+  if (!info) return;
+  const s = ensureStream(streamId);
+  s.info = info;
+  const p = s.panel;
+
+  p.novideo.style.display = info.loaded ? "none" : "flex";
+  if (info.video_path) {
+    const base = String(info.video_path).split(/[\\/]/).pop();
+    p.src.textContent = base ? "· " + base : "";
+    p.title.title = info.video_path;
+  }
+  p.root.classList.toggle("panel-paused", info.loaded && !info.playing);
+
+  const cur = info.current_frame || 0;
+  if (!s.seekDragging) {
+    p.seek.max = String(Math.max(0, (info.frame_count || 1) - 1));
+    p.seek.value = String(cur);
+  }
+  const st = info.stats || {};
+  const dec = (st.decode_fps || 0).toFixed(0);
+  p.meta.textContent =
+    `${cur} / ${info.frame_count || 0} · ${dec} fps · ${info.width || "—"}×${info.height || "—"}`;
+
+  // тревоги этого потока из snapshot треков
+  const live = new Set();
+  for (const t of info.tracks || []) {
+    if (t.alarm) {
+      const key = streamId + ":" + t.id;
+      live.add(key);
+      if (!state.alarms.has(key)) {
+        state.alarms.set(key, { stream_id: streamId, id: t.id, cls: t.cls, state: t.state });
+      } else {
+        state.alarms.get(key).state = t.state;
+      }
+    }
+  }
+  for (const key of [...state.alarms.keys()]) {
+    if (key.startsWith(streamId + ":") && !live.has(key)) state.alarms.delete(key);
+  }
+  const hasAlarm = [...state.alarms.keys()].some((k) => k.startsWith(streamId + ":"));
+  p.ring.classList.toggle("hidden", !hasAlarm);
+  renderAlarms();
+  updateHud();
+}
+
+/** Сводный HUD в шапке (сумма по потокам). */
+function updateHud() {
+  let dec = 0, inf = 0, ev = 0, n = 0;
+  for (const s of state.streams.values()) {
+    const st = s.info?.stats; if (!st) continue;
+    dec += st.decode_fps || 0; inf += st.inference_ms_avg || 0; ev += st.events || 0; n++;
+  }
+  $("#hud-decode").textContent = `декод Σ${dec.toFixed(0)} fps`;
+  $("#hud-render").textContent = `потоков ${state.streams.size}`;
+  $("#hud-inf").textContent = `инф ${n ? (inf / n).toFixed(0) : 0} мс`;
+  $("#hud-events").textContent = `событий ${ev}`;
+  for (const el of ["#hud-decode", "#hud-render", "#hud-inf", "#hud-events", "#hud-conn"]) {
+    $(el).classList.remove("hidden");
   }
 }
 
+/** Синхронизировать панели с серверным списком потоков (GET /api/streams). */
+async function refreshStreams() {
+  try {
+    const data = await api("GET", "/api/streams");
+    const serverStreams = data.streams || [];
+    const seen = new Set();
+    for (const srv of serverStreams) {
+      seen.add(srv.stream_id);
+      ensureStream(srv.stream_id);
+    }
+    // потоки, исчезнувшие на сервере — убрать (если не локально-новые без open)
+    for (const id of [...state.streams.keys()]) {
+      if (!seen.has(id) && state.streams.get(id).info) removeStream(id);
+    }
+    renderStreamsMemory(serverStreams);
+    renderTargetSelect();
+  } catch (e) {
+    console.warn("streams fail", e);
+  }
+}
+
+function renderTargetSelect() {
+  const sel = $("#target-stream");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const full = state.streams.size >= MAX_STREAMS;
+  const optNew = document.createElement("option");
+  optNew.value = "__new__";
+  optNew.textContent = full ? "Лимит потоков" : "Новый поток";
+  optNew.disabled = full;
+  sel.appendChild(optNew);
+  for (const id of [...state.streams.keys()].sort()) {
+    const o = document.createElement("option");
+    o.value = id;
+    o.textContent = id + " (заменить)";
+    sel.appendChild(o);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  else sel.value = full && state.streams.size ? [...state.streams.keys()].sort()[0] : "__new__";
+}
+
+function renderStreamsMemory(streams) {
+  const root = $("#streams-mem-list");
+  if (!root) return;
+  root.replaceChildren();
+  if (!streams || !streams.length) {
+    root.textContent = "—";
+    return;
+  }
+  for (const s of streams) {
+    const row = document.createElement("div");
+    row.className = "flex items-center justify-between gap-2 mb-0.5";
+    const label = document.createElement("span");
+    label.className = "truncate";
+    label.textContent = `${s.stream_id}${s.playing ? " ▶" : ""}`;
+    const val = document.createElement("span");
+    val.className = "font-mono text-slate-800";
+    val.textContent = s.video_path ? String(s.video_path).split(/[\\/]/).pop() : "—";
+    row.append(label, val);
+    root.appendChild(row);
+  }
+}
+
+// ----------------------------------------------------------- тревоги (общие, с пометкой потока)
+
+function renderAlarms() {
+  const root = $("#alarms");
+  root.innerHTML = "";
+  const count = state.alarms.size;
+  const cnt = $("#alarm-count");
+  cnt.textContent = String(count);
+  cnt.className = count > 0 ? "badge badge-danger" : "badge badge-neutral";
+  if (count === 0) {
+    root.innerHTML = '<div class="text-xs text-slate-400">Нет активных тревог.</div>';
+    return;
+  }
+  for (const a of state.alarms.values()) {
+    const el = document.createElement("div");
+    const ui = ALARM_STATE_UI[a.state] || ALARM_STATE_UI.alarm_unattended;
+    el.className = "alarm-card alarm-active";
+    el.innerHTML = `
+      <div>
+        <div class="text-sm font-medium text-slate-900">#${a.id} · ${a.cls}</div>
+        <div class="text-[11px] text-slate-500"><span class="stream-tag">${a.stream_id}</span> ${ui.label}</div>
+      </div>
+      <span class="${ui.badge}">${ui.tag}</span>
+    `;
+    root.appendChild(el);
+  }
+}
+
+// ----------------------------------------------------------- журнал событий (общий)
+
+async function refreshEvents() {
+  try {
+    renderSkeletonList($("#events"), 5);
+    const data = await api("GET", "/api/events?limit=200");
+    renderEvents(data.events || []);
+  } catch (e) { console.warn(e); }
+}
+
+function renderEvents(events) {
+  const root = $("#events");
+  root.innerHTML = "";
+  const shown = events.filter((ev) => JOURNAL_EVENT_TYPES.has(ev.type));
+  if (!shown.length) {
+    root.innerHTML = '<div class="text-xs text-slate-400">Журнал пуст.</div>';
+    return;
+  }
+  for (const ev of shown) {
+    const ui = EVENT_UI[ev.type] || { title: ev.type, desc: "" };
+    const card = document.createElement("div");
+    card.className = `event-card event-${ev.type}`;
+    const img = ev.snapshot_path
+      ? `<a href="${ev.snapshot_path}" target="_blank" rel="noopener noreferrer" title="Открыть снимок">
+           <img src="${ev.snapshot_path}" alt="снимок события"/>
+         </a>`
+      : '<div class="placeholder">нет</div>';
+    const note = ev.note ? `<div class="text-[11px] text-slate-500 mt-1">${ev.note}</div>` : "";
+    const tag = ev.stream_id ? `<span class="stream-tag">${ev.stream_id}</span>` : "";
+    card.innerHTML = `
+      ${img}
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2 text-xs">
+          ${tag}
+          <span class="ev-type">${ui.title}</span>
+          <span class="text-slate-500">#${ev.track_id ?? "—"}</span>
+          <span class="text-slate-700 font-medium">${ev.cls_name ?? ""}</span>
+          ${ev.confidence != null ? `<span class="text-slate-400">${(ev.confidence * 100).toFixed(0)}%</span>` : ""}
+        </div>
+        <div class="text-[11px] text-slate-500 mt-0.5">${fmtTs(ev.ts)} · ${(ev.video_pos_ms / 1000).toFixed(2)}s</div>
+        <div class="text-[11px] text-slate-600 mt-0.5">${ui.desc}</div>
+        ${note}
+      </div>
+    `;
+    root.appendChild(card);
+  }
+}
+
+// ----------------------------------------------------------- список видеофайлов / открытие
+
+async function refreshFiles() {
+  const root = $("#files-list");
+  renderSkeletonList(root, 4);
+  const data = await api("GET", "/api/files");
+  root.innerHTML = "";
+  if (!data.files.length) {
+    root.innerHTML = `<div class="col-span-2 text-xs text-slate-400">Положите .mkv в ${data.data_dir}</div>`;
+    return;
+  }
+  for (const f of data.files) {
+    const btn = document.createElement("button");
+    btn.className = "file-tile truncate";
+    btn.innerHTML = `<div class="name truncate">${f.name}</div><div class="meta">${f.size_mb} MB</div>`;
+    btn.onclick = () => openVideo(f.path);
+    root.appendChild(btn);
+  }
+}
+
+/** Выбрать целевой stream_id из селектора (или новый свободный слот). */
+function resolveTargetStream() {
+  const sel = $("#target-stream");
+  const v = sel ? sel.value : "__new__";
+  if (v && v !== "__new__") return v;
+  const id = nextStreamId();
+  if (!id) {
+    alert(`Достигнут лимит потоков (${MAX_STREAMS}). Закройте один, чтобы открыть новый.`);
+    return null;
+  }
+  return id;
+}
+
+async function openVideo(path, targetStreamId) {
+  const streamId = targetStreamId || resolveTargetStream();
+  if (!streamId) return;
+  try {
+    ensureStream(streamId); // панель сразу, ещё до ответа
+    await api("POST", "/api/open", { path, stream_id: streamId });
+    attachVideoStream(streamId);
+    await refreshStreams();
+    await refreshEvents();
+  } catch (e) { alert("Не удалось открыть: " + e.message); }
+}
+
+async function openVideoFromSystemPicker(file) {
+  if (!file) return;
+  $("#picked-file-name").textContent = `Загрузка: ${file.name}`;
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  try {
+    let r;
+    try {
+      r = await fetch("/api/upload_video", { method: "POST", body: fd });
+    } catch (e) {
+      throw new Error("Сервер недоступен. Проверьте, что python run.py запущен.");
+    }
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`${r.status}: ${t}`);
+    }
+    const data = await r.json();
+    $("#picked-file-name").textContent = `Загружен: ${data.name}`;
+    await refreshFiles();
+    await openVideo(data.path);
+  } catch (e) {
+    $("#picked-file-name").textContent = "Ошибка загрузки";
+    alert("Не удалось загрузить файл: " + e.message);
+  }
+}
+
+/** Привязать MJPEG-поток к панели (с fallback на polling снапшота). */
+function attachVideoStream(streamId, panelArg) {
+  const panel = panelArg || state.streams.get(streamId)?.panel;
+  if (!panel) return;
+  const v = panel.img;
+  if (v._snapshotPoll) { clearInterval(v._snapshotPoll); v._snapshotPoll = null; }
+  v.onerror = () => {
+    if (v._snapshotPoll) return;
+    v._snapshotPoll = setInterval(() => {
+      v.src = withStream("/video_snapshot?ts=" + Date.now(), streamId);
+    }, 300);
+  };
+  v.src = withStream("/video_feed?ts=" + Date.now(), streamId);
+}
+
+// ----------------------------------------------------------- метрики ресурсов
+
 async function refreshMetrics() {
   try {
-    const data = await api("GET", withStream("/api/metrics"));
+    // метрики системные одни на всех; берём по первому потоку (или без stream_id).
+    const firstId = [...state.streams.keys()][0];
+    const path = firstId ? withStream("/api/metrics", firstId) : "/api/metrics";
+    const data = await api("GET", path);
     applySystemMetrics(data.system || {});
     applyProcessAnalyticsMetrics(data.process || {}, data.pipeline || {});
-    renderStreamsMemory(state.streams || []);
   } catch (e) {
     console.warn("metrics fail", e);
   }
@@ -193,12 +591,12 @@ function applyProcessAnalyticsMetrics(proc, pipe) {
   const st = pipe.stats || {};
   const leg = $("#mem-chart-legend");
   if (leg) {
-    const pipe = proc.rss_pipeline_bytes;
+    const pipeB = proc.rss_pipeline_bytes;
     const inf = proc.rss_inference_worker_bytes;
     const parts = [
       `Σ RSS ${fmtBytes(rss)}`,
       `EMA ${fmtBytes(ema)}`,
-      pipe != null ? `пайплайн ${fmtBytes(pipe)}` : null,
+      pipeB != null ? `пайплайн ${fmtBytes(pipeB)}` : null,
       inf != null && inf > 0 ? `инференс ${fmtBytes(inf)}` : null,
       `пик(окно) ${fmtBytes(proc.rss_peak_recent_bytes)}`,
       `decode ${q.decode_size ?? "—"}/${q.decode_max ?? "—"}`,
@@ -354,251 +752,6 @@ function drawMemChart(hist, warnB, critB) {
   ctx.textAlign = "left";
 }
 
-function applyInfo(info) {
-  state.loaded = info.loaded;
-  state.playing = info.playing;
-  state.totalFrames = info.frame_count;
-  state.fps = info.fps;
-  $("#no-video").style.display = info.loaded ? "none" : "flex";
-
-  const cur = info.current_frame;
-  if (!state.seekDragging) {
-    $("#seek").max = String(Math.max(0, info.frame_count - 1));
-    $("#seek").value = String(cur);
-  }
-  $("#time-cur").textContent = fmtTime(info.current_sec);
-  $("#time-total").textContent = fmtTime(info.duration_sec);
-  $("#frame-info").textContent = `кадр ${cur} / ${info.frame_count}`;
-  $("#fps-info").textContent = `${info.fps?.toFixed(2) ?? "—"} fps`;
-  $("#resolution-info").textContent = `${info.width || "—"} × ${info.height || "—"}`;
-
-  const s = info.stats || {};
-  $("#hud-decode").textContent = `декод ${(s.decode_fps || 0).toFixed(0)} fps`;
-  $("#hud-render").textContent = `рендер ${(s.render_fps || 0).toFixed(0)} fps`;
-  $("#hud-inf").textContent = `инф ${(s.inference_ms_avg || 0).toFixed(1)} мс`;
-  $("#hud-events").textContent = `событий ${s.events || 0}`;
-  const pipeFps = s.pipeline_fps != null ? s.pipeline_fps.toFixed(0) : "—";
-  $("#dropped-info").textContent = `пропуск decode ${s.dropped_decode || 0} · render ${s.dropped_render || 0} · пайплайн ${pipeFps} fps`;
-
-  // Синхронизируем локальную карту тревог с актуальным snapshot треков.
-  const liveAlarms = new Set();
-  for (const t of info.tracks || []) {
-    if (t.alarm) {
-      liveAlarms.add(t.id);
-      if (!state.alarms.has(t.id)) {
-        state.alarms.set(t.id, { id: t.id, cls: t.cls, state: t.state, bbox: t.bbox });
-      } else {
-        state.alarms.get(t.id).state = t.state;
-      }
-    }
-  }
-  // Удаляем тревоги, чьи треки уже исчезли из анализатора.
-  for (const id of [...state.alarms.keys()]) {
-    if (!liveAlarms.has(id)) state.alarms.delete(id);
-  }
-  renderAlarms();
-}
-
-async function refreshStreams() {
-  try {
-    const data = await api("GET", "/api/streams");
-    state.streams = data.streams || [];
-    if (!state.streams.some((s) => s.stream_id === state.activeStreamId)) {
-      state.activeStreamId = "main";
-    }
-    renderStreamsTabs();
-    renderStreamsMemory(state.streams);
-  } catch (e) {
-    console.warn("streams fail", e);
-  }
-}
-
-function renderStreamsTabs() {
-  const root = $("#streams-tabs");
-  if (!root) return;
-  root.innerHTML = "";
-  if (!state.streams.length) {
-    root.innerHTML = '<div class="text-xs text-slate-400">Потоки не созданы</div>';
-    return;
-  }
-  for (const s of state.streams) {
-    const btn = document.createElement("button");
-    const active = s.stream_id === state.activeStreamId;
-    btn.className = active ? "stream-chip stream-chip-active" : "stream-chip";
-    const baseName = s.stream_id;
-    const status = s.playing ? "▶" : "⏸";
-    btn.textContent = `${status} ${baseName}`;
-    btn.onclick = () => selectStream(s.stream_id);
-    root.appendChild(btn);
-  }
-}
-
-function renderStreamsMemory(streams) {
-  const root = $("#streams-mem-list");
-  if (!root) return;
-  root.replaceChildren();
-  if (!streams.length) {
-    root.textContent = "—";
-    return;
-  }
-  for (const s of streams) {
-    const row = document.createElement("div");
-    row.className = "flex items-center justify-between gap-2 mb-0.5";
-    const label = document.createElement("span");
-    label.className = "truncate";
-    label.textContent = `${s.stream_id}${s.stream_id === state.activeStreamId ? " (активный)" : ""}`;
-    const total = s.memory?.estimated_total_bytes;
-    const worker = s.memory?.worker_rss_bytes;
-    const val = document.createElement("span");
-    val.className = "font-mono text-slate-800";
-    val.textContent = `${fmtBytes(total)}${worker ? ` · worker ${fmtBytes(worker)}` : ""}`;
-    row.append(label, val);
-    root.appendChild(row);
-  }
-}
-
-async function selectStream(streamId) {
-  state.activeStreamId = streamId;
-  state.alarms.clear();
-  renderAlarms();
-  renderStreamsTabs();
-  await refreshInfo();
-  await refreshEvents();
-  await refreshMetrics();
-  const v = $("#video");
-  attachVideoStream(streamId);
-}
-
-function renderAlarms() {
-  const root = $("#alarms");
-  root.innerHTML = "";
-  const count = state.alarms.size;
-  const cnt = $("#alarm-count");
-  cnt.textContent = String(count);
-  cnt.className = count > 0 ? "badge badge-danger" : "badge badge-neutral";
-  $("#alarm-overlay").classList.toggle("hidden", count === 0);
-  if (count === 0) {
-    root.innerHTML = '<div class="text-xs text-slate-400">Нет активных тревог.</div>';
-    return;
-  }
-  for (const a of state.alarms.values()) {
-    const el = document.createElement("div");
-    const ui = ALARM_STATE_UI[a.state] || ALARM_STATE_UI.alarm_unattended;
-    el.className = "alarm-card alarm-active";
-    el.innerHTML = `
-      <div>
-        <div class="text-sm font-medium text-slate-900">#${a.id} · ${a.cls}</div>
-        <div class="text-[11px] text-slate-500">${ui.label}</div>
-      </div>
-      <span class="${ui.badge}">${ui.tag}</span>
-    `;
-    root.appendChild(el);
-  }
-}
-
-// ----------------------------------------------------------- журнал событий
-
-async function refreshEvents() {
-  try {
-    renderSkeletonList($("#events"), 5);
-    const data = await api("GET", withStream("/api/events?limit=200"));
-    renderEvents(data.events || []);
-  } catch (e) { console.warn(e); }
-}
-
-function renderEvents(events) {
-  const root = $("#events");
-  root.innerHTML = "";
-  if (!events.length) {
-    root.innerHTML = '<div class="text-xs text-slate-400">Журнал пуст.</div>';
-    return;
-  }
-  for (const ev of events) {
-    if (!JOURNAL_EVENT_TYPES.has(ev.type)) continue;
-    const ui = EVENT_UI[ev.type] || { title: ev.type, desc: "" };
-    const card = document.createElement("div");
-    card.className = `event-card event-${ev.type}`;
-    const img = ev.snapshot_path
-      ? `<a href="${ev.snapshot_path}" target="_blank" rel="noopener noreferrer" title="Открыть снимок">
-           <img src="${ev.snapshot_path}" alt="снимок события"/>
-         </a>`
-      : '<div class="placeholder">нет</div>';
-    const note = ev.note ? `<div class="text-[11px] text-slate-500 mt-1">${ev.note}</div>` : "";
-    card.innerHTML = `
-      ${img}
-      <div class="flex-1 min-w-0">
-        <div class="flex items-center gap-2 text-xs">
-          <span class="ev-type">${ui.title}</span>
-          <span class="text-slate-500">#${ev.track_id ?? "—"}</span>
-          <span class="text-slate-700 font-medium">${ev.cls_name ?? ""}</span>
-          ${ev.confidence != null ? `<span class="text-slate-400">${(ev.confidence * 100).toFixed(0)}%</span>` : ""}
-        </div>
-        <div class="text-[11px] text-slate-500 mt-0.5">${fmtTs(ev.ts)} · ${(ev.video_pos_ms / 1000).toFixed(2)}s</div>
-        <div class="text-[11px] text-slate-600 mt-0.5">${ui.desc}</div>
-        ${note}
-      </div>
-    `;
-    root.appendChild(card);
-  }
-}
-
-// ----------------------------------------------------------- список видеофайлов
-
-async function refreshFiles() {
-  const root = $("#files-list");
-  renderSkeletonList(root, 4);
-  const data = await api("GET", "/api/files");
-  root.innerHTML = "";
-  if (!data.files.length) {
-    root.innerHTML = `<div class="col-span-2 text-xs text-slate-400">Положите .mkv в ${data.data_dir}</div>`;
-    return;
-  }
-  for (const f of data.files) {
-    const btn = document.createElement("button");
-    btn.className = "file-tile truncate";
-    btn.innerHTML = `<div class="name truncate">${f.name}</div><div class="meta">${f.size_mb} MB</div>`;
-    btn.onclick = () => openVideo(f.path);
-    root.appendChild(btn);
-  }
-}
-
-async function openVideo(path) {
-  try {
-    await api("POST", "/api/open", { path, stream_id: state.activeStreamId });
-    await refreshStreams();
-    await refreshInfo();
-    await refreshEvents();
-    // Принудительно переподключаем MJPEG-поток через смену query-параметра.
-    attachVideoStream(state.activeStreamId);
-  } catch (e) { alert("Не удалось открыть: " + e.message); }
-}
-
-async function openVideoFromSystemPicker(file) {
-  if (!file) return;
-  $("#picked-file-name").textContent = `Загрузка: ${file.name}`;
-  const fd = new FormData();
-  fd.append("file", file, file.name);
-  try {
-    let r;
-    try {
-      r = await fetch("/api/upload_video", { method: "POST", body: fd });
-    } catch (e) {
-      throw new Error("Сервер недоступен. Проверьте, что python run.py запущен.");
-    }
-    if (!r.ok) {
-      const t = await r.text();
-      throw new Error(`${r.status}: ${t}`);
-    }
-    const data = await r.json();
-    $("#picked-file-name").textContent = `Загружен: ${data.name}`;
-    await refreshFiles();
-    await openVideo(data.path);
-  } catch (e) {
-    $("#picked-file-name").textContent = "Ошибка загрузки";
-    alert("Не удалось загрузить файл: " + e.message);
-  }
-}
-
 // ----------------------------------------------------------- настройки
 
 async function loadSettings() {
@@ -619,7 +772,6 @@ function applySettingsToForm(cfg) {
 
 async function submitSettings(ev) {
   ev.preventDefault();
-  // Собираем PATCH только из полей формы, оставляя пустые значения без отправки.
   const patch = { model: {}, pipeline: {}, analyzer: {}, ui: {} };
   for (const inp of $$("#settings-form [data-section]")) {
     const section = inp.dataset.section;
@@ -657,64 +809,32 @@ function connectWs() {
   ws.onclose = () => {
     $("#hud-conn").textContent = "не в сети";
     $("#hud-conn").className = "metric metric-bad";
-    // Автопереподключение, чтобы UI сам восстанавливался после обрывов.
     setTimeout(connectWs, 1500);
   };
   ws.onerror = () => ws.close();
   ws.onmessage = (m) => {
     let msg;
     try { msg = JSON.parse(m.data); } catch { return; }
-    if (msg.type === "status") {
-      if (!msg.stream_id || msg.stream_id === state.activeStreamId) applyInfo(msg.info);
-    } else if (msg.type === "hello") {
-      if (!msg.stream_id || msg.stream_id === state.activeStreamId) applyInfo(msg.info);
+    if (msg.type === "status" || msg.type === "hello") {
+      if (msg.stream_id) applyInfo(msg.stream_id, msg.info);
+    } else if (msg.type === "event") {
+      onEventMessage(msg.event || msg);
     }
-    else if (msg.type === "event") onEventMessage(msg);
   };
 }
 
 function onEventMessage(ev) {
-  if (ev.stream_id && ev.stream_id !== state.activeStreamId) return;
   refreshEvents();
-  if (ALARM_EVENT_TYPES.has(ev.type)) {
-    if (state.settings?.ui?.alarm_sound) {
-      try { $("#alarm-sound").currentTime = 0; $("#alarm-sound").play(); } catch {}
-    }
+  if (ALARM_EVENT_TYPES.has(ev.type) && state.settings?.ui?.alarm_sound) {
+    try { $("#alarm-sound").currentTime = 0; $("#alarm-sound").play(); } catch {}
   }
 }
 
 // ----------------------------------------------------------- привязка обработчиков UI
 
 function wireControls() {
-  $("#btn-play").onclick = () => api("POST", withStream("/api/play")).then(refreshInfo);
-  $("#btn-pause").onclick = () => api("POST", withStream("/api/pause")).then(refreshInfo);
-
-  const seek = $("#seek");
-  seek.addEventListener("mousedown", () => state.seekDragging = true);
-  seek.addEventListener("touchstart", () => state.seekDragging = true);
-  const release = () => {
-    if (!state.seekDragging) return;
-    state.seekDragging = false;
-    // Отправляем seek один раз при отпускании ползунка.
-    api("POST", withStream("/api/seek"), { frame: Number(seek.value) }).then(refreshInfo);
-  };
-  seek.addEventListener("mouseup", release);
-  seek.addEventListener("touchend", release);
-  seek.addEventListener("change", () => {
-    if (!state.seekDragging) {
-      api("POST", withStream("/api/seek"), { frame: Number(seek.value) }).then(refreshInfo);
-    }
-  });
-
   $("#btn-refresh-files").onclick = refreshFiles;
   $("#btn-refresh-streams").onclick = refreshStreams;
-  $("#btn-add-stream").onclick = async () => {
-    const sid = prompt("Введите ID потока (латиница/цифры/_/-):", "");
-    if (!sid) return;
-    await api("POST", "/api/streams", { stream_id: sid });
-    await refreshStreams();
-    await selectStream(sid);
-  };
   $("#btn-open-path").onclick = () => {
     const p = $("#custom-path").value.trim();
     if (p) openVideo(p);
@@ -738,7 +858,7 @@ function wireControls() {
   $("#btn-refresh-events").onclick = refreshEvents;
   $("#btn-clear-events").onclick = async () => {
     if (!confirm("Очистить журнал?")) return;
-    await api("DELETE", withStream("/api/events"));
+    await api("DELETE", "/api/events");
     refreshEvents();
   };
 
@@ -763,36 +883,15 @@ async function main() {
     applyTheme("light");
   }
   wireControls();
+  renderTargetSelect();
+  syncGridLayout();
   await loadSettings();
   await refreshStreams();
   await refreshFiles();
   await refreshEvents();
-  await refreshInfo();
-  await refreshMetrics();
   switchPage("monitor");
-  const v = $("#video");
-  attachVideoStream(state.activeStreamId);
   connectWs();
   state.streamsTimer = setInterval(refreshStreams, 4000);
-}
-
-function attachVideoStream(streamId) {
-  const v = $("#video");
-  if (!v) return;
-  // Reset any previous handlers/intervals
-  if (v._snapshotPoll) {
-    clearInterval(v._snapshotPoll);
-    v._snapshotPoll = null;
-  }
-  v.onerror = () => {
-    // MJPEG failed — fallback to polling single-image snapshot.
-    if (v._snapshotPoll) return;
-    v._snapshotPoll = setInterval(() => {
-      v.src = withStream("/video_snapshot?ts=" + Date.now(), streamId);
-    }, 300);
-  };
-  // Try MJPEG first (cache-buster)
-  v.src = withStream("/video_feed?ts=" + Date.now(), streamId);
 }
 
 main().catch(console.error);

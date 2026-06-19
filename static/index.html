@@ -6,7 +6,7 @@
   <title>Integra-LOST · Детектор оставленного предмета</title>
   <link rel="icon" type="image/png" href="/static/logo.png"/>
   <link rel="stylesheet" href="/static/tailwind-local.css?v=20260616" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260616-1" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260619-multistream" />
 </head>
 <body class="bg-slate-50 text-slate-800 font-sans antialiased">
   <div class="min-h-screen flex flex-col">
@@ -37,47 +37,25 @@
 
       <section id="page-monitor" class="page-panel page-panel-active grid grid-cols-12 gap-4">
         <section class="col-span-8 flex flex-col gap-3">
-          <div class="relative rounded-xl overflow-hidden border border-slate-300 bg-slate-900 aspect-video shadow-sm card-animated">
-            <img id="video" src="/video_feed" class="w-full h-full object-contain" alt="video"/>
-            <div id="alarm-overlay" class="hidden absolute inset-0 ring-4 ring-rose-500 animate-pulse pointer-events-none"></div>
-            <div id="no-video" class="absolute inset-0 flex items-center justify-center text-slate-300 text-sm">
-              Откройте видеофайл для начала анализа
-            </div>
+          <!-- Сетка панелей потоков: каждая открытая камера/файл — отдельная панель,
+               все работают одновременно. Содержимое строится в app.js. -->
+          <div class="flex items-center justify-between">
+            <h2 class="section-title">Потоки <span id="streams-count" class="text-xs text-slate-400 font-normal"></span></h2>
+            <button id="btn-refresh-streams" class="btn-link">Обновить</button>
           </div>
-
-          <div class="card card-animated flex flex-col gap-3 p-4">
-            <div class="flex items-center gap-3">
-              <button id="btn-play" class="btn btn-primary">▶ Воспроизведение</button>
-              <button id="btn-pause" class="btn btn-secondary">⏸ Пауза</button>
-              <span id="time-cur" class="ml-2 text-xs font-mono text-slate-600">00:00.00</span>
-              <input id="seek" type="range" min="0" max="0" value="0" step="1" class="flex-1 seek-slider"/>
-              <span id="time-total" class="text-xs font-mono text-slate-600">00:00.00</span>
-            </div>
-            <div class="flex items-center gap-3 text-xs text-slate-500">
-              <span id="frame-info">кадр 0 / 0</span>
-              <span class="dot"></span>
-              <span id="fps-info">— fps</span>
-              <span class="dot"></span>
-              <span id="resolution-info">— × —</span>
-              <span class="dot"></span>
-              <span id="dropped-info">пропущено 0</span>
-            </div>
+          <div id="streams-grid" class="streams-grid"></div>
+          <div id="streams-empty" class="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center text-sm text-slate-400">
+            Откройте видеофайл или RTSP-поток ниже — можно несколько одновременно.
           </div>
 
           <div class="card card-animated p-4">
             <div class="flex items-center justify-between mb-3">
-              <h2 class="section-title">Видеофайлы</h2>
-              <button id="btn-refresh-files" class="btn-link">Обновить</button>
-            </div>
-            <div class="mb-3">
-              <div class="flex items-center justify-between mb-2">
-                <h3 class="text-xs font-semibold uppercase tracking-wide text-slate-600">Поток для видео</h3>
-                <div class="flex items-center gap-2">
-                  <button id="btn-add-stream" class="btn-link">+ Добавить поток</button>
-                  <button id="btn-refresh-streams" class="btn-link">Обновить потоки</button>
-                </div>
+              <h2 class="section-title">Добавить источник</h2>
+              <div class="flex items-center gap-2 text-xs">
+                <label class="text-slate-500">Открыть в:</label>
+                <select id="target-stream" class="input input-sm w-auto"></select>
+                <button id="btn-refresh-files" class="btn-link">Обновить файлы</button>
               </div>
-              <div id="streams-tabs" class="flex flex-wrap gap-2"></div>
             </div>
             <div id="files-list" class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm"></div>
             <div class="mt-3 flex items-center gap-2">
@@ -96,7 +74,7 @@
                        placeholder="rtsp://user:pass@192.168.1.10:554/Streaming/Channels/101" class="input flex-1 font-mono text-xs"/>
                 <button id="btn-open-rtsp" class="btn btn-primary whitespace-nowrap">Подключить</button>
               </div>
-              <p class="mt-1 text-[11px] text-slate-400">Поддерживаются rtsp/rtmp/http(s)/srt. Логин и пароль — в URL. По умолчанию транспорт TCP.</p>
+              <p class="mt-1 text-[11px] text-slate-400">Поддерживаются rtsp/rtmp/http(s)/srt. Логин и пароль — в URL. По умолчанию транспорт TCP. До 4 потоков одновременно.</p>
             </div>
           </div>
         </section>
@@ -238,6 +216,6 @@
 
   <audio id="alarm-sound" preload="auto" src="data:audio/wav;base64,UklGRr4AAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZoAAACAgIB/f39+fn5+fn5/f3+AgIGBgoKCg4ODg4ODgoKCgYGAgIB/f39+fn5+fn5+f3+AgIGBgoKDg4ODg4ODgoKCgYGAgIB/f39+fn5+fn5/f3+AgIGBgoKDg4ODg4ODgoKCgYGAgIB/f39+fn5+fn5+f3+AgIGBgoKDg4ODg4ODgoKCgYGAgIB/f39+fn5+fn5/f3+AgIGBgoKDg4ODg4ODgoKCgYGAgIB/"></audio>
 
-  <script src="/static/app.js?v=20260429-resources"></script>
+  <script src="/static/app.js?v=20260619-multistream"></script>
 </body>
 </html>

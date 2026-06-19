@@ -83,10 +83,30 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // RTSP по умолчанию через TCP (надёжнее UDP в локалке/NAT; именно так делает VLC)
+    // + I/O-таймаут. ВАЖНО ставить это ОДИН раз ДО первого VideoCapture и желательно
+    // до старта процесса (run.py прокидывает то же в env) — на Windows значение,
+    // выставленное `std::env::set_var` уже после старта, может не дойти до getenv
+    // внутри OpenCV/FFmpeg (отдельный CRT-кэш окружения) → опция не применится и
+    // поток откроется по UDP/без таймаута. `timeout` вместо устаревшего `stimeout`
+    // (удалён в FFmpeg 5+). Пользовательское значение НЕ перетираем.
+    if std::env::var("OPENCV_FFMPEG_CAPTURE_OPTIONS").is_err() {
+        std::env::set_var(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            "rtsp_transport;tcp|timeout;5000000",
+        );
+    }
+
     let listener =
         TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
     info!(addr = %args.listen, "video-bridge listening (Python: pipeline.rust_video_bridge + this address)");
 
+    // Поток на каждое соединение: раньше сессии обрабатывались СЕРИЙНО
+    // (`run_session` блокировал accept) — второй поток/камера не подключались,
+    // пока не закроется первый. Теперь каждая сессия живёт в своём потоке, что
+    // позволяет вести несколько файлов / RTSP-потоков ОДНОВРЕМЕННО.
+    let target_fps = args.target_fps;
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -95,48 +115,50 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        let peer = stream
-            .peer_addr()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-        stream.set_nodelay(true).ok();
-        info!(%peer, "client connected");
+        std::thread::spawn(move || {
+            let peer = stream
+                .peer_addr()
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            stream.set_nodelay(true).ok();
+            info!(%peer, "client connected");
 
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut cmd_line = String::new();
-        if reader.read_line(&mut cmd_line).unwrap_or(0) == 0 {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_str(cmd_line.trim()).unwrap_or(json!({}));
-        if v.get("cmd").and_then(|x| x.as_str()) != Some("open") {
-            write_handshake_error(&mut stream, "expected {\"cmd\":\"open\",\"path\":...}")?;
-            continue;
-        }
-        let path = match v.get("path").and_then(|x| x.as_str()) {
-            Some(p) => p.to_string(),
-            None => {
-                write_handshake_error(&mut stream, "missing path")?;
-                continue;
+            let mut reader = match stream.try_clone() {
+                Ok(s) => BufReader::new(s),
+                Err(e) => {
+                    warn!(%peer, error = %e, "clone stream failed");
+                    return;
+                }
+            };
+            let mut cmd_line = String::new();
+            if reader.read_line(&mut cmd_line).unwrap_or(0) == 0 {
+                return;
             }
-        };
-        let seek_frame = v
-            .get("seek_frame")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as i32);
-        let prefer_hw_decode = v
-            .get("prefer_hw_decode")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
+            let v: serde_json::Value = serde_json::from_str(cmd_line.trim()).unwrap_or(json!({}));
+            if v.get("cmd").and_then(|x| x.as_str()) != Some("open") {
+                let _ = write_handshake_error(&mut stream, "expected {\"cmd\":\"open\",\"path\":...}");
+                return;
+            }
+            let path = match v.get("path").and_then(|x| x.as_str()) {
+                Some(p) => p.to_string(),
+                None => {
+                    let _ = write_handshake_error(&mut stream, "missing path");
+                    return;
+                }
+            };
+            let seek_frame = v
+                .get("seek_frame")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as i32);
+            let prefer_hw_decode = v
+                .get("prefer_hw_decode")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
 
-        match run_session(
-            &mut stream,
-            &path,
-            seek_frame,
-            args.target_fps,
-            prefer_hw_decode,
-        ) {
-            Ok(()) => info!(%peer, "session ended"),
-            Err(e) => warn!(%peer, error = %e, "session error"),
-        }
+            match run_session(&mut stream, &path, seek_frame, target_fps, prefer_hw_decode) {
+                Ok(()) => info!(%peer, "session ended"),
+                Err(e) => warn!(%peer, error = %e, "session error"),
+            }
+        });
     }
 
     Ok(())
@@ -183,20 +205,19 @@ fn run_session(
         write_handshake_error(stream, &format!("file not found: {path}"))?;
         return Ok(());
     }
-
-    // RTSP по умолчанию через TCP (надёжнее UDP в локалке) + таймаут, если
-    // пользователь не задал свои OPENCV_FFMPEG_CAPTURE_OPTIONS.
-    if is_url && std::env::var("OPENCV_FFMPEG_CAPTURE_OPTIONS").is_err() {
-        std::env::set_var(
-            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-            "rtsp_transport;tcp|stimeout;5000000",
-        );
-    }
+    // Транспорт/таймаут RTSP задаются один раз в main() через
+    // OPENCV_FFMPEG_CAPTURE_OPTIONS (см. там почему именно так на Windows).
 
     let mut cap =
         VideoCapture::from_file(path, CAP_FFMPEG).map_err(|e| anyhow!("opencv open: {e}"))?;
     if !cap.is_opened()? {
-        write_handshake_error(stream, "VideoCapture failed")?;
+        let hint = if is_url {
+            "VideoCapture failed: RTSP/поток не открылся (проверьте URL/логин-пароль; \
+             транспорт TCP включён). Если VLC открывает, а здесь нет — пришлите URL-схему."
+        } else {
+            "VideoCapture failed"
+        };
+        write_handshake_error(stream, hint)?;
         return Ok(());
     }
 

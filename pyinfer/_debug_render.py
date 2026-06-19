@@ -21,8 +21,7 @@ from .bytetrack import BYTETracker
 from .candidates import (CONFIRM_HITS, IouTracker, ObjectCandidates)
 from .config import load_config
 from .worker import (_box_on_person, _merge_regions, _suppress_near_persons,
-                     _drop_oversized, _drop_in_ignore_rect)
-from .yolo_onnx import YoloOnnx
+                     _drop_oversized, _drop_in_ignore_rect, _build_model)
 
 
 class _P:
@@ -45,8 +44,7 @@ def main():
 
     cfg = load_config(root)
     yolo_conf = max(0.05, min(0.30, cfg.tracker.low_thresh))
-    model = YoloOnnx(cfg.model_path, imgsz=cfg.imgsz, conf=yolo_conf,
-                     iou=cfg.iou, person_class=cfg.person_class, threads=cfg.onnx_threads)
+    model = _build_model(cfg, yolo_conf)
     tracker = BYTETracker(cfg.tracker)
     cand = ObjectCandidates(cfg.analyzer.frame_diff_min_region_area_px)
     obj_tracker = IouTracker(cfg.analyzer.tracker_iou_match_threshold,

@@ -26,7 +26,31 @@ from .bytetrack import BYTETracker
 from .candidates import IouTracker, ObjectCandidates
 from .config import Config, load_config
 from .scene_fsm import SceneAnalyzer
-from .yolo_onnx import YoloOnnx
+
+
+def _build_model(cfg: "Config", yolo_conf: float):
+    """Выбор бэкенда инференса по расширению модели:
+      .engine / .pt  → ultralytics (YOLO26 end-to-end, TensorRT/torch);
+      .onnx          → onnxruntime (старый YOLOv11-путь с ручным NMS).
+    """
+    ext = os.path.splitext(cfg.model_path)[1].lower()
+    if ext in (".engine", ".pt"):
+        from .yolo_ultra import YoloUltra
+        try:
+            return YoloUltra(cfg.model_path, imgsz=cfg.imgsz, conf=yolo_conf,
+                             iou=cfg.iou, person_class=cfg.person_class, threads=cfg.onnx_threads)
+        except Exception as e:
+            # .engine привязан к GPU/драйверу, на котором собран. Если не грузится —
+            # откатываемся на .pt рядом (torch соберёт под текущий GPU на лету).
+            fallback = os.path.splitext(cfg.model_path)[0] + ".pt"
+            if ext == ".engine" and os.path.isfile(fallback):
+                log(f"engine load failed ({e}); falling back to {fallback}")
+                return YoloUltra(fallback, imgsz=cfg.imgsz, conf=yolo_conf,
+                                 iou=cfg.iou, person_class=cfg.person_class, threads=cfg.onnx_threads)
+            raise
+    from .yolo_onnx import YoloOnnx
+    return YoloOnnx(cfg.model_path, imgsz=cfg.imgsz, conf=yolo_conf,
+                    iou=cfg.iou, person_class=cfg.person_class, threads=cfg.onnx_threads)
 
 
 def log(msg: str):
@@ -143,9 +167,15 @@ class PersonDet:
 class Session:
     """Состояние одного TCP-подключения (один видеопоток)."""
 
-    def __init__(self, model: YoloOnnx, cfg: Config):
+    def __init__(self, model, cfg: Config, infer_lock=None):
         self.model = model
         self.cfg = cfg
+        # Один воркер обслуживает НЕСКОЛЬКО подключений (по потоку на камеру/файл),
+        # деля одну модель. Инференс через общий TensorRT-контекст не потокобезопасен,
+        # поэтому сериализуем вызовы модели общим локом. GPU всё равно один — два
+        # потока делят его по очереди (15мс×2 ≈ 33fps суммарно).
+        import threading
+        self.infer_lock = infer_lock or threading.Lock()
         self.frame_seq = 0
         self.last_pts = None
         self._make_state()
@@ -173,9 +203,10 @@ class Session:
         t0 = time.perf_counter()
         # Один проход YOLO: люди + «оставляемые» предметы (второй источник кандидатов)
         # + «слабые» люди (маска подавления фантомов сидящих/ближнего плана).
-        dets, yolo_objs, weak = self.model.detect_all(
-            bgr, self.cfg.object_detect_classes, self.cfg.object_detect_conf,
-            self.cfg.person_suppress_conf)
+        with self.infer_lock:
+            dets, yolo_objs, weak = self.model.detect_all(
+                bgr, self.cfg.object_detect_classes, self.cfg.object_detect_conf,
+                self.cfg.person_suppress_conf)
         t1 = time.perf_counter()
 
         # M2: ByteTrack людей
@@ -250,11 +281,11 @@ def _recv_exact(rd, n: int) -> bytes | None:
     return buf
 
 
-def handle_client(conn: socket.socket, addr, model: YoloOnnx, cfg: Config):
+def handle_client(conn: socket.socket, addr, model, cfg: Config, infer_lock=None):
     log(f"client connected {addr}")
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     rd = conn.makefile("rb")
-    sess = Session(model, cfg)
+    sess = Session(model, cfg, infer_lock)
     try:
         while True:
             line = rd.readline()
@@ -322,9 +353,12 @@ def main():
     cfg = load_config(root)
     yolo_conf = max(0.05, min(0.30, cfg.tracker.low_thresh))
     log(f"loading model: {cfg.model_path} (imgsz={cfg.imgsz}, yolo_conf={yolo_conf}, nms_iou={cfg.iou})")
-    model = YoloOnnx(cfg.model_path, imgsz=cfg.imgsz, conf=yolo_conf,
-                     iou=cfg.iou, person_class=cfg.person_class, threads=cfg.onnx_threads)
+    model = _build_model(cfg, yolo_conf)
     log("model loaded")
+
+    # Общий лок инференса на все подключения (несколько камер/файлов делят модель).
+    import threading
+    infer_lock = threading.Lock()
 
     host, port = args.listen.rsplit(":", 1)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -336,7 +370,7 @@ def main():
     try:
         while True:
             conn, addr = srv.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr, model, cfg), daemon=True)
+            t = threading.Thread(target=handle_client, args=(conn, addr, model, cfg, infer_lock), daemon=True)
             t.start()
     except KeyboardInterrupt:
         log("shutting down")
