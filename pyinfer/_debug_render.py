@@ -113,6 +113,12 @@ def main():
         for p in persons:
             cv2.rectangle(vis, (int(p.bbox[0]), int(p.bbox[1])),
                           (int(p.bbox[2]), int(p.bbox[3])), (255, 100, 0), 1)
+        # footprints сидевших людей (анти-ghost): cyan, пунктиром-эмулятор
+        for (fb, _exp) in getattr(obj_tracker, "_footprints", []):
+            cv2.rectangle(vis, (int(fb[0]), int(fb[1])),
+                          (int(fb[2]), int(fb[3])), (255, 255, 0), 1)
+            cv2.putText(vis, "ghost-supp", (int(fb[0]), int(fb[1]) - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
         ts = n / fps
         cv2.putText(vis, f"f{n} t={ts:.1f}s regions={len(regions)} stable={sum(1 for t in obj_tracker._tracks if t.stable)}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)

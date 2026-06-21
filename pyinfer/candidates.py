@@ -100,6 +100,20 @@ class ObjectCandidates:
             # фильтр структурности: гладкие блики/тени на полу отсекаем
             if _edge_density(gray, (x, y, x + rw, y + rh)) < EDGE_DENSITY_MIN:
                 continue
+            # фильтр бликов: яркое + гладкое пятно (низкая std) = солнечный
+            # зайчик / отражение. Берём ЦЕНТРАЛЬНЫЕ 60% bbox: после MORPH_CLOSE
+            # iterations=3 контур шире пятна на 2-3 пикс, и std по полному bbox
+            # перекошен границей с фоном. Центр гарантированно внутри пятна.
+            cx0 = x + rw // 5
+            cy0 = y + rh // 5
+            cx1 = x + rw - rw // 5
+            cy1 = y + rh - rh // 5
+            patch = gray[cy0:cy1, cx0:cx1]
+            if patch.size > 0:
+                m = float(patch.mean())
+                s = float(patch.std())
+                if m >= GLINT_MEAN_MIN and s <= GLINT_STD_MAX:
+                    continue
             if self._on_person(bbox, persons):
                 continue
             regions.append(bbox)
@@ -197,6 +211,22 @@ FROZEN_MAD_DEFAULT = 12.0
 DYNAMIC_DEMOTE_FACTOR = 2.5
 DYNAMIC_DEMOTE_FRAMES = 20
 
+# --- Анти-«призрак» после сидевшего человека (MOG2 ghost) ---
+# Когда человек сидит долго на лавке, MOG2 поглощает его в модель фона. Как только
+# встаёт и уходит — настоящий фон под ним отличается от модели → MOG2 выдаёт большой
+# регион «переднего плана» в форме того места, где он сидел. Это классический
+# ghost-эффект. Frozen-pixel gate его не лечит: фон реально замер.
+# Лечим памятью отпечатков: запоминаем bbox каждого почти неподвижного person-трека,
+# и когда он исчезает — N кадров блокируем СОЗДАНИЕ новых объект-треков внутри его
+# последнего bbox. Если предмет реально оставлен, его трек был создан ещё ПОКА
+# человек сидел (MOG2 видит person+thing как одну кляксу) — он уже жив, suppression
+# new tracks не трогает существующие. Регион-призрак родится «нуля» → блокируется.
+GHOST_SIT_FRAMES = 60        # подряд кадров с почти неподвижным person-bbox → «сидит»
+GHOST_SIT_DRIFT_PX = 24.0    # допустимое смещение центроида между кадрами для «сидит»
+GHOST_GRACE_FRAMES = 110     # подавляем новые треки в footprint столько кадров (≈5с @22)
+GHOST_INFLATE = 0.10         # запас footprint вокруг последнего bbox (10% размера)
+GHOST_CENTER_INSIDE = True   # подавляем, если центр НОВОГО региона в footprint
+
 # --- Пиксельная верификация стабильных треков ---
 # Когда MOG2 перестаёт видеть стабильный трек, проверяем по эталону, на месте ли
 # предмет. Это заменяет «заморозку по таймеру»: реальный оставленный предмет
@@ -212,6 +242,14 @@ PERSON_OCCLUDE_IOU = 0.22   # человек рядом с треком — ве
 # на глянцевом полу — гладкие. Регион проходит, только если доля краевых
 # пикселей (Canny) в нём ≥ порога. Главный фильтр шума на полу.
 EDGE_DENSITY_MIN = 0.040
+
+# Фильтр бликов: солнечный зайчик на мокром асфальте / отражение от стекла —
+# яркое, гладкое, низкоконтрастное пятно. Frozen-pixel gate его НЕ режет (блик
+# действительно стабилен попиксельно). Признак: средняя яркость патча выше
+# GLINT_MEAN_MIN И стандартное отклонение ниже GLINT_STD_MAX. Картон/рюкзак/
+# сумка обычно либо темнее, либо имеют выраженную текстуру → проходят.
+GLINT_MEAN_MIN = 205.0
+GLINT_STD_MAX = 14.0
 
 # Объект, ставший стабильным в первые BASELINE_FRAMES потока, — фон сцены
 # (мебель/начальная обстановка): помечаем baseline=True, в FSM не отдаём.
@@ -290,16 +328,83 @@ class IouTracker:
         self._tracks: list[_Track] = []
         self._next_id = 1
         self._frame = 0  # кадр потока (для baseline-исключения мебели)
+        # Память сидящих людей и их «следов» — против MOG2-ghost после ухода.
+        # _person_state[tid] = {bbox, cx, cy, sit_frames, last_frame}
+        self._person_state: dict[int, dict] = {}
+        # _footprints — отпечатки исчезнувших сидевших людей: (bbox, expire_frame).
+        self._footprints: list[tuple[tuple, int]] = []
 
     def reset(self):
         self._tracks = []
         self._next_id = 1
         self._frame = 0
+        self._person_state = {}
+        self._footprints = []
+
+    def _update_footprints(self, persons):
+        """Обновить память сидящих людей; собрать footprints от исчезнувших.
+
+        Логика: person с track_id, чей центроид смещается не более GHOST_SIT_DRIFT_PX
+        между кадрами, копит sit_frames. Если он пропал из текущего списка (ушёл) —
+        и накопил ≥ GHOST_SIT_FRAMES — пушим его последний bbox в footprints с TTL
+        GHOST_GRACE_FRAMES. Они блокируют создание новых объект-треков в этой зоне.
+        """
+        present = set()
+        for p in persons:
+            tid = getattr(p, "track_id", -1)
+            if tid is None or tid < 0:
+                continue  # без id отследить «сидит» не можем
+            cx = 0.5 * (p.bbox[0] + p.bbox[2])
+            cy = 0.5 * (p.bbox[1] + p.bbox[3])
+            st = self._person_state.get(tid)
+            if st is None:
+                st = {"bbox": tuple(p.bbox), "cx": cx, "cy": cy,
+                      "sit_frames": 0, "last_frame": self._frame}
+                self._person_state[tid] = st
+            else:
+                drift = math.hypot(cx - st["cx"], cy - st["cy"])
+                if drift <= GHOST_SIT_DRIFT_PX:
+                    st["sit_frames"] += 1
+                else:
+                    st["sit_frames"] = 0
+                st["bbox"] = tuple(p.bbox)
+                st["cx"], st["cy"] = cx, cy
+                st["last_frame"] = self._frame
+            present.add(tid)
+
+        # Кто пропал — закрываем footprint, если успел «насидеть» порог.
+        gone = [tid for tid in self._person_state if tid not in present]
+        for tid in gone:
+            st = self._person_state.pop(tid)
+            if st["sit_frames"] >= GHOST_SIT_FRAMES:
+                bx1, by1, bx2, by2 = st["bbox"]
+                bw = (bx2 - bx1) * GHOST_INFLATE
+                bh = (by2 - by1) * GHOST_INFLATE
+                inflated = (bx1 - bw, by1 - bh, bx2 + bw, by2 + bh)
+                self._footprints.append((inflated, self._frame + GHOST_GRACE_FRAMES))
+
+        # Чистим протухшие footprints.
+        if self._footprints:
+            self._footprints = [(b, exp) for (b, exp) in self._footprints
+                                if exp > self._frame]
+
+    def _in_footprint(self, region) -> bool:
+        if not self._footprints:
+            return False
+        rcx = 0.5 * (region[0] + region[2])
+        rcy = 0.5 * (region[1] + region[3])
+        for (b, _exp) in self._footprints:
+            if b[0] <= rcx <= b[2] and b[1] <= rcy <= b[3]:
+                return True
+        return False
 
     def update(self, regions: list, persons: list | None = None,
                gray: "np.ndarray | None" = None) -> list:
         persons = persons or []
         self._frame += 1
+        # Обновляем footprints ДО матчинга: если новый регион в зоне отпечатка
+        # недавно ушедшего сидевшего человека — это MOG2-ghost, не создаём трек.
+        self._update_footprints(persons)
         eff_radius = _eff_static_radius(gray)
         used = [False] * len(regions)
         for tr in self._tracks:
@@ -378,6 +483,12 @@ class IouTracker:
 
         for j, r in enumerate(regions):
             if not used[j]:
+                # Анти-ghost: новый регион в свежем footprint сидевшего → дроп.
+                # Существующие треки (в т.ч. реальный предмет, оставленный пока
+                # человек ещё сидел) уже жили до этого момента и не теряются —
+                # они матчатся выше по IoU. Блокируем только РОЖДЕНИЕ из пустоты.
+                if self._in_footprint(r):
+                    continue
                 cx = 0.5 * (r[0] + r[2])
                 cy = 0.5 * (r[1] + r[3])
                 self._tracks.append(_Track(

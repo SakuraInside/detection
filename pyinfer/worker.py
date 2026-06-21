@@ -248,8 +248,16 @@ class Session:
             objects = self.obj_tracker.update(regions, persons, gray_full)
         t3 = time.perf_counter()
 
-        # M4: поведенческая FSM
-        ts = time.time()
+        # M4: поведенческая FSM. ВАЖНО: ts = видео-таймстемп (pts_ms/1000), НЕ wall.
+        # Раньше брали time.time() — это делало FSM зависимой от FPS обработки:
+        # `static_window_sec`, `abandon_time_sec`, `owner_left_sec`, etc. меряются в
+        # секундах. При нестабильном FPS (warmup TensorRT, тяжёлый кадр, MOG2 в
+        # разных состояниях) wall-таймштамп на одном и том же ролике разный →
+        # пороги срабатывают в разные моменты видео → один прогон ловит предмет,
+        # следующий нет. Привязка к pts_ms делает поведение детерминированным
+        # относительно содержимого ролика: какой бы ни был FPS обработки, 3 с
+        # видео — это всегда 3 с в FSM.
+        ts = float(pts_ms) / 1000.0
         events = self.analyzer.ingest(ts, pts_ms, self.cfg.camera_id, objects, persons, w, h)
         tracks = self.analyzer.tracks_snapshot(ts)
         t4 = time.perf_counter()
