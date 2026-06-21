@@ -54,6 +54,10 @@ class AnalyzerCfg:
     frame_diff_min_region_area_px: int = 100
     tracker_iou_match_threshold: float = 0.15
     tracker_max_missed_frames: int = 15
+    # Анти-листва: трек дозревает до stable только если межкадровый MAD патча
+    # (сглаженный) ниже порога — реальный предмет «замирает», динамическая текстура
+    # (листва/вода/флаг) — нет. 0/отрицательное — гейт выключен (старое поведение).
+    frozen_motion_mad: float = 12.0
     # Верхняя граница площади объект-региона (доля кадра). Регион крупнее — это не
     # «оставленная вещь», а ближний план / силуэт крупного сидящего человека → дроп.
     # По умолчанию ВЫКЛ (0): приоритет recall — близко к камере предмет крупный.
@@ -165,6 +169,7 @@ def load_config(root: Path) -> Config:
         frame_diff_min_region_area_px=_i(analyzer, "frame_diff_min_region_area_px", 100),
         tracker_iou_match_threshold=_f(analyzer, "tracker_iou_match_threshold", 0.15),
         tracker_max_missed_frames=_i(analyzer, "tracker_max_missed_frames", 15),
+        frozen_motion_mad=_f(analyzer, "frozen_motion_mad", 12.0),
         max_object_area_ratio=_f(analyzer, "max_object_area_ratio", 0.10),
         suppress_lost_person_frames=_i(analyzer, "suppress_lost_person_frames", 20),
         ignore_norm_rect=ignore_rect,

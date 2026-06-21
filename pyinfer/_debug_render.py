@@ -48,7 +48,8 @@ def main():
     tracker = BYTETracker(cfg.tracker)
     cand = ObjectCandidates(cfg.analyzer.frame_diff_min_region_area_px)
     obj_tracker = IouTracker(cfg.analyzer.tracker_iou_match_threshold,
-                             cfg.analyzer.tracker_max_missed_frames)
+                             cfg.analyzer.tracker_max_missed_frames,
+                             frozen_mad=cfg.analyzer.frozen_motion_mad)
 
     cap = cv2.VideoCapture(video, cv2.CAP_FFMPEG)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -103,7 +104,10 @@ def main():
                 tag = ""
             cv2.rectangle(vis, (int(t.bbox[0]), int(t.bbox[1])),
                           (int(t.bbox[2]), int(t.bbox[3])), color, 2)
-            cv2.putText(vis, f"id{t.track_id} h{t.hits}{tag}",
+            # motion_ema (межкадровый MAD): низкий = замер (предмет), высокий = живая
+            # текстура (листва). По нему калибруют analyzer.frozen_motion_mad.
+            me = getattr(t, "motion_ema", -1.0)
+            cv2.putText(vis, f"id{t.track_id} h{t.hits} m{me:.0f}{tag}",
                         (int(t.bbox[0]), int(t.bbox[1]) - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         for p in persons:

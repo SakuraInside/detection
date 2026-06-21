@@ -186,6 +186,7 @@ class Session:
         self.obj_tracker = IouTracker(
             self.cfg.analyzer.tracker_iou_match_threshold,
             self.cfg.analyzer.tracker_max_missed_frames,
+            frozen_mad=self.cfg.analyzer.frozen_motion_mad,
         )
         self.analyzer = SceneAnalyzer(self.cfg.analyzer)
 

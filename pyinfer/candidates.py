@@ -154,6 +154,9 @@ class _Track:
     birth_frame: int = 0      # кадр потока, на котором трек создан
     baseline: bool = False    # фон сцены (есть с самого старта) — НЕ тревожный
     owner_seen: bool = False  # человек перекрывал bbox трека (привязка владельца)
+    prev_patch: object = None # патч предыдущего кадра (для межкадрового MAD)
+    motion_ema: float = -1.0  # сглаженный межкадровый MAD патча (-1 = ещё не измерен)
+    live_streak: int = 0      # подряд кадров «текстура снова живая» (демоция stable)
 
 
 # Темпоральная фильтрация. Пороги невысокие — от шума защищает пиксельная
@@ -174,6 +177,25 @@ def _eff_static_radius(gray) -> float:
     h, w = gray.shape[:2]
     diag = math.hypot(w, h)
     return max(STATIC_RADIUS_PX, 0.012 * diag)
+
+
+# --- Гейт «замершего» предмета (анти-листва / динамическая текстура) ---
+# Реальный оставленный предмет ПОСЛЕ постановки перестаёт меняться попиксельно:
+# межкадровый MAD патча падает до уровня шума (≈2-8). Листва на ветру, вода, флаги,
+# мерцающая тень — «живая текстура», её bbox может стоять на месте (куст не уходит),
+# но пиксели внутри меняются всегда → межкадровый MAD остаётся высоким.
+# Главная дыра старого кода: регион, который MOG2 видит КАЖДЫЙ кадр (missed==0),
+# принимался как «на месте» без пиксельной проверки → листва дозревала до stable и
+# давала ложную тревогу. Здесь трек дозревает до stable ТОЛЬКО если сглаженный
+# межкадровый MAD ниже порога (IouTracker.frozen_mad). Порог ≤0 → гейт выключен.
+MOTION_EMA_ALPHA = 0.35
+FROZEN_MAD_DEFAULT = 12.0
+# Демоция уже стабильного трека, если его текстура снова «ожила» (motion_ema выше
+# порога × этот коэффициент N кадров подряд): листва, успевшая случайно замереть на
+# момент стабилизации. Коэффициент с запасом, чтобы не сбрасывать реальный предмет
+# при кратком всплеске (смена освещения, проход тени).
+DYNAMIC_DEMOTE_FACTOR = 2.5
+DYNAMIC_DEMOTE_FRAMES = 20
 
 # --- Пиксельная верификация стабильных треков ---
 # Когда MOG2 перестаёт видеть стабильный трек, проверяем по эталону, на месте ли
@@ -258,9 +280,13 @@ def _edge_density(gray, bbox) -> float:
 class IouTracker:
     """IoU-трекер регионов: темпоральная фильтрация + пиксельная верификация стабильных треков."""
 
-    def __init__(self, iou_thresh: float = 0.15, max_missed: int = 15):
+    def __init__(self, iou_thresh: float = 0.15, max_missed: int = 15,
+                 frozen_mad: float = FROZEN_MAD_DEFAULT):
         self.iou_thresh = float(iou_thresh)
         self.max_missed = int(max_missed)
+        # Порог межкадрового MAD для дозревания трека до stable (анти-листва).
+        # ≤0 → гейт выключен (старое поведение, для A/B сравнения).
+        self.frozen_mad = float(frozen_mad)
         self._tracks: list[_Track] = []
         self._next_id = 1
         self._frame = 0  # кадр потока (для baseline-исключения мебели)
@@ -300,13 +326,48 @@ class IouTracker:
                 tr.cx, tr.cy = new_cx, new_cy
                 tr.missed = 0
                 tr.gone_streak = 0
-                if tr.hits >= STABLE_HITS and not tr.stable:
+
+                # Межкадровая «живость» региона: для замершего предмета MAD ≈ шум,
+                # для листвы/воды/флага — высокий. Сглаживаем EMA. Сравниваем с
+                # патчем ПРОШЛОГО кадра (а не с эталоном стабилизации) — это и есть
+                # детектор динамической текстуры независимо от того, видит ли MOG2
+                # регион каждый кадр.
+                if gray is not None:
+                    cur_patch = _extract_patch(gray, tr.bbox)
+                    if cur_patch is not None:
+                        if (tr.prev_patch is not None
+                                and tr.prev_patch.shape == cur_patch.shape):
+                            inter_mad = float(np.abs(cur_patch - tr.prev_patch).mean())
+                            tr.motion_ema = inter_mad if tr.motion_ema < 0 else (
+                                MOTION_EMA_ALPHA * inter_mad
+                                + (1.0 - MOTION_EMA_ALPHA) * tr.motion_ema)
+                        tr.prev_patch = cur_patch
+
+                # Гейт: трек становится stable, только если текстура «замерла».
+                # frozen_mad ≤ 0 — гейт выключен. Пока motion_ema не измерен (-1) —
+                # не пускаем (нужно хотя бы 2 кадра для межкадрового MAD).
+                frozen_ok = (self.frozen_mad <= 0.0) or (
+                    0.0 <= tr.motion_ema <= self.frozen_mad)
+                if tr.hits >= STABLE_HITS and not tr.stable and frozen_ok:
                     tr.stable = True
                     if gray is not None:
                         tr.ref_patch = _extract_patch(gray, tr.bbox)
                     # стабилизировался в стартовом окне → фон сцены (мебель)
                     if tr.birth_frame <= BASELINE_FRAMES:
                         tr.baseline = True
+                elif tr.stable and self.frozen_mad > 0.0 and tr.motion_ema >= 0.0:
+                    # Демоция: стабильная текстура снова «ожила» (листва, случайно
+                    # замершая на момент стабилизации). N кадров подряд выше порога
+                    # × запас → сбрасываем стабильность, трек уходит с экрана/из FSM.
+                    if tr.motion_ema > self.frozen_mad * DYNAMIC_DEMOTE_FACTOR:
+                        tr.live_streak += 1
+                        if tr.live_streak >= DYNAMIC_DEMOTE_FRAMES:
+                            tr.stable = False
+                            tr.hits = 0
+                            tr.ref_patch = None
+                            tr.live_streak = 0
+                    else:
+                        tr.live_streak = 0
                 used[best_j] = True
             else:
                 # MOG2 не дал контур в этом кадре. Для СТАТИЧНОГО предмета контур

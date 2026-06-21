@@ -89,12 +89,15 @@ fn main() -> Result<()> {
     // до старта процесса (run.py прокидывает то же в env) — на Windows значение,
     // выставленное `std::env::set_var` уже после старта, может не дойти до getenv
     // внутри OpenCV/FFmpeg (отдельный CRT-кэш окружения) → опция не применится и
-    // поток откроется по UDP/без таймаута. `timeout` вместо устаревшего `stimeout`
-    // (удалён в FFmpeg 5+). Пользовательское значение НЕ перетираем.
+    // поток откроется по UDP/без таймаута. Для RTSP-демуксера таймаут сокета задаётся
+    // опцией `stimeout` (микросекунды); опция `timeout` у RTSP означает ожидание
+    // ВХОДЯЩИХ соединений и неявно включает режим listen → ffmpeg пытается слушать на
+    // адресе камеры вместо подключения ("Unable to open RTSP for listening" /
+    // "Cannot assign requested address"). Пользовательское значение НЕ перетираем.
     if std::env::var("OPENCV_FFMPEG_CAPTURE_OPTIONS").is_err() {
         std::env::set_var(
             "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-            "rtsp_transport;tcp|timeout;5000000",
+            "rtsp_transport;tcp|stimeout;5000000",
         );
     }
 

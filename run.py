@@ -433,7 +433,11 @@ def main() -> None:
     # может не дойти до getenv внутри OpenCV/FFmpeg (отдельный CRT-кэш), и поток
     # пойдёт по UDP → не подключится (VLC при этом работает по TCP). Не перетираем
     # пользовательское значение.
-    env.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|timeout;5000000")
+    # ВАЖНО: для RTSP таймаут сокета задаётся опцией `stimeout` (микросекунды).
+    # Опция `timeout` у RTSP-демуксера означает ожидание ВХОДЯЩИХ соединений и неявно
+    # включает режим listen → ffmpeg пытается слушать на адресе камеры вместо подключения:
+    # "Unable to open RTSP for listening" / "Cannot assign requested address".
+    env.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
 
     if args.bridge_build_only and args.no_bridge:
         parser.error("--bridge-build-only несовместим с --no-bridge")
