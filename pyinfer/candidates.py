@@ -104,16 +104,24 @@ class ObjectCandidates:
             # зайчик / отражение. Берём ЦЕНТРАЛЬНЫЕ 60% bbox: после MORPH_CLOSE
             # iterations=3 контур шире пятна на 2-3 пикс, и std по полному bbox
             # перекошен границей с фоном. Центр гарантированно внутри пятна.
-            cx0 = x + rw // 5
-            cy0 = y + rh // 5
-            cx1 = x + rw - rw // 5
-            cy1 = y + rh - rh // 5
-            patch = gray[cy0:cy1, cx0:cx1]
-            if patch.size > 0:
-                m = float(patch.mean())
-                s = float(patch.std())
-                if m >= GLINT_MEAN_MIN and s <= GLINT_STD_MAX:
-                    continue
+            # ВАЖНО — фильтр применяем ТОЛЬКО к мелким регионам: реальные
+            # оставленные предметы (белая коробка, лист бумаги, белый рюкзак)
+            # под равномерным светом имеют ровно те же mean/std что и блик,
+            # но они КРУПНЫЕ. Солнечный зайчик/отражение фары — небольшое пятно.
+            # Порог GLINT_MAX_SHORT_SIDE в MOG2-coordinates (small): 22px @960px
+            # ≈ 44px в 1920p оригинале.
+            short_side = min(rw, rh)
+            if short_side <= GLINT_MAX_SHORT_SIDE:
+                cx0 = x + rw // 5
+                cy0 = y + rh // 5
+                cx1 = x + rw - rw // 5
+                cy1 = y + rh - rh // 5
+                patch = gray[cy0:cy1, cx0:cx1]
+                if patch.size > 0:
+                    m = float(patch.mean())
+                    s = float(patch.std())
+                    if m >= GLINT_MEAN_MIN and s <= GLINT_STD_MAX:
+                        continue
             if self._on_person(bbox, persons):
                 continue
             regions.append(bbox)
@@ -123,31 +131,30 @@ class ObjectCandidates:
     def _on_person(region, persons) -> bool:
         """Подавляем регион, если он явно «принадлежит» человеку.
         Условия (любое):
-          - центроид региона внутри halo вокруг человека (10%),
-          - ≥35% площади региона внутри бокса человека (halo),
-          - IoU(person, region) ≥ 0.15.
-        Это убирает руки/ноги/тени, но НЕ глушит коробку рядом с человеком,
-        потому что её центроид и большая часть площади будут вне его бокса.
+          - ≥60% площади региона внутри бокса человека (halo 5%),
+          - IoU(person, region) ≥ 0.20.
+        Раньше срабатывало по «центроид региона внутри halo» с halo 10%, что
+        КРАЙНЕ агрессивно для зала/лавки: коробка на лавке между сидящими
+        попадает в halo соседа и дропается до трекера. Удалили это условие и
+        ужесточили остальные. Реальная часть тела (рука, нога, тень головы)
+        обычно сидит внутри bbox человека на ≥60% — режется. Предмет рядом с
+        человеком даже почти вплотную имеет большую часть площади ВНЕ bbox.
         """
         rarea = max(1.0, (region[2] - region[0]) * (region[3] - region[1]))
-        rcx = 0.5 * (region[0] + region[2])
-        rcy = 0.5 * (region[1] + region[3])
         for p in persons:
             pb = p.bbox
             pw = pb[2] - pb[0]
             ph = pb[3] - pb[1]
-            mx, my = 0.10 * pw, 0.10 * ph
+            mx, my = 0.05 * pw, 0.05 * ph
             hx1, hy1, hx2, hy2 = pb[0] - mx, pb[1] - my, pb[2] + mx, pb[3] + my
-            if hx1 <= rcx <= hx2 and hy1 <= rcy <= hy2:
-                return True
             ix1 = max(region[0], hx1)
             iy1 = max(region[1], hy1)
             ix2 = min(region[2], hx2)
             iy2 = min(region[3], hy2)
             inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-            if inter / rarea >= 0.35:
+            if inter / rarea >= 0.60:
                 return True
-            if iou_xyxy(pb, region) >= 0.15:
+            if iou_xyxy(pb, region) >= 0.20:
                 return True
         return False
 
@@ -250,6 +257,9 @@ EDGE_DENSITY_MIN = 0.040
 # сумка обычно либо темнее, либо имеют выраженную текстуру → проходят.
 GLINT_MEAN_MIN = 205.0
 GLINT_STD_MAX = 14.0
+# Максимальный «короткий бок» региона (в MOG2-small координатах), к которому
+# применяем фильтр бликов. Крупнее — это уже не блик, а потенциально предмет.
+GLINT_MAX_SHORT_SIDE = 22
 
 # Объект, ставший стабильным в первые BASELINE_FRAMES потока, — фон сцены
 # (мебель/начальная обстановка): помечаем baseline=True, в FSM не отдаём.
@@ -427,7 +437,23 @@ class IouTracker:
                 else:
                     tr.hits = 1
                     tr.anchor_cx, tr.anchor_cy = new_cx, new_cy
-                tr.bbox = new_bbox
+                # Анти-сжатие bbox: на Linux/другом OpenCV-build MOG2 быстрее
+                # поглощает статичный объект в фон → контур ужимается каждый
+                # кадр до точки, трек теряется в visualization и patch-verification
+                # начинает работать на огрызке. Если новый bbox занимает <50% площади
+                # прежнего, держим прежний bbox: пиксельная проверка ниже всё равно
+                # удержит трек, если предмет физически на месте. При реальном
+                # уменьшении (часть предмета убрали) IoU упадёт и трек уйдёт штатно.
+                old_area = max(1.0, (tr.bbox[2] - tr.bbox[0]) * (tr.bbox[3] - tr.bbox[1]))
+                new_area = max(1.0, (new_bbox[2] - new_bbox[0]) * (new_bbox[3] - new_bbox[1]))
+                if new_area < 0.5 * old_area:
+                    # держим старый bbox; центроид НЕ перетираем (anchor-логика выше
+                    # уже зачла «совпало по центру»), patch-проверка пойдёт по
+                    # старому bbox — предмет либо подтвердится, либо умрёт по
+                    # PATCH_GONE_FRAMES (нормальный путь).
+                    pass
+                else:
+                    tr.bbox = new_bbox
                 tr.cx, tr.cy = new_cx, new_cy
                 tr.missed = 0
                 tr.gone_streak = 0

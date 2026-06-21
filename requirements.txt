@@ -1,19 +1,45 @@
-# Integra-LOST — зависимости Python.
+# Detection — Python-зависимости pyinfer worker'а (актуальный стек YOLO26 + TRT).
 #
-# run.py (launcher) — чистая stdlib, pip не требует.
+# Версии зафиксированы под рабочий стек:
+#   CUDA 12.4, TensorRT 10.7, cuDNN 9.x, GPU compute capability 8.6+ (RTX 30/40/50).
+# Под другую CUDA — подбери колесо torch с соответствующим тегом (см. install_linux.txt).
 #
-# Режим --py-infer (pyinfer): инференс YOLOv11 через onnxruntime-gpu
-# (CUDAExecutionProvider). torch ставится ради CUDA/cuDNN DLL — pyinfer
-# подкладывает torch/lib в PATH, чтобы onnxruntime подцепил cublasLt/cudnn.
-# Для отключения GPU: INTEGRA_FORCE_CPU=1.
+# Установка (рекомендуется в чистом venv/conda env):
+#   python -m pip install --upgrade pip wheel
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 #
-# Установка: .venv\Scripts\python -m pip install -r requirements.txt
+# Если CUDA 11.8 — замени cu124 → cu118 в команде и поменяй версии torch ниже на
+# совместимые (torch==2.4.1+cu118).
 
-onnxruntime-gpu>=1.17    # или onnxruntime (CPU only)
-torch>=2.5               # CUDA-сборка cu121 поставляет cudnn/cublasLt DLL
-numpy>=1.26,<2
-opencv-python>=4.9
-lap>=0.5                  # линейное назначение для ByteTrack
+# ---- ядро инференса ----
+numpy==1.26.4
+opencv-python==4.10.0.84
+# Если RTSP не открывается с opencv-python, замени на opencv-contrib-python==4.10.0.84
 
-# Только для офлайн-экспорта весов .pt -> .onnx (scripts/export_onnx.py):
-# ultralytics>=8.4
+# ---- ByteTrack ----
+lap==0.4.0
+
+# ---- YOLO (ultralytics) ----
+ultralytics==8.3.40
+
+# ---- Torch / TorchVision (CUDA 12.4 wheels через --extra-index-url выше) ----
+torch==2.4.1
+torchvision==0.19.1
+
+# ---- TensorRT и ONNX Runtime (для .engine и .onnx путей) ----
+# tensorrt 10.7 рассчитан на CUDA 12.x. Под CUDA 11.x — tensorrt 10.0-10.4.
+tensorrt==10.7.0
+# onnxruntime-gpu даёт CUDAExecutionProvider/TensorrtExecutionProvider.
+# CPU-only альтернатива: закомментируй -gpu и поставь onnxruntime==1.20.1
+onnxruntime-gpu==1.20.1
+
+# ---- транзитивные зависимости ultralytics (фиксируем во избежание surprise-updates) ----
+pillow==10.4.0
+pyyaml==6.0.2
+requests==2.32.3
+scipy==1.13.1
+matplotlib==3.9.2
+pandas==2.2.3
+tqdm==4.66.5
+psutil==6.1.0
+py-cpuinfo==9.0.0

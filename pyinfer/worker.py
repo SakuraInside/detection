@@ -126,7 +126,7 @@ def _drop_in_ignore_rect(regions, ignore_rect, fw, fh):
     return out
 
 
-def _suppress_near_persons(regions, persons, margin=0.10, contain=0.55):
+def _suppress_near_persons(regions, persons, margin=0.05, contain=0.70):
     """Убрать кандидатов, которые реально НА человеке (его держат/часть тела).
 
     Лёгкое подавление (не широкая зона!): давим регион, только если ≥`contain`
@@ -134,6 +134,10 @@ def _suppress_near_persons(regions, persons, margin=0.10, contain=0.55):
     предмет РЯДОМ с человеком (на лавке у ног, сбоку) сохраняется и виден — это
     важно для recall: новый предмет на лавке не должен глушиться, если поблизости
     кто-то есть.
+
+    Параметры подкручены под сцены зала/лавки: margin 10%→5%, contain 0.55→0.70.
+    Раньше коробка на лавке между сидящими попадала в раздутый бокс соседа на
+    55-65% и дропалась до трекера. Теперь требуется почти полное вложение.
     """
     if not persons:
         return list(regions)
@@ -178,6 +182,7 @@ class Session:
         self.infer_lock = infer_lock or threading.Lock()
         self.frame_seq = 0
         self.last_pts = None
+        self.last_wall = None  # wall-таймштамп прошлого кадра (для reset по паузе)
         self._make_state()
 
     def _make_state(self):
@@ -194,10 +199,35 @@ class Session:
         self._make_state()
 
     def process(self, bgr: np.ndarray, pts_ms: float) -> tuple[list, dict]:
-        # seek / переоткрытие → сбрасываем модель фона и трекеры
-        if self.last_pts is not None and abs(pts_ms - self.last_pts) > 2000.0:
+        # === Reset state на «новую сессию ролика» ===
+        # Гарантия повторяемости: каждый прогон должен видеть чистые MOG2/трекеры/
+        # FSM. Иначе:
+        #  - модель фона MOG2 уже впитала прошлый прогон → новый предмет может не
+        #    выдать передний план;
+        #  - IouTracker._footprints / _person_state, SceneAnalyzer.tracks с
+        #    raised_unattended=True → новая постановка того же предмета не даёт
+        #    повторной тревоги (трек считается «уже отстрелившим»);
+        #  - живой baseline-флаг на ранних треках → они не выходят в FSM.
+        # Триггеры reset (любой):
+        #   1) pts_ms прыгнул назад (перезапуск ролика с начала) — < last_pts;
+        #   2) огромный прыжок вперёд (seek в плеере) — > +2000ms;
+        #   3) пауза в потоке кадров > 2с wall (UI закрыл и открыл заново,
+        #      bridge переподключился) — приходит первый кадр после паузы.
+        wall_now = time.time()
+        reset_reason = None
+        if self.last_pts is not None:
+            if pts_ms < self.last_pts - 100.0:
+                reset_reason = f"pts_back ({pts_ms:.0f}<{self.last_pts:.0f})"
+            elif pts_ms - self.last_pts > 2000.0:
+                reset_reason = f"pts_jump_fwd (+{pts_ms - self.last_pts:.0f}ms)"
+        if reset_reason is None and self.last_wall is not None:
+            if wall_now - self.last_wall > 2.0:
+                reset_reason = f"wall_gap ({wall_now - self.last_wall:.2f}s)"
+        if reset_reason:
+            print(f"[pyinfer] RESET state: {reset_reason}", flush=True)
             self.reset()
         self.last_pts = pts_ms
+        self.last_wall = wall_now
         self.frame_seq += 1
         h, w = bgr.shape[:2]
 
@@ -261,6 +291,23 @@ class Session:
         events = self.analyzer.ingest(ts, pts_ms, self.cfg.camera_id, objects, persons, w, h)
         tracks = self.analyzer.tracks_snapshot(ts)
         t4 = time.perf_counter()
+
+        # Периодическая диагностика для сверки между прогонами одного ролика.
+        # На повторных прогонах одинакового видео эти числа должны совпадать в
+        # ключевые моменты (когда появляется предмет, когда тревога). Если на
+        # прогоне 1 stable=2, на прогоне 2 stable=0 в той же точке pts — корень в
+        # MOG2 (фон/warmup), а не в FSM. Если stable одинаковый, а событий нет —
+        # копать FSM/таймеры.
+        if self.frame_seq % 60 == 1:
+            stable_n = sum(1 for tr in self.obj_tracker._tracks if tr.stable)
+            fp_n = len(getattr(self.obj_tracker, "_footprints", []))
+            fsm_n = len(self.analyzer.tracks)
+            alarms = sum(1 for t in self.analyzer.tracks.values()
+                         if t.raised_unattended or t.raised_removed or t.raised_missing)
+            print(f"[pyinfer] f={self.frame_seq} pts={pts_ms/1000:.1f}s "
+                  f"persons={len(persons)} regions={len(objects)} "
+                  f"stable={stable_n} footprints={fp_n} "
+                  f"fsm_tracks={fsm_n} alarms={alarms}", flush=True)
 
         frame_result = {
             "frame_id": self.frame_seq,

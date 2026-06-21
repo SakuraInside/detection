@@ -1,0 +1,176 @@
+=== УСТАНОВКА Detection НА Linux-СЕРВЕРНОЙ ===
+
+Цель: воспроизвести рабочий стек один-в-один.
+Тестировалось на Ubuntu 22.04 / 24.04, GPU NVIDIA RTX 30/40/50, CUDA 12.4.
+
+ВАЖНО заранее:
+1) Файлы models/*.engine НЕЛЬЗЯ КОПИРОВАТЬ с другой машины. Engine привязан
+   к GPU + версии CUDA + версии TensorRT. Скопированный engine даёт мусорные
+   детекции или падает. Engine нужно собрать локально (см. шаг 5).
+2) Все команды запускаются ИЗ корня репозитория (cd ~/Desktop/detection/detection-main).
+3) Используем venv (НЕ системный Python — на Ubuntu системный занят под apt).
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 0 — ПРОВЕРИТЬ GPU И ДРАЙВЕРЫ
+────────────────────────────────────────────────────────────────
+  nvidia-smi
+
+Должен показать модель GPU и Driver Version ≥ 550 (для CUDA 12.4).
+Если нет драйвера или версия ниже:
+  sudo apt update
+  sudo ubuntu-drivers autoinstall
+  sudo reboot
+После ребута снова nvidia-smi — должен работать.
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 1 — СИСТЕМНЫЕ ПАКЕТЫ
+────────────────────────────────────────────────────────────────
+  sudo apt update
+  sudo apt install -y \
+      build-essential pkg-config git curl wget ca-certificates \
+      python3.11 python3.11-venv python3.11-dev \
+      ffmpeg \
+      libopencv-dev libssl-dev \
+      clang libclang-dev    # нужно для opencv-rust (video-bridge)
+
+Проверка:
+  python3.11 --version    # ожидается 3.11.x
+  ffmpeg -version          # должна быть поддержка libavcodec, h264
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 2 — CUDA TOOLKIT 12.4 + cuDNN 9
+────────────────────────────────────────────────────────────────
+Скачать .deb с NVIDIA (или взять local installer). Пример для Ubuntu 22.04:
+
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+  sudo dpkg -i cuda-keyring_1.1-1_all.deb
+  sudo apt update
+  sudo apt install -y cuda-toolkit-12-4 libcudnn9-cuda-12 libcudnn9-dev-cuda-12
+
+Добавить в ~/.bashrc:
+  export PATH=/usr/local/cuda-12.4/bin:$PATH
+  export LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH
+
+Применить:
+  source ~/.bashrc
+  nvcc --version   # Cuda compilation tools, release 12.4, V12.4.x
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 3 — VENV И PYTHON-ЗАВИСИМОСТИ
+────────────────────────────────────────────────────────────────
+  python3.11 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install --upgrade pip wheel
+
+  pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+
+Проверка стека:
+  python - <<'PY'
+  import cv2, numpy, torch, tensorrt, onnxruntime as ort
+  print("opencv     ", cv2.__version__)
+  print("numpy      ", numpy.__version__)
+  print("torch      ", torch.__version__, "cuda", torch.cuda.is_available())
+  print("tensorrt   ", tensorrt.__version__)
+  print("ort        ", ort.__version__, ort.get_available_providers())
+  PY
+
+Ожидается:
+  opencv      4.10.0
+  numpy       1.26.4
+  torch       2.4.1+cu124  cuda True
+  tensorrt    10.7.x
+  ort         1.20.1  ['TensorrtExecutionProvider','CUDAExecutionProvider','CPUExecutionProvider']
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 4 — RUST + СБОРКА video-bridge
+────────────────────────────────────────────────────────────────
+video-bridge декодирует RTSP/файлы и шлёт BGR-кадры в gateway.
+
+Установить Rust (если ещё нет):
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  source $HOME/.cargo/env
+  rustc --version    # должен быть stable 1.80+
+
+Опционально — переменные для opencv-rust (если apt-libopencv-dev стоит правильно,
+обычно не нужно):
+  # export OPENCV_LINK_LIBS="opencv_core,opencv_imgproc,opencv_imgcodecs,opencv_videoio,opencv_video"
+  # export OPENCV_INCLUDE_PATHS=/usr/include/opencv4
+  # export OPENCV_LINK_PATHS=/usr/lib/x86_64-linux-gnu
+
+Сборка:
+  cargo build --release --manifest-path video-bridge/Cargo.toml
+
+Проверка:
+  ls -la target/release/video-bridge
+  ldd target/release/video-bridge | grep -iE 'opencv|avcodec|cuda'
+
+Все указанные .so должны быть найдены (не «not found»).
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 5 — TensorRT ENGINE (СОБРАТЬ ЛОКАЛЬНО, НЕ КОПИРОВАТЬ!)
+────────────────────────────────────────────────────────────────
+Engine .engine ПРИВЯЗАН к GPU + CUDA + TRT. Скопированный с другой машины
+файл даст мусорные детекции — это самая частая причина «у меня треки
+сжимаются и пропадают, а на другой машине работает».
+
+Если у тебя есть веса yolo26m.pt (или скачай через ultralytics):
+  python - <<'PY'
+  from ultralytics import YOLO
+  m = YOLO("models/yolo26m.pt")          # подставь свой путь
+  m.export(format="engine", imgsz=800, half=True, device=0, workspace=4)
+  PY
+
+Файл сохранится рядом с .pt как yolo26m.engine. Перенеси в models/:
+  mv models/yolo26m.engine models/yolo26m.engine.bak 2>/dev/null
+  cp <путь_к_новому>/yolo26m.engine models/yolo26m.engine
+
+Проверка пути в config.json:
+  grep -nE 'weights|model_path' config.json
+  # должно быть "models/yolo26m.engine"
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 6 — ENV ДЛЯ RTSP (важно на Linux ТОЖЕ!)
+────────────────────────────────────────────────────────────────
+Для RTSP-демуксера ffmpeg опция `timeout` означает listen-режим. Нужен `stimeout`.
+run.py уже выставляет правильное значение, но если запускаешь video-bridge
+ОТДЕЛЬНО — экспортируй в shell перед запуском:
+
+  export OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp|stimeout;5000000"
+
+
+────────────────────────────────────────────────────────────────
+ШАГ 7 — ЗАПУСК
+────────────────────────────────────────────────────────────────
+  source .venv/bin/activate
+  python run.py --release --py-infer
+
+В UI ввести RTSP-URL вида:
+  rtsp://192.168.10.39:8554/122?profile=high
+
+
+────────────────────────────────────────────────────────────────
+БЫСТРАЯ ДИАГНОСТИКА (если что-то не работает)
+────────────────────────────────────────────────────────────────
+  {
+    echo "=== nvidia-smi ===" ; nvidia-smi | head -15
+    echo "=== nvcc ===" ; nvcc --version
+    echo "=== python ===" ; which python ; python --version
+    echo "=== opencv ===" ; python -c "import cv2; print(cv2.__version__)"
+    echo "=== torch ===" ; python -c "import torch; print(torch.__version__, 'cuda=', torch.cuda.is_available())"
+    echo "=== tensorrt ===" ; python -c "import tensorrt; print(tensorrt.__version__)"
+    echo "=== ort ===" ; python -c "import onnxruntime as o; print(o.__version__, o.get_available_providers())"
+    echo "=== ffmpeg ===" ; ffmpeg -version | head -2
+    echo "=== video-bridge ===" ; ls -la target/release/video-bridge ; ldd target/release/video-bridge | grep -iE 'opencv|avcodec|cuda|not found'
+    echo "=== engine ===" ; ls -la models/*.engine
+  } > /tmp/diag.txt 2>&1
+  cat /tmp/diag.txt
+
+Если что-то «not found» в ldd, или версия torch/tensorrt не совпадает —
+здесь и кроется источник кросс-платформенных артефактов.
